@@ -1,0 +1,1 @@
+#define MALI_DEVICE_PATH "/dev/mali0"
