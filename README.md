@@ -5,6 +5,19 @@ Mali GPUs) to run on **kbase**, Arm's out-of-tree/vendor kernel driver —
 instead of the upstream `panfrost`/`panthor` DRM drivers PanVK currently
 requires. Target device: Mali-G615-MC2, kbase r44p0 / UK interface 1.20 (CSF).
 
+**Motivating end-state:** essentially every shipping Android phone with a
+Mali GPU runs kbase, not panthor/panfrost — so PanVK cannot run on real
+Android hardware at all today. Solving that is the same shape of problem
+Turnip solved for Adreno via its `kgsl` backend, which is what eventually
+made Turnip loadable as a standalone, swappable Vulkan driver in Android
+apps (custom-driver pickers in emulators like Eden and Azahar, GPU driver
+managers, etc.). This repo is aimed at the same outcome for Mali: a PanVK
+build that runs on stock Android via kbase, packaged the same way. See
+`ROADMAP.md` for the full path there and honest expectations on how far
+that is (Turnip took years of investment to get where it is; PanVK's own
+Vulkan maturity on Mali is not there yet independent of the kbase problem
+this repo solves).
+
 **Status: pre-alpha.** Standalone device probing works (see below);
 nothing wires into Mesa/PanVK yet.
 

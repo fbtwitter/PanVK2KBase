@@ -10,6 +10,15 @@ header and a working standalone probe, so Phase 0 and Phase 1 are further
 along here than a from-scratch roadmap assumes. Track deviations from the
 original recommendations inline below.
 
+**End goal this roadmap is aimed at:** a PanVK build that runs on real
+Android hardware and can be packaged/loaded the way Turnip is on Adreno —
+a standalone Vulkan driver a user can drop into a custom-driver picker
+(Eden, Azahar, Skyline, Winlator, etc.) instead of the phone's stock Mali
+blob driver. Phases 2–6 (device probe through WSI) are the prerequisite
+for that to even be possible; Phase 6 below includes the actual Android
+packaging step. This is a long path — see Phase 6 and Phase 7 notes for
+why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
+
 ## Phase 0 — Ground yourself
 - [x] Pick ONE target: **Mali-G615-MC2**, real device, UK interface 1.20
       (CSF) / driver release r44p0. Headers vendored in
@@ -84,10 +93,24 @@ original recommendations inline below.
 ## Phase 5 — Headless triangle
 - [ ] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
 
-## Phase 6 — WSI
+## Phase 6 — WSI and Android driver packaging
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
       targeting phones, or DRM/kmsro if targeting an embedded board still
       on kbase.
+- [ ] Once WSI actually presents to a real `Surface`/`ANativeWindow`:
+      cross-compile Mesa for Android via a Meson Android cross-file
+      (NDK toolchain, same shape as the community's Turnip-for-Android
+      builds), producing a standalone Vulkan ICD `.so` — not a full
+      system image integration, a droppable driver file.
+- [ ] Package that `.so` with a `meta.json` manifest matching the
+      Adrenotool/Turnip convention that custom-driver pickers in
+      Eden/Azahar/Skyline/Winlator already know how to consume — this is
+      what actually makes the driver "swap in" usable rather than just
+      "builds for Android."
+- [ ] Sanity-test the packaged driver in at least one of those pickers
+      before assuming the packaging step itself is correct — a `.so`
+      that loads is not the same as a `.so` that gets recognized and
+      selected correctly by a given emulator's driver manager.
 
 ## Phase 7 — CTS-driven hardening
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
