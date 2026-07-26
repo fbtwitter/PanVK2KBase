@@ -14,6 +14,9 @@ all: first_test
  
 first_test: ./src/tests/first_test/first_test.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/first_test $<
+
+memory: ./src/tests/memory/memory.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/memory $<
  
 clean:
 	rm -f first_test
