@@ -27,11 +27,14 @@ original recommendations inline below.
 - [ ] Get the device running the proprietary/vendor Mali blob driver
       first, so you have a correctness + performance oracle to diff
       against later.
-- [ ] Identify whether your kernel exposes JM (job-manager, older) or CSF
+- [x] Identify whether your kernel exposes JM (job-manager, older) or CSF
       (command-stream frontend, v10+) kbase ioctls. `first_test.c` builds
       with `-DMALI_USE_CSF=1` (see `makefile`), so this repo is already
-      assuming CSF — confirm that assumption holds for the real device,
-      not just the header.
+      assuming CSF — confirmed for the Poco X8 Pro: `/vendor/firmware/
+      mali_csffw.bin` (CSF-only firmware blob) exists on-device, and the
+      probe's reported UK version (`major=1`) matches CSF's numbering
+      scheme in the vendored headers, not JM's (`major=11`). See
+      `docs/kbase-notes.md`.
 - [x] Pull the exact kbase UAPI header for the target kernel — done,
       `third_party/kbase-uapi-r44p0/`. This is a **real** header, not a
       stub; keep it in sync if the target kernel's kbase version changes.

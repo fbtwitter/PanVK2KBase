@@ -133,6 +133,27 @@ independent signals now agree (kbase UK version, this repo's own
 `parse_gpuprops()` decode, and the vendor blob's own strings) — about as
 solid as this gets without MediaTek's actual private source tree.
 
+**JM vs CSF, confirmed for real (closes the ROADMAP Phase 0 item):**
+`first_test.c` builds with `-DMALI_USE_CSF=1`, and this device backs that
+assumption up three ways, not just "the probe didn't error":
+
+- `/vendor/firmware/mali_csffw.bin` exists on-device (300KB). This file is
+  CSF-architecture-specific — it's firmware uploaded to the GPU's own
+  command-stream-frontend microcontroller at driver init. JM-generation
+  kbase has no equivalent; there's nothing to upload.
+- The two UK-version numbering schemes in the vendored r49p1 headers are
+  worlds apart — CSF: `BASE_UK_VERSION_MAJOR=1` (`csf/mali_kbase_csf_ioctl.h`),
+  JM: `BASE_UK_VERSION_MAJOR=11` (`jm/mali_kbase_jm_ioctl.h`). The device
+  reported `major=1` — squarely CSF's scheme, not JM's.
+- Mali-G720 is Valhall 5th-gen (the `TTIx`/`Mali-TTIX` family decoded
+  earlier) — architecturally CSF-only regardless of driver config; Arm
+  hasn't shipped a JM variant of any Gen5+ Mali design.
+
+`dmesg` and `/proc/device-tree` were both inaccessible to the unprivileged
+`shell` user on this device (empty output, not an error) — worth knowing
+if you try to confirm this on another device and those paths are your
+first instinct; the firmware-blob check doesn't need either.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/
