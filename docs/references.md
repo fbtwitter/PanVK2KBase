@@ -32,7 +32,7 @@
 
 ## Hardware/software context this repo was scoped against (mid-2026)
 - PanVK is Vulkan-conformant on Mali-G610 (Valhall, v10, CSF).
-- This repo's actual target is Mali-G615-MC2 (UK 44.10 / r44p0) — verify
+- This repo's actual target is Mali-G615-MC2 (UK 1.20 CSF / r44p0) — verify
   its conformance status separately; do not assume it inherits G610's
   conformant status. See the Phase 0 note in `ROADMAP.md`.
 - Panthor (CSF, v10+) and its in-progress Rust reimplementation "Tyr" are

@@ -3,7 +3,7 @@
 Translation layer for PanVK (Mesa's open-source Vulkan driver for Arm
 Mali GPUs) to run on **kbase**, Arm's out-of-tree/vendor kernel driver —
 instead of the upstream `panfrost`/`panthor` DRM drivers PanVK currently
-requires. Target device: Mali-G615-MC2, kbase r44p0 / UK interface 44.10.
+requires. Target device: Mali-G615-MC2, kbase r44p0 / UK interface 1.20 (CSF).
 
 **Status: pre-alpha.** Standalone device probing works (see below);
 nothing wires into Mesa/PanVK yet.
@@ -12,7 +12,10 @@ nothing wires into Mesa/PanVK yet.
 
 ```
 third_party/kbase-uapi-r44p0/  real vendored kbase UAPI headers for the
-                                target kernel (r44p0 / UK 44.10)
+                                target kernel (r44p0 / UK 1.20 CSF)
+third_party/kbase-uapi-r49p1/  second vendored header set (r49p1 / UK 1.30
+                                CSF), confirmed against a real mt6899/
+                                Mali-G720 device - see docs/kbase-notes.md
 utils/parse_gpu_props.h        decodes KBASE_IOCTL_GET_GPUPROPS output:
                                 GPU ID, model, shader/L2 core counts, etc.
 tests/first_test/              standalone probe: open /dev/mali0, version

@@ -11,8 +11,9 @@ along here than a from-scratch roadmap assumes. Track deviations from the
 original recommendations inline below.
 
 ## Phase 0 — Ground yourself
-- [x] Pick ONE target: **Mali-G615-MC2**, real device, UK interface 44.10
-      (r44p0). Headers vendored in `third_party/kbase-uapi-r44p0/`, pulled
+- [x] Pick ONE target: **Mali-G615-MC2**, real device, UK interface 1.20
+      (CSF) / driver release r44p0. Headers vendored in
+      `third_party/kbase-uapi-r44p0/`, pulled
       from the `nest-open-source` mali-driver mirror — see that
       directory's README.md for exact commit/provenance.
       **Deviation to verify:** the original roadmap recommended
@@ -44,9 +45,12 @@ original recommendations inline below.
       size probe + fetch) → `parse_gpuprops()` (`utils/parse_gpu_props.h`),
       which decodes the GPU ID, shader core count, L2 slice count, and
       max frequency from the raw property blob.
-- [ ] Diff the probe's decoded output against what the vendor blob driver
+- [x] Diff the probe's decoded output against what the vendor blob driver
       reports for the same device (see Phase 0's blob-driver item) to
-      sanity-check the decoding, not just that the ioctl round-trips.
+      sanity-check the decoding, not just that the ioctl round-trips. Done
+      for the Poco X8 Pro — pulled `libGLES_mali.so` off-device and found
+      it embeds both `r49p1` and `Mali-G720`, matching the probe's decode
+      and the kbase UK version. See `docs/kbase-notes.md`.
 
 ## Phase 2 — pan_kmod backend skeleton
 - [ ] Clone Mesa.
@@ -104,4 +108,5 @@ original recommendations inline below.
       panfrost/panvk core code changes.
 - [ ] Track kbase UAPI drift — Arm's blob kernel driver evolves
       independently of whatever version you pinned to (currently r44p0 /
-      UK 44.10).
+      UK 1.20 CSF; a second target, r49p1 / UK 1.30 CSF, is also vendored
+      in `third_party/kbase-uapi-r49p1/` — see `docs/kbase-notes.md`).
