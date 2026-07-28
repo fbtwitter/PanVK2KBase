@@ -5,6 +5,7 @@
 #include "mali_base_common_kernel.h"
 #include "mali_base_kernel.h"
 #include "mali_kbase_ioctl.h"
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,17 +37,27 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
   alloc.in.extension = 0;
 
   // set the allocation metadata input flags
-  alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
-                   BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA;
+  alloc.in.flags =
+      BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD |
+      BASE_MEM_PROT_GPU_WR /*| BASE_MEM_COHERENT_SYSTEM | BASE_MEM_SAME_VA*/;
+
+  int ret = ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &alloc);
 
   // allocate the memory on the GPU
-  if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &alloc) < 0) {
+  if (ret < 0) {
+    printf("ret=%d\n", ret);
     perror("KBASE_IOCTL_MEM_ALLOC");
     return NULL;
   }
 
+  printf("ret=%d errno=%d\n", ret, errno);
+  printf("gpu_va=0x%llx\n",
+        (unsigned long long)alloc.out.gpu_va);
+  printf("flags=0x%llx\n",
+        (unsigned long long)alloc.out.flags);
+
   // read the output flags
-  //decode_mem_alloc_output_flags(alloc.out.flags);
+  decode_mem_alloc_output_flags(alloc.out.flags);
 
   // verify that the allocated GPU memory is aligned with the page size
   if (alloc.out.gpu_va & 0xfff)
@@ -63,6 +74,14 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
   bo->cpu =
       mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bo->gpu_va);
 
+  /*bo->cpu =
+    mmap((void *)(uintptr_t)bo->gpu_va,
+         size,
+         PROT_READ | PROT_WRITE,
+         MAP_SHARED | MAP_FIXED,
+         fd,
+         (off_t)bo->gpu_va);*/
+
   // in case of error, return null
   if (bo->cpu == MAP_FAILED) {
     perror("mmap");
@@ -72,6 +91,10 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
 
   // initialize the memory area with 0s
   memset(bo->cpu, 0, size);
+
+  printf("buffer gpu_va = 0x%016lx\n", bo->gpu_va);
+  printf("buffer cpu = 0x%016lx\n", bo->cpu);
+  printf("buffer size   = %zu\n", bo->size);
 
   // return the constructed buffer object
   return bo;

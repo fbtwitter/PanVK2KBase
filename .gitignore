@@ -1,2 +1,3 @@
 /build/*
 !/build/.gitkeep
+/third_party/MESA-KMOD
