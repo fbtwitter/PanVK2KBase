@@ -46,6 +46,7 @@
 
 #include "pan_kmod.h"
 #include "pan_kmod_backend.h"
+#include "pan_kmod_kbase.h"
 
 /* Vendored kbase UAPI headers. The include path is supplied by the meson
  * snippet in src/mesa/meson.build.kbase - see src/mesa/README.md.
@@ -55,7 +56,9 @@
 #include "mali_kbase_ioctl.h"
 #include "csf/mali_kbase_csf_ioctl.h"
 
-const struct pan_kmod_ops kbase_kmod_ops;
+/* Forward declaration; the definition is at the bottom of this file.
+ * Declared in pan_kmod_kbase.h.
+ */
 
 /* kbase allocations in this backend are BASE_MEM_SAME_VA: the kernel hands
  * back a VA that is valid for both CPU and GPU, so the CPU pointer returned

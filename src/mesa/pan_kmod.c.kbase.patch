@@ -7,42 +7,40 @@ function bails before any backend is consulted.
 
 This adds a probe for kbase *before* the DRM path, mirroring how Turnip
 special-cases kgsl (/dev/kgsl-3d0) alongside DRM enumeration. The probe is
-KBASE_IOCTL_VERSION_CHECK, which is side-effect free and fails cleanly on a
-non-kbase fd (see pan_kmod_fd_is_kbase() in pan_kmod_kbase.c).
+KBASE_IOCTL_VERSION_CHECK, side-effect free and clean on a non-kbase fd.
 
 pan_kmod_fd_is_kbase() reports the kbase UK interface version through
-out-params rather than having this file issue the ioctl itself, specifically
-so that pan_kmod.c - generic, driver-agnostic code - needs no kbase UAPI
-headers. That UK version is used as the pan_kmod_driver version, since it is
-the closest analogue to a DRM driver version and is what kbase clients
-actually version-gate on.
+out-params rather than having this file issue the ioctl, so pan_kmod.c -
+generic, driver-agnostic code - needs no kbase UAPI headers. The declaration
+lives in pan_kmod_kbase.h, matching how panthor_kmod.h serves the panthor
+backend (Mesa builds with -Werror=missing-prototypes, so a visible prototype
+is mandatory, not optional).
 
-Note the `if (!allocator)` default is hoisted above the probe, because the
-kbase path needs the allocator too.
+The `if (!allocator)` default is hoisted above the probe, since the kbase
+path needs the allocator too.
 
-Generated with `diff -u` against Mesa 26.3.0-devel (commit c439d52c) and
-verified: both translation units compile clean for aarch64-linux-android26,
-and pan_kmod.o's two undefined kbase symbols resolve exactly against
-pan_kmod_kbase.o.
+VERIFIED: generated from a tree that builds. Mesa 26.3.0-devel (7296f9a),
+native x86_64 Linux, meson 1.11.2 / LLVM 18.1.3. `ninja
+src/panfrost/lib/kmod/libpankmod_lib.a` succeeds with pan_kmod_kbase.c.o in
+the archive.
 
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index eac10b2..281553a 100644
 --- a/src/panfrost/lib/kmod/pan_kmod.c
 +++ b/src/panfrost/lib/kmod/pan_kmod.c
-@@ -14,6 +14,14 @@
- 
+@@ -15,6 +15,11 @@
  extern const struct pan_kmod_ops panfrost_kmod_ops;
  extern const struct pan_kmod_ops panthor_kmod_ops;
-+extern const struct pan_kmod_ops kbase_kmod_ops;
-+
-+/* Defined in pan_kmod_kbase.c. kbase is not a DRM driver, so it cannot be
-+ * identified by drmGetVersion() like the backends above. Reports the kbase
-+ * UK interface version through out-params so this file needs no kbase UAPI
-+ * headers.
-+ */
-+bool pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor);
  
++/* kbase is not a DRM driver, so it cannot be identified by drmGetVersion()
++ * like the backends above. pan_kmod_kbase.h declares the probe and the ops.
++ */
++#include "pan_kmod_kbase.h"
++
  static const struct {
     const char *name;
-@@ -51,15 +59,34 @@
+    const struct pan_kmod_ops *ops;
+@@ -51,15 +56,34 @@ struct pan_kmod_dev *
  pan_kmod_dev_create(int fd, uint32_t flags,
                      const struct pan_kmod_allocator *allocator)
  {

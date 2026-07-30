@@ -27,8 +27,12 @@ to be applied by hand.
 | File | Purpose |
 |---|---|
 | `pan_kmod_kbase.c` | The backend itself — implements `struct pan_kmod_ops`. |
+| `pan_kmod_kbase.h` | Declares `kbase_kmod_ops` and `pan_kmod_fd_is_kbase()`. Mirrors `panthor_kmod.h`. Not optional — Mesa builds with `-Werror=missing-prototypes`. |
 | `pan_kmod.c.kbase.patch` | The dispatch change: `pan_kmod_dev_create()` must probe for kbase *before* calling `drmGetVersion()`, which fails on a misc device. Kept as a readable patch rather than auto-applied, since upstream `pan_kmod.c` moves. |
-| `meson.build.kbase` | The `meson.build` hunk: adds the source file and the kbase UAPI include path. |
+| `meson.build.kbase.patch` | The `meson.build` hunk: adds the source file, the kbase UAPI include path, `-DMALI_USE_CSF=1`, and the kconfig shim. |
+| `wsl-install-deps.sh` | Installs the Linux toolchain needed to build Mesa's panfrost targets. |
+| `wsl-build.sh` | Syncs the backend in, applies both patches, configures and builds `libpankmod_lib`. |
+| `android-aarch64.cross` | Meson cross-file for the eventual Android build. |
 
 ## The two structural problems this backend runs into
 
@@ -72,58 +76,97 @@ than plausible-looking fakes:
   `MEM_ALLOC` time, with no separate bind step. Mapping pan_kmod's
   explicit-VM model onto that needs a design decision, not a guess.
 
+
 ## Building
 
+The backend **builds as part of Mesa**, verified on Linux. Windows can't do
+it (see "Why Linux" below), so the workflow is WSL:
+
+```bash
+# in WSL, as root (wsl -u root - no sudo/password needed)
+bash src/mesa/wsl-install-deps.sh    # toolchain + LLVM + libclc
+bash src/mesa/wsl-build.sh           # sync, patch, configure, build
 ```
-make mesa-libdrm           # once: fetch real libdrm via Mesa's own wrap
-make mesa-backend-sync     # copy the backend into the Mesa tree
-make mesa-backend-check    # compile it for aarch64-android + check symbols
+
+`wsl-build.sh` clones nothing — point `MESA` at a checkout, or clone into the
+WSL *native* filesystem first (building on `/mnt/c` goes through the 9p
+bridge and is dramatically slower for a tree this size).
+
+There is also a lighter-weight check that doesn't need a Mesa build at all:
+
+```
+make mesa-libdrm && make mesa-backend-sync && make mesa-backend-check
 ```
 
-### What has actually been verified
+which cross-compiles just the backend for `aarch64-linux-android26` and
+verifies its symbols.
 
-- **Compiles to a real object file** (`-c`, not `-fsyntax-only`) for
-  `aarch64-linux-android26`, against the **real** `pan_kmod.h` /
-  `pan_kmod_backend.h` from the Mesa checkout, the **real** vendored kbase
-  UAPI, and **real libdrm 2.4.133** (fetched via Mesa's own pinned wrap —
-  the stub in `syntax-check-stubs/` is only a fallback when libdrm hasn't
-  been downloaded). Clean, no warnings, against both `kbase-uapi-r49p1` and
-  `kbase-uapi-r44p0`.
-- **Integrates with the dispatch patch at link level.** With
-  `pan_kmod.c.kbase.patch` applied, `pan_kmod.c` also compiles clean, and
-  its two undefined kbase symbols (`kbase_kmod_ops`,
-  `pan_kmod_fd_is_kbase`) resolve exactly against the ones
-  `pan_kmod_kbase.c` defines — checked with `llvm-nm`.
+### Verified
 
-### What has *not* been verified
+**The backend is built by Mesa's own build system into the real library
+target.** Mesa 26.3.0-devel (`7296f9a`), native x86_64 Linux, meson 1.11.2,
+GCC 13.3, LLVM 18.1.3:
 
-**A full Mesa build has not been done, and is blocked on a real
-dependency.** Modern Mesa requires LLVM to build any panfrost target:
+```
+[1/3] Compiling C object src/panfrost/lib/kmod/libpankmod_lib.a.p/pan_kmod.c.o
+[2/3] Compiling C object src/panfrost/lib/kmod/libpankmod_lib.a.p/pan_kmod_kbase.c.o
+[3/3] Linking static target src/panfrost/lib/kmod/libpankmod_lib.a
+
+--- archive members ---
+libpankmod_lib.a.p/pan_kmod.c.o
+libpankmod_lib.a.p/panfrost_kmod.c.o
+libpankmod_lib.a.p/panthor_kmod.c.o
+libpankmod_lib.a.p/pan_kmod_kbase.c.o     <-- ours, alongside the upstream three
+
+--- kbase symbols ---
+0000000000000000 D kbase_kmod_ops
+0000000000000000 T pan_kmod_fd_is_kbase
+```
+
+So: it compiles under Mesa's full warning set (including
+`-Werror=missing-prototypes`, `-Werror=incompatible-pointer-types`,
+`-Werror=int-conversion`), links into `libpankmod_lib.a`, and the patched
+`pan_kmod.c` resolves against it.
+
+Separately, the backend also cross-compiles clean for
+`aarch64-linux-android26` against both `kbase-uapi-r49p1` and
+`kbase-uapi-r44p0`.
+
+### Not verified
+
+- **Never executed.** Building is not running. `dev_create` and
+  `bo_alloc`/`bo_free` use ioctl sequences this repo verified on real
+  hardware, but the backend itself has never been loaded or called.
+- **No Android build of Mesa yet.** `android-aarch64.cross` is checked in
+  and meson accepts it (it finds the NDK toolchain correctly), but a full
+  Android cross-build additionally needs a native `mesa_clc`, which means
+  building Mesa's host tools first. Not done.
+- **Enumeration above `pan_kmod` is untouched.** The dispatch patch fixes
+  `pan_kmod_dev_create()`, but whoever *opens* the device still looks for a
+  `/dev/dri/renderD*` node, not `/dev/mali0`.
+
+### Why Linux (and not Windows)
+
+Any panfrost target pulls in CLC, which requires LLVM:
 
 ```
 meson.build:976: ERROR: Feature llvm cannot be disabled: CLC requires LLVM
 ```
 
-`with_driver_using_cl` includes *both* `with_gallium_panfrost` and
-`with_panfrost_vk`, so there's no panfrost configuration that avoids CLC.
-The documented cross-build escape hatch, `-Dmesa-clc=system`, only moves the
-problem — it then requires a prebuilt native `mesa_clc`:
+`with_driver_using_cl` covers *both* `with_gallium_panfrost` and
+`with_panfrost_vk`, so no panfrost configuration avoids it. The documented
+cross-build escape hatch `-Dmesa-clc=system` only relocates the problem — it
+then wants a prebuilt native `mesa_clc`:
 
 ```
 meson.build:965: ERROR: Program 'mesa_clc' not found or not executable
 ```
 
-Building `mesa_clc` natively needs LLVM + Clang **development libraries on
-the build machine**. On this Windows host that's a substantial install, and
-Mesa cross-building from a Windows host to Android is an unusual path
-(Mesa's own docs assume a Linux host). A Linux build machine would make this
-straightforward.
+On Linux this is just `apt install llvm-dev libclc-18-dev` (note: the libclc
+version must match the LLVM version — `libclc-18-dev` for LLVM 18). On
+Windows it's a substantial LLVM build, and Mesa cross-building from a
+Windows host is an off-the-beaten-path setup its own docs don't cover.
 
-So the honest status: the backend compiles and links correctly against real
-Mesa interfaces, and the ioctl sequences in it were verified on real
-hardware by this repo's probes — but it has **never been built as part of
-Mesa, loaded, or executed**.
-
-An Android meson cross-file is checked in at `android-aarch64.cross` (meson
-accepts it and finds the NDK toolchain — configure gets as far as the LLVM
-error above, so the cross-file itself is good).
+Ubuntu 24.04 caveat: its meson is 1.3.2, older than Mesa's `>= 1.4.0`
+requirement, so `wsl-install-deps.sh` puts a newer meson in a venv at
+`/opt/mesa-venv` rather than fighting the system package.

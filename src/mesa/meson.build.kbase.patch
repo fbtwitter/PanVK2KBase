@@ -1,0 +1,46 @@
+Add the kbase backend to libpankmod_lib.
+
+Adds pan_kmod_kbase.c to the pan_kmod library and points it at the kbase
+UAPI headers, which are not part of Mesa - they're vendored in the
+PanVK2KBase repo (third_party/kbase-uapi-<version>/).
+
+Three things the backend needs beyond the source file itself:
+
+  -DMALI_USE_CSF=1   Selects the CSF (Valhall v10+) ioctl surface, matching
+                     every other consumer of these headers in PanVK2KBase.
+
+  -include kconfig_shim.h
+                     Resolves IS_ENABLED() for MTK-derived header sets
+                     (r49p1 uses it around vendor debug fields) outside a
+                     kernel build tree. Harmless for header sets that don't,
+                     like r44p0.
+
+  -I<kbase uapi dir> The vendored headers.
+
+The two absolute paths below are placeholders - substitute your own
+PanVK2KBase checkout. `make mesa-backend-sync` does this substitution for
+you rather than applying this patch literally.
+
+VERIFIED: this exact change builds. Mesa 26.3.0-devel (7296f9a), native
+x86_64 Linux, meson 1.11.2 / LLVM 18.1.3.
+
+--- a/src/panfrost/lib/kmod/meson.build
++++ b/src/panfrost/lib/kmod/meson.build
+@@ -5,13 +5,16 @@ libpankmod_lib_files = files(
+   'pan_kmod.c',
+   'panfrost_kmod.c',
+   'panthor_kmod.c',
++  'pan_kmod_kbase.c',
+ )
+
+ libpankmod_lib = static_library(
+   'pankmod_lib',
+   [libpankmod_lib_files],
+   include_directories : [inc_include, inc_src, inc_panfrost],
+-  c_args : [no_override_init_args],
++  c_args : [no_override_init_args, '-DMALI_USE_CSF=1',
++            '-include', '@PANVK2KBASE@/src/utils/kconfig_shim.h',
++            '-I@PANVK2KBASE@/third_party/kbase-uapi-r49p1'],
+   gnu_symbol_visibility : 'hidden',
+   dependencies: [dep_libdrm, idep_mesautil, idep_pan_packers, libpanfrost_model_dep],
+   build_by_default : false,
