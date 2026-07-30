@@ -59,5 +59,8 @@ queue_group: ./src/tests/queue_group/queue_group.c
 fence_probe: ./src/tests/fence_probe/fence_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/fence_probe $<
 
+event_probe: ./src/tests/event_probe/event_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/event_probe $<
+
 clean:
 	rm -f first_test

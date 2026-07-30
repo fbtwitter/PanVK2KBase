@@ -356,6 +356,46 @@ userspace of queue/group events elsewhere (Arm's own kbase driver
 design), unlike `INTERNAL_FENCE_WAIT` which is MTK-only and now shown
 empirically not to block. Not yet tried against this device.
 
+## poll()/read() on the kbase fd: mechanism untested, kick likely inert
+
+`tests/event_probe/event_probe.c` follows up on the redirect above:
+`poll(fd, POLLIN, timeout)` at three points (before any group/queue
+setup, bound but not kicked, and after `CS_QUEUE_KICK`), reading a
+`struct base_csf_notification` (`csf/mali_base_csf_kernel.h`) whenever
+`poll()` reports readable. Also a real-world exercise of the
+version-adaptive pattern: `BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FAULT` and
+its `fault_queue` payload only exist in r49p1 (added after r44p0's UK
+1.20), so that decode path is behind `#ifdef
+BASE_GPU_QUEUE_GROUP_QUEUE_ERROR_FAULT` — confirmed building clean
+against both header sets.
+
+Result on-device: `poll()` **never** returned readable, not even 2
+seconds after `KICK`, despite the queue buffer being filled with
+`0xdeadbeef` (garbage that should read as an invalid instruction to any
+real CS interpreter).
+
+**Most likely explanation, not yet confirmed:** this repo's `KICK` never
+touches the queue's mmap'd input/output pages (`queue_state`, from
+`CS_QUEUE_BIND`'s `mmap_handle`) — only the raw ring-buffer BO. Real CSF
+queues are expected to need the *insert* offset in that input page
+updated to tell firmware how much of the ring buffer is valid pending
+work; without that, `KICK` plausibly never registers as real work to
+the firmware at all, so there's nothing to fault on and nothing to
+notify. This is consistent with, not contradictory to, the caveat
+already noted for `queue_group.c`: `ret=0` from `KICK` was always only
+proof the *ioctl* succeeded, never proof the GPU executed anything.
+
+**Where this investigation stops for now:** confirming poll()/read() as
+a real mechanism needs an actual minimal CS instruction stream written
+through the correct insert-pointer protocol - that requires CSF ISA
+knowledge (instruction encoding for the command-stream frontend) this
+repo hasn't built up yet, and arguably belongs to Phase 4's "map
+VkQueueSubmit onto kbase command-stream submission" work directly
+rather than a quick fence-mechanism probe. Neither confirmed nor ruled
+out; unlike `INTERNAL_FENCE_WAIT`, there's no evidence against this
+being the right mechanism, only an inconclusive "we haven't given the
+firmware real work yet" result.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

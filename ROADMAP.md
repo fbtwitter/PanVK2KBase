@@ -145,11 +145,19 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       sequence can produce; most likely a kernel-internal MTK debug hook,
       not a userspace completion API. Full writeup in
       `docs/kbase-notes.md`.
-      **Redirect:** try `poll()`/`read()` on the kbase device fd plus
-      `KBASE_IOCTL_CS_EVENT_SIGNAL` (ioctl 44, present in both r44p0 and
-      r49p1 — not MTK-only) and `KBASE_IOCTL_CS_GET_GLB_IFACE` instead —
-      the standard mainline-kbase CSF event-notification primitives.
-      Not yet tried.
+      **Redirect tried, inconclusive (not another dead end):**
+      `tests/event_probe/event_probe.c` polls the kbase fd and reads
+      `struct base_csf_notification` when ready, at three points
+      (idle, bound, after `KICK`). `poll()` never returned readable, not
+      even 2s after kicking a queue filled with `0xdeadbeef`. Most
+      likely cause: this repo's `KICK` never updates the insert offset
+      in the queue's mmap'd input page, so firmware probably never sees
+      it as real work to fault on — not evidence the notification
+      channel itself doesn't work. Confirming it needs an actual minimal
+      CS instruction stream (real CSF ISA encoding), which is arguably
+      this checklist item's own scope ("map VkQueueSubmit onto kbase
+      command-stream submission") rather than a quick probe. Full
+      writeup in `docs/kbase-notes.md`.
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/
