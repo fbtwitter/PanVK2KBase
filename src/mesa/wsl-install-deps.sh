@@ -23,6 +23,7 @@ apt-get install -y -qq --no-install-recommends \
   python3-yaml \
   llvm-dev \
   libclang-cpp-dev \
+  libclang-18-dev \
   clang \
   libdrm-dev \
   libexpat1-dev \

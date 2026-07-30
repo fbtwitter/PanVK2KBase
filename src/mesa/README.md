@@ -132,18 +132,67 @@ Separately, the backend also cross-compiles clean for
 `aarch64-linux-android26` against both `kbase-uapi-r49p1` and
 `kbase-uapi-r44p0`.
 
+### Android cross-build — done
+
+A full PanVK Android driver now builds with the kbase backend in it:
+
+```bash
+bash src/mesa/wsl-install-deps.sh      # toolchain, LLVM, libclc
+bash src/mesa/wsl-fetch-ndk.sh         # Linux NDK r27c -> /opt/android-ndk
+bash src/mesa/wsl-build-host-tools.sh  # mesa_clc + panfrost_compile
+bash src/mesa/wsl-build-android.sh     # the driver itself
+```
+
+The host-tools step is not optional: a cross build can't run the aarch64
+binaries it produces, so Mesa's shader compilers must exist as native
+binaries for `-Dmesa-clc=system -Dprecomp-compiler=system` to consume.
+
+Result — `libvulkan_panfrost.so`, 18.8 MB:
+
+```
+ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked
+NEEDED: libdrm.so libhardware.so liblog.so libnativewindow.so libsync.so
+        libm.so libz.so libdl.so libc.so
+kbase symbols: kbase_kmod_dev_create, kbase_kmod_bo_alloc, kbase_kmod_ops,
+               pan_kmod_fd_is_kbase, ... (all present)
+```
+
+**It loads on the real device.** `make driver_load_probe` builds a probe
+that `dlopen()`s the driver from `/data/local/tmp` — no `/vendor` changes,
+no root, no risk to the running graphics stack. On the Poco X8 Pro:
+
+```
+OK: loaded, all NEEDED dependencies resolved
+OK: HMI (Android HAL module entrypoint) present
+  tag  = 0x48574d54 (HARDWARE_MODULE_TAG)
+  id   = vulkan
+  name = Mesa 3D Vulkan HAL
+```
+
+So every `NEEDED` dependency resolves on a stock device, and it exposes a
+well-formed Android hwvulkan HAL module — the same interface the device's
+own `vulkan.mali.so` uses (`ro.hardware.vulkan=mali`).
+
 ### Not verified
 
-- **Never executed.** Building is not running. `dev_create` and
-  `bo_alloc`/`bo_free` use ioctl sequences this repo verified on real
-  hardware, but the backend itself has never been loaded or called.
-- **No Android build of Mesa yet.** `android-aarch64.cross` is checked in
-  and meson accepts it (it finds the NDK toolchain correctly), but a full
-  Android cross-build additionally needs a native `mesa_clc`, which means
-  building Mesa's host tools first. Not done.
-- **Enumeration above `pan_kmod` is untouched.** The dispatch patch fixes
-  `pan_kmod_dev_create()`, but whoever *opens* the device still looks for a
-  `/dev/dri/renderD*` node, not `/dev/mali0`.
+- **The driver cannot actually drive the GPU yet.** It builds and loads;
+  that is not the same as working. Two known blockers, both above this
+  backend:
+  - **Enumeration.** The dispatch patch fixes `pan_kmod_dev_create()`, but
+    whoever *opens* the device still looks for a `/dev/dri/renderD*` node,
+    not `/dev/mali0`. Nothing currently reaches the kbase backend.
+  - **Submission.** `panvk_vX_gpu_queue.c` issues `DRM_IOCTL_PANTHOR_*` and
+    libdrm `drmSyncobj*` on a DRM fd — neither works on a misc device. And
+    the underlying "queue group never gets scheduled" problem in
+    `docs/kbase-notes.md` is still unsolved.
+- **The backend's own code has never executed.** `dev_create` and
+  `bo_alloc`/`bo_free` use ioctl sequences verified on hardware by this
+  repo's standalone probes, but the backend functions themselves have never
+  been called.
+- **Not installed as the system driver.** Replacing
+  `/vendor/lib64/hw/vulkan.mali.so` needs a writable `/vendor` (root) and
+  would break the device's graphics if the driver misbehaves. Deliberately
+  not attempted.
 
 ### Why Linux (and not Windows)
 

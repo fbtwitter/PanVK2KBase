@@ -102,6 +102,24 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       device/BO/VM, not submission — see Phase 4 and
       `docs/architecture.md`'s "Correction" section for why a
       `pan_kmod_kbase` backend alone isn't sufficient.
+- [x] **Android cross-build of the full driver** — this is Phase 6's
+      "cross-compile Mesa for Android via a Meson Android cross-file,
+      producing a standalone Vulkan ICD `.so`" arriving early, because
+      it fell out of getting the backend building. Produces
+      `libvulkan_panfrost.so` (18.8 MB, aarch64), with every kbase
+      backend symbol in it. Needs Mesa's host shader compilers built
+      natively first (`mesa_clc`, `panfrost_compile`) — a cross build
+      can't run the aarch64 binaries it produces. Scripts:
+      `src/mesa/wsl-fetch-ndk.sh`, `wsl-build-host-tools.sh`,
+      `wsl-build-android.sh`; cross-file `android-aarch64-wsl.cross`.
+      **Confirmed loading on the real device** via
+      `tests/driver_load_probe/` — `dlopen()` from `/data/local/tmp`
+      (no `/vendor` changes, no root): all `NEEDED` deps resolve and it
+      exposes a well-formed Android hwvulkan HAL module (`HMI`, tag
+      `HARDWARE_MODULE_TAG`, "Mesa 3D Vulkan HAL"), the same interface
+      the device's own `vulkan.mali.so` uses.
+      **But it cannot drive the GPU** — see the two unchecked items
+      immediately below, both of which sit *above* this backend.
 - [x] Get device probe working — `dev_create` does
       `VERSION_CHECK` → `SET_FLAGS` → `GET_GPUPROPS` and decodes the
       property blob into `pan_kmod_dev_props`, which is exactly the

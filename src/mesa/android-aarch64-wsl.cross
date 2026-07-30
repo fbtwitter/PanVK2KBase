@@ -1,0 +1,30 @@
+# Meson cross-file for building Mesa against a Linux Android NDK, aarch64.
+#
+# This is the one that actually works - see android-aarch64.cross for the
+# Windows-host variant, which is unusable because Mesa's panfrost targets
+# need LLVM/mesa_clc on the build machine (see src/mesa/README.md).
+#
+# Paths match src/mesa/wsl-fetch-ndk.sh (NDK r27c at /opt/android-ndk).
+# API 34: below the test device's API 36, and what Mesa's docs/android.rst
+# uses.
+#
+# The C++ flags come straight from Mesa's docs/android.rst - without
+# -static-libstdc++ the resulting .so depends on a libc++_shared.so that
+# isn't present on a stock device.
+
+[constants]
+ndk_bin = '/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin'
+
+[binaries]
+c = ndk_bin / 'aarch64-linux-android34-clang'
+cpp = [ndk_bin / 'aarch64-linux-android34-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+ar = ndk_bin / 'llvm-ar'
+strip = ndk_bin / 'llvm-strip'
+c_ld = 'lld'
+cpp_ld = 'lld'
+
+[host_machine]
+system = 'android'
+cpu_family = 'aarch64'
+cpu = 'armv8'
+endian = 'little'

@@ -67,6 +67,11 @@ event_probe: ./src/tests/event_probe/event_probe.c
 glb_iface_probe: ./src/tests/glb_iface_probe/glb_iface_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/glb_iface_probe $<
 
+# dlopen()s a built PanVK Android driver to check it loads on-device.
+# Doesn't touch /vendor - see the source for why.
+driver_load_probe: ./src/tests/driver_load_probe/driver_load_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_load_probe $<
+
 # --- Mesa CS instruction encoder (see docs/mesa-cs-builder.md) ---
 # Builds real Mali CSF instructions via Mesa's own encoder
 # (cs_builder.h) instead of sentinel bytes - see docs/kbase-notes.md's
