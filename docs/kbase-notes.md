@@ -396,6 +396,33 @@ out; unlike `INTERNAL_FENCE_WAIT`, there's no evidence against this
 being the right mechanism, only an inconclusive "we haven't given the
 firmware real work yet" result.
 
+**CSF ISA docs located — path forward exists, not yet taken.** The
+"this repo hasn't built up CSF ISA knowledge" gap above has a real
+answer, already on disk: `third_party/MESA-KMOD/src/panfrost/genxml/`
+(the Mesa clone, see `docs/architecture.md`) has the actual instruction
+set as genxml — `v12.xml` matches this device's architecture (12.8,
+Mali-G720/Mali-TTIX, confirmed in `docs/kbase-notes.md`'s device
+section above). Real opcode table: 64-bit instructions, 8-bit opcode in
+the top byte (`start="56"`), e.g. `MOVE48=1`, `MOVE32=2`, `WAIT=3`,
+`FINISH_TILING=9`, `SYNC_WAIT32=39`, `SYNC_WAIT64=53`. Mesa's own
+encoder, `genxml/cs_builder.h` (3131 lines), builds real instruction
+streams from this table.
+
+**Two ways to actually use this, with different risk profiles, neither
+attempted yet:**
+1. Link against `cs_builder.h` directly — correct-by-construction
+   encoding, but it depends on Mesa's `util` library (`bitset`,
+   `u_dynarray`, etc.), meaning cross-compiling a slice of Mesa's own
+   build for Android rather than just adding a header. More
+   infrastructure, safer encoding.
+2. Hand-encode one minimal instruction word directly from `v12.xml`,
+   no Mesa build dependency. Much less infrastructure, but it means
+   constructing and running real GPU firmware instructions by hand
+   against real hardware - a different risk class than every ioctl-level
+   probe so far, since a wrong encoding is executed by firmware
+   directly and could hang the GPU rather than just fail an ioctl
+   cleanly and loudly. Should not be attempted casually.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/
