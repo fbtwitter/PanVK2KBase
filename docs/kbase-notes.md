@@ -276,7 +276,7 @@ reason: `queue_bo` is referenced by the queue registration (`REGISTER`'s
 Correct order, confirmed clean on-device: unmap doorbell → terminate
 queue → terminate group → free BO.
 
-## KBASE_IOCTL_INTERNAL_FENCE_WAIT: reachable, but not yet proven useful
+## KBASE_IOCTL_INTERNAL_FENCE_WAIT: reachable, but NOT the completion mechanism
 
 `tests/fence_probe/fence_probe.c` calls r49p1's MediaTek-only
 `KBASE_IOCTL_INTERNAL_FENCE_WAIT` (ioctl 80, documented as gated behind
@@ -295,15 +295,38 @@ a real wait mechanism and there was trivially nothing to wait for" from
 NOT yet confirm this is a usable completion signal for Phase 4's
 fence-translation shim.
 
-To actually test that, the next experiment needs a **real** `queue`
-value from an active bound CS queue (e.g. `queue_group.c`'s
-`queue_bo->cpu`/`buffer_gpu_addr` after `CS_QUEUE_BIND`) and a non-zero
-`flags` (candidates in `mali_base_kernel.h`:
-`BASE_INTERNAL_FENCE_WAIT_IDLE_FLAG`, `_RESULT_FLAG`, `_DUMP_FLAG`) —
-neither is documented beyond the flag names, so this would be
-trial-and-error against the real device, watching whether the call
-actually blocks for `time_in_microseconds` and what it returns for a
-queue that's genuinely idle vs. one with pending work. Not yet done.
+**Follow-up done, and it's a negative result.** Extended
+`fence_probe.c` to set up a real queue group + bound CS queue (same
+shape as `queue_group.c`) and called `INTERNAL_FENCE_WAIT` with the
+queue's real GPU VA, the calling process's real `pid`, a 2-second
+`time_in_microseconds` timeout, and every documented flag combination
+(`BASE_INTERNAL_FENCE_WAIT_IDLE_FLAG`, `_RESULT_FLAG`, `_DUMP_FLAG`) —
+both before and after `CS_QUEUE_KICK`. Timed each call with
+`clock_gettime()` to distinguish "actually blocked" from "returned
+instantly."
+
+Result: **every single variant returned in ~0.0ms**, `ret=0`/`errno=0`,
+regardless of real vs. zeroed input, bound vs. unbound, kicked vs. not,
+or which flag was set. A 2-second requested timeout that never once
+measurably blocks is strong evidence this ioctl does not function as a
+general-purpose "wait for this queue to reach some state" primitive —
+at minimum not for the args this repo's ioctl sequence produces. Most
+likely explanation given the name and `CONFIG_MALI_MTK_DEBUG_DUMP`/
+`_FENCE_DEBUG` gating: this is a kernel-internal diagnostic hook (e.g.
+for MTK's own driver-side fence-timeout dump tooling), not a
+userspace-facing completion-wait API — "internal" in the struct/ioctl
+name should have been a bigger hint from the start.
+
+**Conclusion: don't build Phase 4's fence shim on this ioctl.** The
+more standard mainline-kbase primitive to try next is `poll()`/`read()`
+on the kbase device fd itself for CS event notifications, paired with
+`KBASE_IOCTL_CS_EVENT_SIGNAL` (`csf/mali_kbase_csf_ioctl.h`, ioctl 44,
+present in both r44p0 and r49p1 — not an MTK-only addition) and
+`KBASE_IOCTL_CS_GET_GLB_IFACE` for the global command-stream interface.
+This matches how mainline kbase CSF is actually documented to notify
+userspace of queue/group events elsewhere (Arm's own kbase driver
+design), unlike `INTERNAL_FENCE_WAIT` which is MTK-only and now shown
+empirically not to block. Not yet tried against this device.
 
 ## Where to ask
 

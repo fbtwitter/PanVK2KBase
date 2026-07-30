@@ -136,14 +136,20 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `CONFIG_MALI_MTK_FENCE_DEBUG` that r44p0 doesn't have; worth
       checking whether that's usable before designing a generic shim
       (see `docs/kbase-notes.md`).
-      **Partial progress:** `tests/fence_probe/fence_probe.c` confirmed
-      on-device that this device's kernel actually implements the ioctl
-      (`ret=0`, not `ENOTTY`) — so the code path is built in, not just
-      declared in the header. Not yet confirmed as a *usable* completion
-      signal: the probe passed all-zero args, which succeeded but can't
-      distinguish "real wait, trivially satisfied" from "no-op on
-      degenerate input." Next step needs a real bound-queue handle and
-      non-zero flags — see `docs/kbase-notes.md` for specifics.
+      **Resolved as a dead end, don't revisit:** `tests/fence_probe/
+      fence_probe.c` confirmed the kernel implements the ioctl (`ret=0`,
+      not `ENOTTY`), then tested it against a real bound CS queue (real
+      GPU VA, real pid, every documented flag, before/after `KICK`,
+      2-second requested timeout) — every variant returned in ~0.0ms.
+      That's not a real wait mechanism for any input this repo's ioctl
+      sequence can produce; most likely a kernel-internal MTK debug hook,
+      not a userspace completion API. Full writeup in
+      `docs/kbase-notes.md`.
+      **Redirect:** try `poll()`/`read()` on the kbase device fd plus
+      `KBASE_IOCTL_CS_EVENT_SIGNAL` (ioctl 44, present in both r44p0 and
+      r49p1 — not MTK-only) and `KBASE_IOCTL_CS_GET_GLB_IFACE` instead —
+      the standard mainline-kbase CSF event-notification primitives.
+      Not yet tried.
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/
