@@ -408,20 +408,27 @@ the top byte (`start="56"`), e.g. `MOVE48=1`, `MOVE32=2`, `WAIT=3`,
 encoder, `genxml/cs_builder.h` (3131 lines), builds real instruction
 streams from this table.
 
-**Two ways to actually use this, with different risk profiles, neither
-attempted yet:**
-1. Link against `cs_builder.h` directly — correct-by-construction
-   encoding, but it depends on Mesa's `util` library (`bitset`,
-   `u_dynarray`, etc.), meaning cross-compiling a slice of Mesa's own
-   build for Android rather than just adding a header. More
-   infrastructure, safer encoding.
+**Two ways to actually use this, with different risk profiles.** Chose
+option 1:
+1. **Link against `cs_builder.h` directly** — correct-by-construction
+   encoding. Done: see `docs/mesa-cs-builder.md` for the full setup
+   (Mesa clone, genxml codegen, the two util `.c` files and two
+   platform macros actually needed, why `--gc-sections` matters).
+   `tests/cs_encode_probe/cs_encode_probe.c` confirms it produces
+   correct bytes offline (no device access) — a `MOVE32` instruction
+   encodes to `0x0200000000001234` for immediate `0x1234`, `0x02`
+   matching `v12.xml`'s opcode table exactly.
 2. Hand-encode one minimal instruction word directly from `v12.xml`,
-   no Mesa build dependency. Much less infrastructure, but it means
-   constructing and running real GPU firmware instructions by hand
-   against real hardware - a different risk class than every ioctl-level
-   probe so far, since a wrong encoding is executed by firmware
-   directly and could hang the GPU rather than just fail an ioctl
-   cleanly and loudly. Should not be attempted casually.
+   no Mesa build dependency — not taken, in favor of option 1's
+   correctness guarantee.
+
+**Still not done:** wiring a real (not just offline-verified)
+instruction stream into a live `CS_QUEUE_KICK` through the correct
+insert-pointer protocol, and re-running `event_probe.c`'s poll()/read()
+check against it. That's the actual GPU-firmware-execution step — a
+wrong encoding is executed by firmware directly and could hang the GPU
+rather than just fail an ioctl cleanly, so this shouldn't be attempted
+casually even with a verified-correct encoder in hand.
 
 ## Where to ask
 

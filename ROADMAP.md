@@ -158,6 +158,13 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       this checklist item's own scope ("map VkQueueSubmit onto kbase
       command-stream submission") rather than a quick probe. Full
       writeup in `docs/kbase-notes.md`.
+      **CSF instruction encoder built and verified offline:**
+      `tests/cs_encode_probe/cs_encode_probe.c` links Mesa's own
+      `cs_builder.h` (not hand-encoded bytes) and confirms it produces
+      correct instruction bytes for this device's architecture — see
+      `docs/mesa-cs-builder.md` for the full build setup. Not yet wired
+      into a live `KICK`; that's the next step, and the point where this
+      moves from "verified offline" to "executed by real GPU firmware."
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/

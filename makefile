@@ -62,5 +62,46 @@ fence_probe: ./src/tests/fence_probe/fence_probe.c
 event_probe: ./src/tests/event_probe/event_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/event_probe $<
 
+# --- Mesa CS instruction encoder (see docs/mesa-cs-builder.md) ---
+# Builds real Mali CSF instructions via Mesa's own encoder
+# (cs_builder.h) instead of sentinel bytes - see docs/kbase-notes.md's
+# "poll()/read() on the kbase fd" section for why. Needs a real Mesa
+# checkout, not vendored in this repo (see docs/mesa-cs-builder.md for
+# the clone command - it's gitignored, ~600MB, local to whichever
+# machine clones it) and a Python interpreter for the genxml codegen
+# step below.
+MESA_DIR ?= third_party/MESA-KMOD
+# Must match the target GPU's architecture major version, e.g. 12 for
+# this repo's Poco X8 Pro/Mali-G720 target (see utils/parse_gpu_props.h's
+# decode). A different device needs a different PAN_ARCH.
+PAN_ARCH ?= 12
+PYTHON ?= python3
+MESA_GENXML := $(MESA_DIR)/src/panfrost/genxml
+MESA_PACK_H := $(MESA_GENXML)/v$(PAN_ARCH)_pack.h
+MESA_CS_INCLUDES := -I$(MESA_DIR)/src/panfrost -I$(MESA_DIR)/src -I$(MESA_DIR)/src/util -I$(MESA_DIR)/include
+# Mesa's C11 threads/time compat shims (src/c11/) need to be told
+# explicitly what the platform supports - normally supplied by meson.
+# Android and Linux both have real pthreads and a real struct timespec.
+MESA_CS_DEFS := -DPAN_ARCH=$(PAN_ARCH) -DHAVE_PTHREAD -DHAVE_STRUCT_TIMESPEC
+# Dead-code-strip so only what cs_builder.h actually calls
+# (reralloc_size, util_dynarray_is_data_stack_allocated) gets linked,
+# not the GPU-shader-printf machinery ralloc.c would otherwise
+# transitively pull in via whole-object linking - see
+# docs/mesa-cs-builder.md.
+MESA_CS_GC := -ffunction-sections -fdata-sections -Wl,--gc-sections
+
+.PHONY: mesa-cs-pack
+
+mesa-cs-pack: $(MESA_PACK_H)
+
+$(MESA_PACK_H):
+	@test -d "$(MESA_DIR)" || { echo "error: $(MESA_DIR) not found - see docs/mesa-cs-builder.md for the clone command"; exit 1; }
+	cd $(MESA_GENXML) && $(PYTHON) gen_pack.py v$(PAN_ARCH).xml > v$(PAN_ARCH)_pack.h
+
+cs_encode_probe: ./src/tests/cs_encode_probe/cs_encode_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/cs_encode_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
 clean:
 	rm -f first_test
