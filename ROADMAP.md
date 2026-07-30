@@ -181,6 +181,17 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `tests/glb_iface_probe/glb_iface_probe.c` shows the firmware
       offers 8 CSG slots × 8 streams at interface v3.6.0, so there is
       no shortage of anything.
+      **Vendor blob reverse-engineered for comparison.** Mapped
+      `libGLES_mali.so`'s complete kbase ioctl surface (50 call sites
+      resolved via `ioctl@plt` + `mov`/`movk` pairing — see
+      `docs/kbase-notes.md` for the method and the non-obvious pitfalls).
+      It calls several things this repo never does: `MEM_JIT_INIT`,
+      `MEM_EXEC_INIT`, `CS_TILER_HEAP_INIT`, `CONTEXT_PRIORITY_CHECK`,
+      `GET_CONTEXT_ID`, `STREAM_CREATE`. It also uses
+      `CS_QUEUE_GROUP_CREATE_1_6` (nr 42), not the modern nr 58 these
+      probes use. Concrete next experiment: replicate that context setup
+      (JIT init + exec init + tiler heap) before group create, and try
+      the older group-create struct.
       **Blocked on kernel visibility, and it needs root.** Verified on
       this device: `dmesg` → `Permission denied` (no `CAP_SYSLOG`),
       `/sys/kernel/debug/mali0/` absent, tracefs readable but event

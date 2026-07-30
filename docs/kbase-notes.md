@@ -500,6 +500,63 @@ reports whether `CS_EXTRACT` ever advances):
   interface version is far newer than anything kbase gates group
   scheduling on. `iface_has_enough_streams(cs_min=1)` clearly passes too.
 
+### What the vendor blob does that this repo doesn't (RE findings)
+
+Since kernel-side diagnostics are unavailable (below), the other angle is
+the vendor userspace driver, which demonstrably *does* get groups
+scheduled. Pulled `/vendor/lib64/egl/mt6899/libGLES_mali.so` (52MB,
+world-readable, no root) and mapped its kbase ioctl usage. Method, for
+reproducibility:
+
+1. Auto-generate a dumper of every `KBASE_IOCTL_*` value from the
+   vendored r49p1 headers, cross-compile it, and run it on-device — the
+   ioctl numbers encode `sizeof(struct)`, so computing them by hand is
+   error-prone.
+2. `llvm-objdump -d` the blob and extract every `bl … <ioctl@plt>` call
+   site with preceding context (`ioctl@LIBC` is an imported symbol, so
+   all call sites are findable).
+3. For each call site, walk backwards to pair the `mov w1, #lo` with its
+   `movk w1, #hi, lsl #16` and reconstruct the 32-bit request. **Note:**
+   the `movk` is scheduled several instructions after the `mov`, not
+   adjacent — naive adjacent-line matching finds almost nothing, and
+   the constants appear neither as raw literals in the file nor in
+   literal pools.
+
+Result: 50 of 56 call sites resolved, and they form a clean 1:1
+ioctl-wrapper layer (one wrapper per ioctl, laid out in header order
+around `0x1dba000`–`0x1dbc300`), so this is the blob's complete kbase
+surface, not a sample.
+
+**Called by the blob, never called by this repo's probes:**
+
+- `KBASE_IOCTL_MEM_JIT_INIT` — JIT memory pool setup.
+- `KBASE_IOCTL_MEM_EXEC_INIT` — executable-VA zone setup.
+- `KBASE_IOCTL_CS_TILER_HEAP_INIT` (+ `_1_13` and `_TERM`) — confirms
+  the tiler-heap hypothesis is live; the vendor driver always creates
+  one.
+- `KBASE_IOCTL_CONTEXT_PRIORITY_CHECK`, `KBASE_IOCTL_GET_CONTEXT_ID`,
+  `KBASE_IOCTL_STREAM_CREATE` (fence stream), `KBASE_IOCTL_MEM_SYNC`,
+  `KBASE_IOCTL_KCPU_QUEUE_CREATE`/`_DELETE`/`_ENQUEUE`.
+
+**Notable version choice:** the blob's group-create wrapper uses
+`KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6` (nr 42), *not* the modern
+`CS_QUEUE_GROUP_CREATE` (nr 58) that this repo's probes use, and not
+`_1_18` either. Both of those are entirely absent from the blob. Worth
+testing whether the older, smaller group-create struct behaves
+differently — this is a concrete, cheap experiment.
+
+**Also confirmed:** `KBASE_IOCTL_INTERNAL_FENCE_WAIT` really is used by
+the vendor driver (one call site), so it is a genuine MTK mechanism —
+but that does not contradict the finding above that it never blocks for
+the arguments this repo can construct.
+
+**Next experiment this suggests** (not yet run): replicate the vendor's
+context setup before creating a group — `MEM_JIT_INIT` + `MEM_EXEC_INIT`
+right after `SET_FLAGS`, then `CS_TILER_HEAP_INIT`, then group create
+(trying both nr 58 and nr 42), then bind/insert/kick. Any of those three
+setup steps is a plausible precondition for the scheduler to consider a
+group schedulable.
+
 **Why this can't be chased further from userspace on this device.**
 The failure path is `dev_dbg`-only and otherwise silent, so it needs
 kernel-side visibility — and `dmesg` returns `klogctl: Permission
