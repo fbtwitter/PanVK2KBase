@@ -174,9 +174,20 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       a **CSG slot**, and that call is skipped for a freshly created
       group (`scheduler_group_schedule()` returns 0 unconditionally and
       only marks the group runnable). So `KICK` succeeding proves
-      nothing about execution. Chasing it further needs kernel-side
-      visibility this device denies (`dmesg` → `Permission denied`
-      unprivileged). Full writeup + candidate next steps in
+      nothing about execution.
+      **Ruled out so far:** CS interface index; endpoint masks (real
+      `RAW_SHADER_PRESENT` mask, compute-only, and `~0ULL` all fail
+      identically); ring-buffer validity; and firmware capacity —
+      `tests/glb_iface_probe/glb_iface_probe.c` shows the firmware
+      offers 8 CSG slots × 8 streams at interface v3.6.0, so there is
+      no shortage of anything.
+      **Blocked on kernel visibility, and it needs root.** Verified on
+      this device: `dmesg` → `Permission denied` (no `CAP_SYSLOG`),
+      `/sys/kernel/debug/mali0/` absent, tracefs readable but event
+      enable/read denied — and the registered `mali` tracepoints are
+      memory/JIT only, with no CSG-scheduling ones. `ro.build.type=user`,
+      `ro.debuggable=0`, SELinux enforcing as `u:r:shell:s0`. No
+      developer-options toggle changes this. Full writeup in
       `docs/kbase-notes.md`.
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,

@@ -1,6 +1,9 @@
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
 
 #include "gpu/mali_kbase_gpu_id.h"
 #include "mali_kbase_ioctl.h"
@@ -401,4 +404,91 @@ void parse_gpuprops(void *buffer, size_t length) {
       break;
     }
   }
+}
+/*
+    Extracts a single property value by ID from a raw KBASE_IOCTL_GET_GPUPROPS
+    buffer, without printing anything. Same key/size-code walk as
+    parse_gpuprops() above, just returning one value instead of dumping all
+    of them - needed when code has to *act* on a property rather than show
+    it to a human (e.g. passing the real shader-core mask to
+    CS_QUEUE_GROUP_CREATE instead of a made-up one).
+
+    Returns true and writes *out if the property is present.
+*/
+static bool gpuprops_lookup(void *buffer, size_t length, uint32_t want_id,
+                            uint64_t *out) {
+  uint8_t *buf = buffer;
+  size_t off = 0;
+
+  while (off + 4 <= length) {
+    uint32_t key = *(uint32_t *)(buf + off);
+    off += 4;
+
+    uint32_t id = key >> 2;
+    uint32_t size_code = key & 0x3;
+    size_t value_size;
+
+    switch (size_code) {
+    case KBASE_GPUPROP_VALUE_SIZE_U8:
+      value_size = 1;
+      break;
+    case KBASE_GPUPROP_VALUE_SIZE_U16:
+      value_size = 2;
+      break;
+    case KBASE_GPUPROP_VALUE_SIZE_U32:
+      value_size = 4;
+      break;
+    case KBASE_GPUPROP_VALUE_SIZE_U64:
+      value_size = 8;
+      break;
+    default:
+      return false;
+    }
+
+    if (off + value_size > length)
+      return false;
+
+    if (id == want_id) {
+      *out = read_value(buf + off, value_size);
+      return true;
+    }
+
+    off += value_size;
+  }
+
+  return false;
+}
+
+/*
+    Convenience wrapper: does the two-step GET_GPUPROPS size-probe + fetch
+    and returns the GPU's real shader-core presence mask
+    (KBASE_GPUPROP_RAW_SHADER_PRESENT). Returns 0 on failure.
+*/
+static uint64_t kbase_get_shader_present(int fd) {
+  struct kbase_ioctl_get_gpuprops probe = {
+      .buffer = 0,
+      .size = 0,
+      .flags = 0,
+  };
+
+  int size = ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &probe);
+  if (size <= 0)
+    return 0;
+
+  uint8_t *buf = calloc(1, (size_t)size);
+  if (!buf)
+    return 0;
+
+  struct kbase_ioctl_get_gpuprops fetch = {
+      .buffer = (uint64_t)(uintptr_t)buf,
+      .size = (uint32_t)size,
+      .flags = 0,
+  };
+
+  uint64_t mask = 0;
+  if (ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &fetch) >= 0)
+    gpuprops_lookup(buf, (size_t)size, KBASE_GPUPROP_RAW_SHADER_PRESENT, &mask);
+
+  free(buf);
+  return mask;
 }

@@ -474,6 +474,32 @@ if the group never reaches a slot, `queue->user_io_gpu_va` stays 0
 on slot at runtime"), so firmware never even sees these pages — which
 is exactly consistent with `CS_ACTIVE` never leaving 0.
 
+**Hypotheses tested and ruled out** (via the config sweep now built into
+`live_kick_probe.c`, which runs several group shapes in one pass and
+reports whether `CS_EXTRACT` ever advances):
+
+- *CS interface index* — `csi_index` 0 and 1 behave identically.
+- *Endpoint masks* — the first version passed `~0ULL` for tiler/fragment/
+  compute masks. The kernel only validates `*_max <= hweight64(*_mask)`,
+  then hands the mask to firmware as `CSG_ALLOW_*`, so asking for 64
+  shader cores on an 8-core GPU looked like a plausible cause. It isn't:
+  the real mask (`RAW_SHADER_PRESENT = 0x550055`), a compute-only group
+  with no tiler/fragment endpoints, and the original `~0ULL` all fail
+  identically. (`parse_gpu_props.h` gained `gpuprops_lookup()` /
+  `kbase_get_shader_present()` to query the real mask rather than
+  hardcoding it.)
+- *Ring buffer validity* — 4096 bytes is exactly `CS_RING_BUFFER_MIN_SIZE`,
+  is a power of two, and page-aligned; `CS_QUEUE_REGISTER` accepts it and
+  the kernel's region checks (native type, not shrinkable, big enough)
+  all pass.
+- *Firmware capacity* — `tests/glb_iface_probe/glb_iface_probe.c` queries
+  `KBASE_IOCTL_CS_GET_GLB_IFACE` (read-only, no submission). The firmware
+  reports **glb_version 3.6.0, 8 CSG slots, 8 streams per slot (64
+  total), 27520-byte suspend buffer per group, stream features
+  `0x0007107f`**. So there is no shortage of slots or streams, and the
+  interface version is far newer than anything kbase gates group
+  scheduling on. `iface_has_enough_streams(cs_min=1)` clearly passes too.
+
 **Why this can't be chased further from userspace on this device.**
 The failure path is `dev_dbg`-only and otherwise silent, so it needs
 kernel-side visibility — and `dmesg` returns `klogctl: Permission

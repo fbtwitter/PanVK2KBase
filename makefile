@@ -62,6 +62,11 @@ fence_probe: ./src/tests/fence_probe/fence_probe.c
 event_probe: ./src/tests/event_probe/event_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/event_probe $<
 
+# Read-only query of the CSF firmware's global interface (slot counts,
+# stream counts, interface version). No submission, no state change.
+glb_iface_probe: ./src/tests/glb_iface_probe/glb_iface_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/glb_iface_probe $<
+
 # --- Mesa CS instruction encoder (see docs/mesa-cs-builder.md) ---
 # Builds real Mali CSF instructions via Mesa's own encoder
 # (cs_builder.h) instead of sentinel bytes - see docs/kbase-notes.md's
