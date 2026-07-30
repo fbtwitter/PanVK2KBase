@@ -422,13 +422,70 @@ option 1:
    no Mesa build dependency — not taken, in favor of option 1's
    correctness guarantee.
 
-**Still not done:** wiring a real (not just offline-verified)
-instruction stream into a live `CS_QUEUE_KICK` through the correct
-insert-pointer protocol, and re-running `event_probe.c`'s poll()/read()
-check against it. That's the actual GPU-firmware-execution step — a
-wrong encoding is executed by firmware directly and could hang the GPU
-rather than just fail an ioctl cleanly, so this shouldn't be attempted
-casually even with a verified-correct encoder in hand.
+## Live KICK with a real instruction: submitted cleanly, never executed
+
+`tests/live_kick_probe/live_kick_probe.c` does the real thing:
+encodes a `MOVE32` with `cs_builder.h` straight into a bound queue's
+ring buffer, writes `CS_INSERT` in the mmap'd user input page, and
+calls `CS_QUEUE_KICK` for real. Run on-device (Poco X8 Pro, r49p1).
+
+**Protocol details worth keeping** (all verified against the kernel
+driver source, see `utils/csf_user_regs.h` for provenance):
+
+- `CS_INSERT` is a **byte offset** into the ring buffer, not an address.
+  Confirmed from the kernel's own diagnostic print, which reports ring
+  buffer base, insert, and extract as three separate values with
+  insert/extract starting at 0 while base is a real address.
+- The ring buffer's GPU address is the **CPU pointer** (SAME_VA), *not*
+  `bo->gpu_va` — that's the reusable cookie (`0x41000` for every
+  allocation, see the SAME_VA section above). An early version of this
+  probe passed the cookie to `cs_builder`'s `cs_buffer.gpu`; harmless
+  for a single chunk that emits no link instructions, but wrong, and it
+  would corrupt any multi-chunk stream.
+- A single 64-bit store satisfies the kernel's "CS_INSERT should be
+  accessed atomically" requirement on aarch64 (one `STR`).
+- Userspace does **not** need to ring the hardware doorbell itself for
+  an already-bound queue. `kbase_csf_queue_kick()` only flags the queue
+  and wakes the scheduler kthread; the kernel rings the real MMIO
+  doorbell later on our behalf.
+
+**Result: the submission is accepted, but the GPU never runs it.**
+`KICK` returns 0, and then `CS_EXTRACT` stays `0` (never advances to
+the expected `8`) and `CS_ACTIVE` stays `0` for the full 2s wait. No
+`poll()` notification either. **No GPU hang** — `first_test` and
+`queue_group` both still run clean afterward, and the device needed no
+reset. Ruled out: the CS interface index (`csi_index` 0 and 1 give
+identical results).
+
+**Where it actually stops, from the kernel source.** The CS is only
+programmed and started when the scheduler places the group on a **CSG
+slot** — that's `onslot_csg_add_new_queue()`, which writes `CS_BASE`/
+`CS_SIZE`, does the `CS_REQ.STATE=START` handshake, and rings the
+kernel doorbell. But in `kbase_csf_scheduler_queue_start()` that call
+is guarded by `kbasep_csf_scheduler_group_is_on_slot_locked(group)`,
+which is false for a freshly created group. The preceding
+`scheduler_group_schedule()` returns 0 *unconditionally* — it merely
+inserts the group into the runnable list and calls `scheduler_wakeup()`.
+So a successful `KICK` guarantees nothing about execution; actual slot
+assignment is deferred to a scheduler tick, and here it evidently never
+completes. Note this also explains the earlier `event_probe.c` result:
+if the group never reaches a slot, `queue->user_io_gpu_va` stays 0
+(kernel comment: "only mapped when scheduler decides to put the queue
+on slot at runtime"), so firmware never even sees these pages — which
+is exactly consistent with `CS_ACTIVE` never leaving 0.
+
+**Why this can't be chased further from userspace on this device.**
+The failure path is `dev_dbg`-only and otherwise silent, so it needs
+kernel-side visibility — and `dmesg` returns `klogctl: Permission
+denied` for the unprivileged `shell` user here (KTRACE/debugfs likewise
+out of reach without root). Candidate next steps, all needing more than
+this probe: a rooted device or a userdebug build to read the driver's
+own diagnostics; comparing against a trace of the vendor blob driver
+doing a real submission (it clearly gets groups onto slots); or
+checking whether group creation needs more setup than this probe does
+(e.g. a tiler heap via `CS_TILER_HEAP_INIT`, or the `dvs_buf` field
+left zero in `GROUP_CREATE`) before the scheduler will consider the
+group schedulable.
 
 ## Where to ask
 

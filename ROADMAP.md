@@ -162,9 +162,22 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `tests/cs_encode_probe/cs_encode_probe.c` links Mesa's own
       `cs_builder.h` (not hand-encoded bytes) and confirms it produces
       correct instruction bytes for this device's architecture — see
-      `docs/mesa-cs-builder.md` for the full build setup. Not yet wired
-      into a live `KICK`; that's the next step, and the point where this
-      moves from "verified offline" to "executed by real GPU firmware."
+      `docs/mesa-cs-builder.md` for the full build setup.
+      **Wired into a live KICK — submitted cleanly, never executed:**
+      `tests/live_kick_probe/live_kick_probe.c` encodes a real `MOVE32`
+      into a bound queue's ring buffer, writes `CS_INSERT` (a byte
+      offset, per `utils/csf_user_regs.h`), and kicks for real. `KICK`
+      returns 0 but `CS_EXTRACT`/`CS_ACTIVE` both stay 0 — the GPU never
+      runs it. No hang; device healthy afterward. Root cause located in
+      the kernel source: the CS is only programmed/started by
+      `onslot_csg_add_new_queue()` once the scheduler puts the group on
+      a **CSG slot**, and that call is skipped for a freshly created
+      group (`scheduler_group_schedule()` returns 0 unconditionally and
+      only marks the group runnable). So `KICK` succeeding proves
+      nothing about execution. Chasing it further needs kernel-side
+      visibility this device denies (`dmesg` → `Permission denied`
+      unprivileged). Full writeup + candidate next steps in
+      `docs/kbase-notes.md`.
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/
@@ -173,9 +186,14 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       TILER_HEAP_CREATE` / `_DESTROY` directly — not through
       `pan_kmod_ops`. A kbase target needs a sibling file swapping those
       for `CS_QUEUE_GROUP_CREATE` / `CS_QUEUE_REGISTER` / `CS_QUEUE_BIND`
-      / `CS_QUEUE_KICK` (already prototyped and confirmed working
-      end-to-end on-device in `tests/queue_group/queue_group.c`) and
-      `CS_TILER_HEAP_INIT`/`_TERM` for the tiler-heap half.
+      / `CS_QUEUE_KICK` (prototyped in `tests/queue_group/queue_group.c`
+      — every ioctl round-trips, but see the live-KICK finding above:
+      that is *not* the same as the GPU executing anything, and getting
+      a group actually scheduled onto a CSG slot is still unsolved) and
+      `CS_TILER_HEAP_INIT`/`_TERM` for the tiler-heap half. The tiler
+      heap may in fact be part of the answer — one hypothesis for the
+      unscheduled group is that it needs more setup before the scheduler
+      considers it schedulable.
 - [ ] Build the fence-translation shim between kbase's completion
       mechanism and whatever PanVK's sync code expects to wait/signal on.
       Confirmed harder than "translate the ioctls": the same file signals

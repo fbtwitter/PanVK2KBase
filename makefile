@@ -103,5 +103,13 @@ cs_encode_probe: ./src/tests/cs_encode_probe/cs_encode_probe.c $(MESA_PACK_H)
 	  -o ./build/cs_encode_probe $< \
 	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
 
+# Combines the kbase ioctl surface with Mesa's CS encoder - builds a
+# real instruction, writes it through the real CS_INSERT/KICK protocol
+# (see utils/csf_user_regs.h), and checks for a real CSF notification.
+live_kick_probe: ./src/tests/live_kick_probe/live_kick_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/live_kick_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
 clean:
 	rm -f first_test
