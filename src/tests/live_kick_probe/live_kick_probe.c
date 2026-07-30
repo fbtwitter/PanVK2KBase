@@ -107,7 +107,78 @@ struct group_config {
   uint8_t fragment_max;
   uint8_t compute_max;
   uint8_t csi_index;
+  // Use KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 (nr 42, older/smaller
+  // struct) instead of the modern CS_QUEUE_GROUP_CREATE (nr 58). The
+  // vendor blob uses _1_6 exclusively - nr 58 and _1_18 don't appear in
+  // it at all (see docs/kbase-notes.md's RE section), so it's worth
+  // testing whether the kernel treats them differently.
+  bool use_1_6;
 };
+
+/*
+    Replicates the context-level setup the vendor blob does but this
+    repo's probes never did. Discovered by mapping libGLES_mali.so's
+    kbase ioctl surface - see docs/kbase-notes.md. Each step is
+    reported rather than fatal, since the point is to learn which ones
+    this kernel accepts and whether any is the missing precondition for
+    a queue group to become schedulable.
+
+    All of these are one-shot per context: calling them twice fails.
+*/
+static void vendor_context_setup(int fd) {
+  printf("\n=== vendor-style context setup ===\n");
+
+  // JIT memory pool. The vendor driver always initialises this; tiler
+  // heap growth is backed by it.
+  struct kbase_ioctl_mem_jit_init jit = {
+      .va_pages = 1 << 14, /* 64MB worth of 4K pages */
+      .max_allocations = 255,
+      .trim_level = 0,
+      .group_id = 0,
+      .phys_pages = 1 << 14,
+  };
+  if (ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit) < 0)
+    printf("  MEM_JIT_INIT   : FAILED (%s)\n", strerror(errno));
+  else
+    printf("  MEM_JIT_INIT   : OK (va_pages=%llu)\n",
+           (unsigned long long)jit.va_pages);
+
+  // Executable VA zone.
+  struct kbase_ioctl_mem_exec_init exec = {
+      .va_pages = 1 << 16, /* 256MB worth of 4K pages */
+  };
+  if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec) < 0)
+    printf("  MEM_EXEC_INIT  : FAILED (%s)\n", strerror(errno));
+  else
+    printf("  MEM_EXEC_INIT  : OK (va_pages=%llu)\n",
+           (unsigned long long)exec.va_pages);
+}
+
+/*
+    Creates a tiler heap the way the vendor driver does. chunk_size must
+    be 4KB-aligned and <= CHUNK_SIZE_MASK (0xfff000), initial_chunks >= 1
+    and <= max_chunks, target_in_flight >= 1 - all enforced by
+    kbase_csf_tiler_heap_init(). Returns the heap's GPU VA, or 0.
+*/
+static uint64_t vendor_tiler_heap_init(int fd) {
+  union kbase_ioctl_cs_tiler_heap_init heap = {0};
+  heap.in.chunk_size = 2 * 1024 * 1024; /* 2MB, 4KB-aligned */
+  heap.in.initial_chunks = 1;
+  heap.in.max_chunks = 8;
+  heap.in.target_in_flight = 1;
+  heap.in.group_id = 0;
+  heap.in.buf_desc_va = 0;
+
+  if (ioctl(fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &heap) < 0) {
+    printf("  TILER_HEAP_INIT: FAILED (%s)\n", strerror(errno));
+    return 0;
+  }
+
+  printf("  TILER_HEAP_INIT: OK gpu_heap_va=0x%llx first_chunk_va=0x%llx\n",
+         (unsigned long long)heap.out.gpu_heap_va,
+         (unsigned long long)heap.out.first_chunk_va);
+  return heap.out.gpu_heap_va;
+}
 
 // Runs one full create/bind/encode/insert/kick/observe/teardown cycle.
 // Returns true only if the GPU actually consumed the instruction
@@ -122,22 +193,50 @@ static bool run_config(int fd, const struct group_config *cfg) {
   printf("  tiler_max=%u fragment_max=%u compute_max=%u csi_index=%u\n",
          cfg->tiler_max, cfg->fragment_max, cfg->compute_max, cfg->csi_index);
 
-  union kbase_ioctl_cs_queue_group_create create = {0};
-  create.in.tiler_mask = cfg->tiler_mask;
-  create.in.fragment_mask = cfg->fragment_mask;
-  create.in.compute_mask = cfg->compute_mask;
-  create.in.cs_min = 1;
-  create.in.priority = 0;
-  create.in.tiler_max = cfg->tiler_max;
-  create.in.fragment_max = cfg->fragment_max;
-  create.in.compute_max = cfg->compute_max;
+  uint8_t group_handle;
+  uint32_t group_uid;
 
-  if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &create) < 0) {
-    printf("  CS_QUEUE_GROUP_CREATE failed: %s - skipping\n", strerror(errno));
-    return false;
+  if (cfg->use_1_6) {
+    union kbase_ioctl_cs_queue_group_create_1_6 create = {0};
+    create.in.tiler_mask = cfg->tiler_mask;
+    create.in.fragment_mask = cfg->fragment_mask;
+    create.in.compute_mask = cfg->compute_mask;
+    create.in.cs_min = 1;
+    create.in.priority = 0;
+    create.in.tiler_max = cfg->tiler_max;
+    create.in.fragment_max = cfg->fragment_max;
+    create.in.compute_max = cfg->compute_max;
+
+    if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &create) < 0) {
+      printf("  CS_QUEUE_GROUP_CREATE_1_6 failed: %s - skipping\n",
+             strerror(errno));
+      return false;
+    }
+    group_handle = create.out.group_handle;
+    group_uid = create.out.group_uid;
+    printf("  [via _1_6 / nr 42] ");
+  } else {
+    union kbase_ioctl_cs_queue_group_create create = {0};
+    create.in.tiler_mask = cfg->tiler_mask;
+    create.in.fragment_mask = cfg->fragment_mask;
+    create.in.compute_mask = cfg->compute_mask;
+    create.in.cs_min = 1;
+    create.in.priority = 0;
+    create.in.tiler_max = cfg->tiler_max;
+    create.in.fragment_max = cfg->fragment_max;
+    create.in.compute_max = cfg->compute_max;
+
+    if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &create) < 0) {
+      printf("  CS_QUEUE_GROUP_CREATE failed: %s - skipping\n",
+             strerror(errno));
+      return false;
+    }
+    group_handle = create.out.group_handle;
+    group_uid = create.out.group_uid;
+    printf("  [via nr 58] ");
   }
-  printf("  group_handle=%u group_uid=%u\n", create.out.group_handle,
-         create.out.group_uid);
+
+  printf("group_handle=%u group_uid=%u\n", group_handle, group_uid);
 
   struct kbase_bo *queue_bo = kbase_bo_create(fd, 4096);
   if (!queue_bo)
@@ -185,7 +284,7 @@ static bool run_config(int fd, const struct group_config *cfg) {
 
   union kbase_ioctl_cs_queue_bind bind = {0};
   bind.in.buffer_gpu_addr = queue_gpu_va;
-  bind.in.group_handle = create.out.group_handle;
+  bind.in.group_handle = group_handle;
   bind.in.csi_index = cfg->csi_index;
   if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_BIND, &bind) < 0) {
     perror("  CS_QUEUE_BIND");
@@ -257,7 +356,7 @@ static bool run_config(int fd, const struct group_config *cfg) {
     perror("  CS_QUEUE_TERMINATE");
 
   struct kbase_ioctl_cs_queue_group_term term = {
-      .group_handle = create.out.group_handle,
+      .group_handle = group_handle,
   };
   if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &term) < 0)
     perror("  CS_QUEUE_GROUP_TERMINATE");
@@ -286,19 +385,15 @@ int main(void) {
     return 1;
   }
 
+  // Do the context setup the vendor blob does and this repo never did,
+  // before creating any group. These are one-shot per context, so they
+  // happen once here rather than per-config.
+  vendor_context_setup(fd);
+  vendor_tiler_heap_init(fd);
+
   const struct group_config configs[] = {
       {
-          .name = "real core mask, compute-only (no tiler/fragment)",
-          .tiler_mask = 0,
-          .fragment_mask = 0,
-          .compute_mask = shader_present,
-          .tiler_max = 0,
-          .fragment_max = 0,
-          .compute_max = 1,
-          .csi_index = 0,
-      },
-      {
-          .name = "real core mask, all three endpoint types",
+          .name = "vendor-style setup + nr 58 group create, all endpoints",
           .tiler_mask = shader_present,
           .fragment_mask = shader_present,
           .compute_mask = shader_present,
@@ -306,16 +401,30 @@ int main(void) {
           .fragment_max = 1,
           .compute_max = 1,
           .csi_index = 0,
+          .use_1_6 = false,
       },
       {
-          .name = "baseline: ~0ULL masks (known not to execute)",
-          .tiler_mask = ~0ULL,
-          .fragment_mask = ~0ULL,
-          .compute_mask = ~0ULL,
+          .name = "vendor-style setup + _1_6 (nr 42) group create, as the "
+                  "blob does",
+          .tiler_mask = shader_present,
+          .fragment_mask = shader_present,
+          .compute_mask = shader_present,
           .tiler_max = 1,
           .fragment_max = 1,
           .compute_max = 1,
           .csi_index = 0,
+          .use_1_6 = true,
+      },
+      {
+          .name = "vendor-style setup + _1_6, compute-only",
+          .tiler_mask = 0,
+          .fragment_mask = 0,
+          .compute_mask = shader_present,
+          .tiler_max = 0,
+          .fragment_max = 0,
+          .compute_max = 1,
+          .csi_index = 0,
+          .use_1_6 = true,
       },
   };
 

@@ -550,18 +550,60 @@ the vendor driver (one call site), so it is a genuine MTK mechanism —
 but that does not contradict the finding above that it never blocks for
 the arguments this repo can construct.
 
-**Next experiment this suggests** (not yet run): replicate the vendor's
-context setup before creating a group — `MEM_JIT_INIT` + `MEM_EXEC_INIT`
-right after `SET_FLAGS`, then `CS_TILER_HEAP_INIT`, then group create
-(trying both nr 58 and nr 42), then bind/insert/kick. Any of those three
-setup steps is a plausible precondition for the scheduler to consider a
-group schedulable.
+**Experiment run, and it's another clean negative.** `live_kick_probe.c`
+now replicates that setup: `MEM_JIT_INIT` + `MEM_EXEC_INIT` after
+`SET_FLAGS`, then `CS_TILER_HEAP_INIT`, then group create via both nr 58
+and nr 42. **Every setup ioctl succeeds** —
+
+```
+MEM_JIT_INIT   : OK (va_pages=16384)
+MEM_EXEC_INIT  : OK (va_pages=65536)
+TILER_HEAP_INIT: OK gpu_heap_va=0x7ffc000000 first_chunk_va=0x7ffc002000
+```
+
+— and the result is unchanged: `CS_EXTRACT=0`, `CS_ACTIVE=0`, no
+notification, for all three group configurations. So the missing context
+setup was *not* the blocker, and `CS_QUEUE_GROUP_CREATE_1_6` (nr 42)
+behaves identically to nr 58 despite being what the vendor uses.
+
+Worth noting the tiler heap lands at a real dedicated GPU VA
+(`0x7ffc000000`), unlike the SAME_VA allocations whose GPU address is
+just the CPU pointer — so the kernel is clearly willing to hand this
+context real GPU VA space.
+
+**Leading remaining hypothesis** (untestable without root): the group
+never gets its MCU shared region bound. Before a group can go on a slot
+the kernel must map its suspend buffers, ring buffer, and user-IO pages
+into the MCU's own address space
+(`kbase_csf_mcu_shared_group_bind_csg_reg()`,
+`csf/mali_kbase_csf_mcu_shared_reg.c` — note `group->csg_reg` and
+`group->csg_reg_bind_retries` are initialised at group creation). If
+that binding fails, the group stays runnable-but-never-scheduled, with
+no userspace-visible error — exactly the observed behaviour. The other
+candidate is simply that the scheduler tick never selects this context.
+Both are `dev_dbg`-only paths.
 
 **Why this can't be chased further from userspace on this device.**
 The failure path is `dev_dbg`-only and otherwise silent, so it needs
-kernel-side visibility — and `dmesg` returns `klogctl: Permission
-denied` for the unprivileged `shell` user here (KTRACE/debugfs likewise
-out of reach without root). Candidate next steps, all needing more than
+kernel-side visibility. Every avenue was checked explicitly on this
+device (Poco X8 Pro, `ro.build.type=user`, `ro.debuggable=0`, SELinux
+enforcing as `u:r:shell:s0`) — **all closed**, so don't re-tread these:
+
+| Surface | Result |
+|---|---|
+| `dmesg` / `klogctl` | `Permission denied` (no `CAP_SYSLOG`) |
+| `/proc/sys/kernel/dmesg_restrict` | `Permission denied` |
+| `/dev/kmsg` | `Permission denied` |
+| `/sys/kernel/debug/mali0/` | does not exist (debugfs not exposed) |
+| tracefs `events/mali/` | dir lists, but `enable`/read `Permission denied` — **and** the registered tracepoints are memory/JIT only (`mali_mem_*`, `mali_jit_*`, `mali_mmu_page_fault_*`); there are no CSG-scheduling tracepoints, so this wouldn't answer the question even if writable |
+| `/proc/mtk_mali/{logbuf_critical,logbuf_exception,logbuf_regular,fwlog}` | exist (MediaTek's own Mali log buffers — exactly what's needed) but all `Permission denied` |
+| `logcat` | nothing Mali/kbase-related; kernel `dev_dbg` doesn't route here |
+| `adb root` | `adbd cannot run as root in production builds` |
+
+Note the Xiaomi developer-option "USB debugging (Security settings)"
+does **not** help — it governs permission modification and input
+simulation, not kernel access. Verified after enabling it: no change to
+any row above. Candidate next steps, all needing more than
 this probe: a rooted device or a userdebug build to read the driver's
 own diagnostics; comparing against a trace of the vendor blob driver
 doing a real submission (it clearly gets groups onto slots); or

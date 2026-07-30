@@ -189,9 +189,21 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `MEM_EXEC_INIT`, `CS_TILER_HEAP_INIT`, `CONTEXT_PRIORITY_CHECK`,
       `GET_CONTEXT_ID`, `STREAM_CREATE`. It also uses
       `CS_QUEUE_GROUP_CREATE_1_6` (nr 42), not the modern nr 58 these
-      probes use. Concrete next experiment: replicate that context setup
-      (JIT init + exec init + tiler heap) before group create, and try
-      the older group-create struct.
+      probes use.
+      **That experiment is now run, and is another clean negative:**
+      `live_kick_probe.c` does the full vendor-style setup
+      (`MEM_JIT_INIT` + `MEM_EXEC_INIT` + `CS_TILER_HEAP_INIT`, all
+      succeeding — the heap gets a real GPU VA `0x7ffc000000`) and tries
+      group create via both nr 58 and nr 42. Result is unchanged:
+      `CS_EXTRACT=0`, `CS_ACTIVE=0`, no notification, every time. So
+      neither the missing context setup nor the group-create struct
+      version is the blocker.
+      **Leading remaining hypothesis** (needs root to test): the group's
+      MCU shared region never gets bound —
+      `kbase_csf_mcu_shared_group_bind_csg_reg()` must map the group's
+      suspend buffers, ring buffer and user-IO pages into the MCU's
+      address space before it can occupy a slot, and a failure there is
+      silent to userspace.
       **Blocked on kernel visibility, and it needs root.** Verified on
       this device: `dmesg` → `Permission denied` (no `CAP_SYSLOG`),
       `/sys/kernel/debug/mali0/` absent, tracefs readable but event
