@@ -1,3 +1,6 @@
+#ifndef INITIALIZE_H
+#define INITIALIZE_H
+
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
@@ -59,3 +62,5 @@ int open_gpu(void) {
 
   return fd;
 }
+
+#endif

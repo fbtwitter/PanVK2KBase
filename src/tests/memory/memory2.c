@@ -31,6 +31,12 @@ int main(void) {
 
   struct kbase_bo *buffer = kbase_bo_create(fd, size);
 
+  struct kbase_bo *buffer2 = kbase_bo_create(fd, size);
+
+  struct kbase_bo *buffer3 = kbase_bo_create(fd, size);
+
+  struct kbase_bo *buffer4 = kbase_bo_create(fd, size);
+
   memset(buffer->cpu, 0x5a, 64);
   dump_hex(buffer->cpu, 64);
 

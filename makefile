@@ -17,6 +17,12 @@ first_test: ./src/tests/first_test/first_test.c
 
 memory: ./src/tests/memory/memory.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/memory $<
+
+memory2: ./src/tests/memory/memory2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/memory2 $<
+
+queue_group: ./src/tests/queue_group/queue_group.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/queue_group $<
  
 clean:
 	rm -f first_test
