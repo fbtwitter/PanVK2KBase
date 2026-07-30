@@ -59,16 +59,50 @@ itself, not just inside it.
 ```
 
 `pan_kmod_ops` (in upstream Mesa: `src/panfrost/lib/pan_kmod.h`) is the
-vtable every backend implements — device open/close, BO alloc/free/mmap/
-import/export, VM management, and submission. **Do not trust the exact
-field names below** — verify against the actual header in the Mesa
-checkout you're building against, since it evolves:
+vtable every backend implements — device open/close, BO alloc/free/
+import/export, and VM management. **Do not trust the exact field names
+below** — verify against the actual header in the Mesa checkout you're
+building against, since it evolves:
 
 - device probe / properties query
-- BO create / free / mmap / import (dma-buf) / export (dma-buf)
-- VM (address space) create / map / unmap
-- job/command-stream submission
-- sync object wait / signal
+- BO alloc / free / import (dma-buf) / export (dma-buf) /
+  get-mmap-offset / wait / evictable
+- VM create / destroy / bind (map/unmap) / query state
+- misc: query GPU timestamp, BO labeling, perf-counter session
+
+**Correction, checked against a real Mesa checkout (`git clone
+--depth 1 https://gitlab.freedesktop.org/mesa/mesa.git`, cloned into
+the gitignored `third_party/MESA-KMOD/`, `src/panfrost/lib/kmod/`):**
+`pan_kmod_ops` has **no submission or sync entry at all** — the
+"submission" and "sync object wait/signal" bullets from earlier
+drafts of this doc were wrong. Command-stream submission and fence
+handling for CSF are hardcoded directly into the Vulkan driver, not
+routed through `pan_kmod_ops`:
+
+- `src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c` calls
+  `DRM_IOCTL_PANTHOR_GROUP_CREATE` / `_SUBMIT` / `_DESTROY` /
+  `_GET_STATE` and `DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE` / `_DESTROY`
+  directly on `dev->drm_fd` via `pan_kmod_ioctl()` — panthor-specific
+  ioctls, not anything a `pan_kmod_kbase` backend can intercept just by
+  implementing the vtable.
+- The same file signals/waits on completion via libdrm's generic DRM
+  syncobj calls (`drmSyncobjCreate`/`Wait`/`Reset`/`Transfer`/
+  `TimelineWait`), also on `dev->drm_fd`. These are DRM-subsystem
+  ioctls, not panthor-specific, but they require the fd to actually be
+  a DRM fd — and kbase's `/dev/mali0` is a misc device (see above), so
+  none of them work against it even in principle, not just as a matter
+  of "wrong ioctl numbers."
+
+**Practical consequence for `ROADMAP.md`:** a `pan_kmod_kbase.c`
+backend (Phase 2) covers device probe + BO/VM management, but Phase 4
+(submission + sync) needs a kbase-specific sibling to
+`panvk_vX_gpu_queue.c` itself, not just a `pan_kmod_ops`
+implementation — a materially bigger scope than "translate the ioctls
+kmod calls." The CS group-create/register/bind/kick sequence this
+repo's `tests/queue_group/queue_group.c` already exercises
+successfully on-device (see `docs/kbase-notes.md`) is the raw material
+for that sibling file's submission half; the sync half is still
+unsolved (no DRM fd to hang a syncobj off of).
 
 For kbase, several of these need real design decisions, not just ioctl
 translation:
@@ -82,11 +116,16 @@ translation:
    this into `pan_kmod_dev_props` once a `pan_kmod_kbase.c` backend
    exists (Phase 2 of `ROADMAP.md`).
 2. **BO/VM management** — kbase has its own memory-region and JIT/
-   tiler-heap growth model. Needs adapting, not just wrapping.
-3. **Submission + sync** — the hardest part. kbase's atom/job-chain
-   submission and completion signaling don't map cleanly onto what
-   PanVK's sync code (built around DRM sync objects / timelines) expects.
-   This is where to expect the most iteration.
+   tiler-heap growth model. Needs adapting, not just wrapping. BO
+   create/free against real hardware is already prototyped (not through
+   `pan_kmod_ops` yet) in `utils/memory.h` — see `docs/kbase-notes.md`
+   for the SAME_VA free semantics found there.
+3. **Submission + sync** — the hardest part, and bigger than originally
+   scoped here (see the correction above): it's not a `pan_kmod_ops`
+   translation, it's a kbase-specific fork of the Vulkan driver's own
+   CSF queue file. kbase's atom/command-stream submission and completion
+   signaling don't map onto DRM syncobjs at all, since kbase isn't a DRM
+   device. This is where to expect the most iteration.
 
 ## JM vs CSF
 

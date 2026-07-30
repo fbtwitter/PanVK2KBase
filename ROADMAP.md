@@ -65,10 +65,25 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       and the kbase UK version. See `docs/kbase-notes.md`.
 
 ## Phase 2 — pan_kmod backend skeleton
-- [ ] Clone Mesa.
+- **Signal, not progress (superseded below):** `.gitignore` gained a
+  `/third_party/MESA-KMOD` entry in root main's `a1644be` ("added queue
+  group generation") — a placeholder for a local Mesa clone, correctly
+  excluded from git. Worth checking with upstream before duplicating a
+  `pan_kmod_kbase` skeleton independently.
+- [x] Clone Mesa — done into that same gitignored path (`git clone
+      --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git
+      third_party/MESA-KMOD`). Local/ephemeral to this machine only —
+      gitignored, won't persist across clones of this repo, re-run the
+      clone command if it's missing.
 - [ ] Add a `pan_kmod_kbase` backend as a third `pan_kmod` backend
-      alongside `panfrost` and `panthor` (mirror their file shape in
-      `src/panfrost/lib/`).
+      alongside `panfrost` and `panthor`. Confirmed real shape from the
+      clone (`src/panfrost/lib/kmod/`): `pan_kmod.c/h` (the vtable +
+      dispatch), `pan_kmod_backend.h`, `panfrost_kmod.c` (JM),
+      `panthor_kmod.c/h` (CSF, DRM) — mirror `panthor_kmod.*` since it's
+      the CSF sibling, not `panfrost_kmod.c` (JM). **Scope correction:**
+      the vtable only covers device/BO/VM, not submission — see Phase 4
+      and `docs/architecture.md`'s "Correction" section for why a
+      `pan_kmod_kbase` backend alone isn't sufficient.
 - [ ] Get device probe + enumeration working — this is where the
       DRM-node-vs-misc-device mismatch in `docs/architecture.md` has to
       actually be solved. Look at how Turnip's kgsl path is special-cased
@@ -121,9 +136,25 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `CONFIG_MALI_MTK_FENCE_DEBUG` that r44p0 doesn't have; worth
       checking whether that's usable before designing a generic shim
       (see `docs/kbase-notes.md`).
-- [ ] Map VkQueueSubmit onto kbase atom/command-stream submission.
+- [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
+      target identified from the Mesa clone (`third_party/MESA-KMOD`,
+      see `docs/architecture.md`): `src/panfrost/vulkan/csf/
+      panvk_vX_gpu_queue.c` calls `DRM_IOCTL_PANTHOR_GROUP_CREATE` /
+      `_SUBMIT` / `_DESTROY` / `_GET_STATE` and `DRM_IOCTL_PANTHOR_
+      TILER_HEAP_CREATE` / `_DESTROY` directly — not through
+      `pan_kmod_ops`. A kbase target needs a sibling file swapping those
+      for `CS_QUEUE_GROUP_CREATE` / `CS_QUEUE_REGISTER` / `CS_QUEUE_BIND`
+      / `CS_QUEUE_KICK` (already prototyped and confirmed working
+      end-to-end on-device in `tests/queue_group/queue_group.c`) and
+      `CS_TILER_HEAP_INIT`/`_TERM` for the tiler-heap half.
 - [ ] Build the fence-translation shim between kbase's completion
       mechanism and whatever PanVK's sync code expects to wait/signal on.
+      Confirmed harder than "translate the ioctls": the same file signals
+      completion via libdrm `drmSyncobj*` calls on `dev->drm_fd`, which
+      only work on an actual DRM fd — kbase's `/dev/mali0` is a misc
+      device, so there's no DRM fd to hang a syncobj off of. This isn't a
+      wrong-ioctl-number problem, it's "the mechanism PanVK's sync code
+      assumes doesn't exist on this kernel driver at all."
 - [ ] Budget the most time here. This was the long pole for kgsl too.
 
 ## Phase 5 — Headless triangle
