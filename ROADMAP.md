@@ -136,6 +136,14 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `CONFIG_MALI_MTK_FENCE_DEBUG` that r44p0 doesn't have; worth
       checking whether that's usable before designing a generic shim
       (see `docs/kbase-notes.md`).
+      **Partial progress:** `tests/fence_probe/fence_probe.c` confirmed
+      on-device that this device's kernel actually implements the ioctl
+      (`ret=0`, not `ENOTTY`) — so the code path is built in, not just
+      declared in the header. Not yet confirmed as a *usable* completion
+      signal: the probe passed all-zero args, which succeeded but can't
+      distinguish "real wait, trivially satisfied" from "no-op on
+      degenerate input." Next step needs a real bound-queue handle and
+      non-zero flags — see `docs/kbase-notes.md` for specifics.
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/

@@ -276,6 +276,35 @@ reason: `queue_bo` is referenced by the queue registration (`REGISTER`'s
 Correct order, confirmed clean on-device: unmap doorbell → terminate
 queue → terminate group → free BO.
 
+## KBASE_IOCTL_INTERNAL_FENCE_WAIT: reachable, but not yet proven useful
+
+`tests/fence_probe/fence_probe.c` calls r49p1's MediaTek-only
+`KBASE_IOCTL_INTERNAL_FENCE_WAIT` (ioctl 80, documented as gated behind
+`CONFIG_MALI_MTK_FENCE_DEBUG`) with an all-zero
+`{pid, flags, time_in_microseconds=1000, queue}` struct, to check
+whether the *running kernel* actually implements it (the header always
+declares it regardless of kernel config).
+
+Result on-device: `ret=0, errno=0` — success, not `ENOTTY`. This
+**confirms the kernel does implement the ioctl** (the MTK fence-debug
+code path is built into this device's kernel, not just declared in the
+header). That's as far as this result can honestly be pushed, though:
+succeeding on an all-zero `pid=0`/`queue=0` doesn't distinguish "this is
+a real wait mechanism and there was trivially nothing to wait for" from
+"this is a no-op/validation-only path for degenerate input." It does
+NOT yet confirm this is a usable completion signal for Phase 4's
+fence-translation shim.
+
+To actually test that, the next experiment needs a **real** `queue`
+value from an active bound CS queue (e.g. `queue_group.c`'s
+`queue_bo->cpu`/`buffer_gpu_addr` after `CS_QUEUE_BIND`) and a non-zero
+`flags` (candidates in `mali_base_kernel.h`:
+`BASE_INTERNAL_FENCE_WAIT_IDLE_FLAG`, `_RESULT_FLAG`, `_DUMP_FLAG`) —
+neither is documented beyond the flag names, so this would be
+trial-and-error against the real device, watching whether the call
+actually blocks for `time_in_microseconds` and what it returns for a
+queue that's genuinely idle vs. one with pending work. Not yet done.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

@@ -30,6 +30,10 @@ memory2: ./src/tests/memory/memory2.c
 
 queue_group: ./src/tests/queue_group/queue_group.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/queue_group $<
- 
+
+# KBASE_IOCTL_INTERNAL_FENCE_WAIT only exists in r49p1's headers.
+fence_probe: ./src/tests/fence_probe/fence_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/fence_probe $<
+
 clean:
 	rm -f first_test
