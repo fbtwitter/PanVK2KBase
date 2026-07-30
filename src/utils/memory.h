@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -98,6 +99,30 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
 
   // return the constructed buffer object
   return bo;
+}
+
+/*
+    Function to free a Buffer Object created by kbase_bo_create()
+
+    kbase_bo_create() always ends up with BASE_MEM_SAME_VA granted (see
+    decoded output flags) even though the input flags don't request it
+    explicitly - this device's kbase treats it as the default for this
+    flag combination. For SAME_VA regions the GPU-side allocation is tied
+    1:1 to the CPU mmap: munmap() alone releases it on vm_close, and a
+    follow-up KBASE_IOCTL_MEM_FREE fails with EINVAL because the region
+    is already gone by the time it runs (confirmed on-device). Only
+    munmap here; don't also call MEM_FREE.
+*/
+void kbase_bo_free(int fd, struct kbase_bo *bo) {
+  (void)fd;
+
+  if (!bo)
+    return;
+
+  if (munmap(bo->cpu, bo->size) < 0)
+    perror("munmap");
+
+  free(bo);
 }
 
 #endif

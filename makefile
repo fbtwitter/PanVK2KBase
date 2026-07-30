@@ -2,11 +2,18 @@ CC ?= gcc
 CFLAGS ?= -O0 -g -Wall -Wextra
 MALIFLAGS ?= -DMALI_USE_CSF=1
  
-# Path to the vendored kbase r44p0 uapi headers, relative to this Makefile.
-# Adjust if you placed third_party/ somewhere else relative to this file.
-KBASE_UAPI_DIR := third_party/kbase-uapi-r44p0
- 
-INCLUDES := -I$(KBASE_UAPI_DIR) -Isrc/utils
+# Which vendored kbase uapi header set to build against. Two are vendored:
+# r44p0 (UK 1.20, Mali-G615-MC2 target) and r49p1 (UK 1.30, confirmed match
+# for the Poco X8 Pro / Mali-G720 device tested in docs/kbase-notes.md).
+# Override on the command line to target the other, e.g.:
+#   make queue_group KBASE_VERSION=r49p1
+KBASE_VERSION ?= r44p0
+KBASE_UAPI_DIR := third_party/kbase-uapi-$(KBASE_VERSION)
+
+# -include the kconfig shim so r49p1's IS_ENABLED() guards resolve
+# without a real kernel build tree (see src/utils/kconfig_shim.h). Harmless
+# for r44p0, which doesn't use IS_ENABLED at all.
+INCLUDES := -I$(KBASE_UAPI_DIR) -Isrc/utils -include src/utils/kconfig_shim.h
  
 .PHONY: all clean
  

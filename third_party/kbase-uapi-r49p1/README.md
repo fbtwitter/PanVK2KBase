@@ -17,9 +17,14 @@ test writeup. Unlike `kbase-uapi-r44p0`, this pairing has been verified
 against a live device's `VERSION_CHECK` response, not just assumed from
 the driver release name.
 
-File set mirrors `third_party/kbase-uapi-r44p0/` exactly (same 18 files,
+File set otherwise mirrors `third_party/kbase-uapi-r44p0/` (same 18 files,
 same relative layout) so the two can be swapped by changing
-`KBASE_UAPI_DIR` in the root `makefile`.
+`KBASE_UAPI_DIR` in the root `makefile` — with one addition:
+`mali_base_kernel.h` in this version added `#include "mali_gpu_props.h"`,
+a 19th file not present in r44p0. It was missing from the initial vendor
+of this directory (caught when it broke the build); pulled separately
+from the same repo/branch/commit, path
+`.../include/uapi/gpu/arm/midgard/mali_gpu_props.h`.
 
 Unmodified except as noted in individual file diffs, if any.
 Original license notices preserved in each file - see file headers,

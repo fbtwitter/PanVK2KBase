@@ -23,8 +23,10 @@ int main(void) {
 
   printf("ret=%d errno=%d\n", ret, errno);
 
-  if (ret < 0)
+  if (ret < 0) {
     perror("CS_QUEUE_GROUP_CREATE");
+    return 1;
+  }
 
   printf("group_handle = %u\n", create.out.group_handle);
   printf("group_uid    = %u\n", create.out.group_uid);
@@ -66,8 +68,9 @@ int main(void) {
 
   printf("mmap_handle = 0x%llx\n", (unsigned long long)bind.out.mmap_handle);
 
-  /*
-  size_t queue_state_size = 16 * 4096;
+  // Input page, output page, and HW doorbell page for this queue
+  // (BASEP_QUEUE_NR_MMAP_USER_PAGES, csf/mali_base_csf_kernel.h).
+  size_t queue_state_size = BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096;
 
   void *queue_state = mmap(
       NULL,
@@ -83,7 +86,8 @@ int main(void) {
       return 1;
   }
 
-  printf("queue_state=%p\n", queue_state); */
+  printf("queue_state=%p (input/output/doorbell, %zu bytes)\n",
+         queue_state, queue_state_size);
 
   uint32_t *q = queue_bo->cpu;
 
@@ -98,4 +102,31 @@ int main(void) {
     perror("CS_QUEUE_KICK");
     return 1;
   }
+
+  printf("CS_QUEUE_KICK OK\n");
+
+  if (munmap(queue_state, queue_state_size) < 0)
+    perror("munmap queue_state");
+
+  // Tear down in dependency order: the queue holds a reference to
+  // queue_bo (via REGISTER's buffer_gpu_addr) and the group holds a
+  // reference to the queue (via BIND) - MEM_FREE on queue_bo fails with
+  // EINVAL if either is still alive when it's called.
+  struct kbase_ioctl_cs_queue_terminate q_term = {
+      .buffer_gpu_addr = (uint64_t)(uintptr_t)queue_bo->cpu,
+  };
+
+  if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &q_term) < 0)
+    perror("CS_QUEUE_TERMINATE");
+
+  struct kbase_ioctl_cs_queue_group_term term = {
+      .group_handle = create.out.group_handle,
+  };
+
+  if (ioctl(fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &term) < 0)
+    perror("CS_QUEUE_GROUP_TERMINATE");
+
+  kbase_bo_free(fd, queue_bo);
+
+  return 0;
 }

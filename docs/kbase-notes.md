@@ -154,6 +154,128 @@ assumption up three ways, not just "the probe didn't error":
 if you try to confirm this on another device and those paths are your
 first instinct; the firmware-blob check doesn't need either.
 
+## r44p0 vs r49p1: what actually changed for submission (Phase 4 prep)
+
+`queue_group.c` (root repo, merged into this branch) exercises
+`KBASE_IOCTL_CS_QUEUE_GROUP_CREATE`, `_QUEUE_REGISTER`, `_QUEUE_BIND`, and
+`_QUEUE_KICK` against `third_party/kbase-uapi-r44p0`, but the confirmed
+header for the actual tested device (Poco X8 Pro, see above) is r49p1.
+Diffed the two header sets for exactly the structs/ioctls that code
+touches, since "the probe round-trips" isn't evidence past Phase 1 (see
+the "Practical takeaway" note above):
+
+- `union kbase_ioctl_cs_queue_group_create` — the only struct that
+  changed shape. r44p0 has `__u16 reserved`; r49p1 splits it into
+  `__u8 reserved` + `__u8 cs_fault_report_enable` (new in UK 1.22, CS
+  fault reporting). Same total size, same offset for every field
+  `queue_group.c` actually sets (`tiler_mask`, `fragment_mask`,
+  `compute_mask`, `cs_min`, `priority`, `*_max`) — the code
+  zero-initializes with `= {0}` and never touches `reserved`, so this is
+  a safe swap, not a silent ABI break.
+- `_QUEUE_REGISTER`, `_QUEUE_BIND`, `_QUEUE_KICK` structs and ioctl
+  numbers (37/39, register unnumbered but unchanged): byte-for-byte
+  identical between the two header sets.
+- `KBASE_IOCTL_MEM_ALLOC` and the `BASE_MEM_PROT_*`/`SAME_VA` flags
+  `memory.h`/`flags_helper.h` use: unchanged.
+
+Conclusion: rebuilding `queue_group`/`memory2` against r49p1 should be a
+pure `KBASE_VERSION=r49p1` makefile-variable swap (now supported — see
+root `makefile`), not a code change. Still needs an actual on-device run
+to confirm — this diff only proves the header shapes match, not that the
+ioctls behave identically on r49p1's kernel.
+
+**New in r49p1, not in r44p0:** `KBASE_IOCTL_INTERNAL_FENCE_WAIT` (ioctl
+80, gated behind `CONFIG_MALI_MTK_FENCE_DEBUG` — a MediaTek vendor
+addition, consistent with r49p1's `mali_avalon`/MTK provenance noted
+above). This waits on an "internal fence" given a `pid`/`queue` pointer
+and a microsecond timeout. Directly relevant to the still-open "what's
+the actual completion/fence signaling mechanism kbase exposes for a
+submitted atom?" question below — worth checking whether this ioctl (or
+its absence on non-MTK kbase forks) is the answer before designing
+Phase 4's fence-translation shim around it.
+
+## r49p1 build fixes, and the first on-device submission round-trip
+
+Building `memory`/`memory2`/`queue_group` against r49p1 (NDK
+`aarch64-linux-android26-clang`, `ndk;29.0.14206865`) surfaced two real
+gaps in the vendored header set — both fixed without touching the
+semantic content (ioctl numbers/struct layouts) of any vendored file:
+
+- `mali_base_kernel.h` in r49p1 added `#include "mali_gpu_props.h"`
+  (r44p0 doesn't have this include), but that file was never vendored.
+  Pulled it from the same repo/branch/commit as the rest of
+  `kbase-uapi-r49p1` (see that directory's `README.md`) — it's now a
+  19th file there.
+- `csf/mali_base_csf_kernel.h` guards MediaTek debug-dump-only fields
+  with `IS_ENABLED(CONFIG_MALI_MTK_DEBUG_DUMP)`, assuming a real kernel
+  build tree defines `IS_ENABLED` via `<linux/kconfig.h>`. A standalone
+  probe has neither. Added `src/utils/kconfig_shim.h` (pulled in via
+  `-include` in the root `makefile`, harmless for r44p0) that defines
+  `IS_ENABLED(x)` as `0` — correct here since those fields are unused by
+  any test in this repo and "not enabled" is the same state a normal
+  (non-MTK-debug) kernel build would produce.
+
+Separately, `src/utils/initialize.h` and `src/utils/memory.h` were
+missing `<fcntl.h>`/`<string.h>` includes for `open()`/`O_RDWR` and
+`memset()` respectively — worked before only because `first_test.c`
+happened to include those headers first; broke under NDK clang (which
+doesn't allow implicit function declarations) once `queue_group.c`/
+`memory2.c` included them without that accidental ordering. Fixed by
+adding the includes directly to the headers that use them.
+
+With those fixed, ran all four probes on the Poco X8 Pro against
+r49p1 (`/data/local/tmp`, unprivileged `shell` user, no root):
+
+- `first_test`: unchanged from earlier r44p0 run — `VERSION_CHECK`
+  reports `major=1 minor=30` (matches r49p1's pinned UK version exactly,
+  vs. r44p0 which is off by one minor version from what the device
+  actually reports).
+- `memory`: `KBASE_IOCTL_MEM_ALLOC` + `mmap()` round-trip; decoded
+  output flags include `SAME_VA` even though the input flags leave it
+  commented out (kernel-added default — not yet understood, noted in
+  `ROADMAP.md` Phase 3).
+- `queue_group`: **first confirmed submission-chain round-trip.**
+  `CS_QUEUE_GROUP_CREATE` → BO alloc → `CS_QUEUE_REGISTER` →
+  `CS_QUEUE_BIND` → `CS_QUEUE_KICK` all returned `ret=0`, no error path
+  taken. This is a real result, but a narrow one: it confirms the
+  syscalls succeed, not that the GPU executed or completed anything —
+  the probe never builds an actual command stream (just writes sentinel
+  words) and never maps or reads the doorbell/ring-buffer region from
+  `bind.out.mmap_handle` (left commented out in the source). Confirming
+  real GPU-side completion is still open — see the fence-mechanism note
+  above.
+
+## SAME_VA free semantics and the gpu_va "cookie" (found via `kbase_bo_free`)
+
+Added `kbase_bo_free()` (`utils/memory.h`) and wired it into
+`memory2.c`/`queue_group.c`. Two on-device surprises worth recording
+since they'd otherwise cause confusing failures later:
+
+- **`munmap()` is the free, not `KBASE_IOCTL_MEM_FREE`.** Every
+  allocation from `kbase_bo_create()` comes back with `SAME_VA` set in
+  the decoded output flags, even though the input flags leave it
+  commented out — this device's kbase defaults to it for this flag
+  combination. For SAME_VA regions the GPU allocation is tied 1:1 to the
+  CPU VMA: `munmap()` tears it down on `vm_close`, and a follow-up
+  `MEM_FREE` call fails `EINVAL` because the region is already gone.
+  Confirmed by trying both orders on-device. `kbase_bo_free()` now only
+  calls `munmap()`.
+- **The `gpu_va` alloc returns is a reusable cookie, not a stable
+  address.** Allocating 4 buffers back-to-back in `memory2.c` (no frees
+  in between) returned `gpu_va = 0x41000` for *all four* — only the
+  `mmap()`'d CPU addresses differed. This is expected SAME_VA cookie
+  behavior (the cookie is retired/becomes reusable once its `mmap()`
+  resolves it to a real GPU VA), but it means `bo->gpu_va` cannot be used
+  to distinguish or look up a specific live allocation across a run —
+  only `bo->cpu` (the CPU-side pointer) is a unique handle post-mmap.
+
+`queue_group.c`'s teardown order also had to be fixed for the same
+reason: `queue_bo` is referenced by the queue registration (`REGISTER`'s
+`buffer_gpu_addr`) and the group (`BIND`), so freeing it before
+`CS_QUEUE_TERMINATE` → `CS_QUEUE_GROUP_TERMINATE` also failed `EINVAL`.
+Correct order, confirmed clean on-device: unmap doorbell → terminate
+queue → terminate group → free BO.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

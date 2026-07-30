@@ -78,13 +78,49 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `pan_kmod_dev_props`.
 
 ## Phase 3 — Memory management
-- [ ] BO create/free through kbase's mem-alloc ioctls.
-- [ ] mmap.
+- [x] BO create through kbase's mem-alloc ioctl —
+      `kbase_bo_create()` in `utils/memory.h`. Confirmed on-device (Poco
+      X8 Pro, r49p1 headers): `KBASE_IOCTL_MEM_ALLOC` + `mmap()` both
+      round-trip, decoded output flags include `SAME_VA` (kernel adds it
+      even though the input flags leave it commented out — worth
+      understanding why before relying on it).
+- [x] BO free — `kbase_bo_free()` in `utils/memory.h`. Confirmed
+      on-device: for these SAME_VA allocations, `munmap()` alone is the
+      free (kbase tears the region down on `vm_close`); calling
+      `KBASE_IOCTL_MEM_FREE` afterward fails `EINVAL` since the region's
+      already gone by then, so it's `munmap()`-only. Wired into
+      `memory2.c` and `queue_group.c`'s teardown.
+- [x] mmap — confirmed working (see above).
 - [ ] dma-buf import/export.
 - [ ] Tiler heap / JIT growable memory — PanVK's current growth logic
       assumes panthor/panfrost conventions; expect to adapt it.
 
 ## Phase 4 — Submission and sync (highest risk)
+- [x] First real submission-chain round-trip —
+      `tests/queue_group/queue_group.c`. Confirmed on-device (Poco X8
+      Pro, r49p1 headers): `CS_QUEUE_GROUP_CREATE` → BO alloc →
+      `CS_QUEUE_REGISTER` → `CS_QUEUE_BIND` → `CS_QUEUE_KICK` all return
+      `ret=0`, no error path hit. **Caveat:** this only confirms the
+      ioctls succeed syscall-wise, not that the GPU actually executed or
+      completed anything — the probe writes sentinel words into the
+      queue buffer but never builds a real command stream, and the
+      doorbell/ring-buffer region from `bind.out.mmap_handle` is never
+      mapped (commented out in the source) or read back. Still open:
+      confirming actual GPU-side completion.
+      **Update:** the doorbell/ring-buffer mmap is now wired up (3 pages
+      — `BASEP_QUEUE_NR_MMAP_USER_PAGES`: input/output/HW-doorbell — per
+      `csf/mali_base_csf_kernel.h`) and confirmed mapping successfully
+      on-device. Full teardown (`CS_QUEUE_TERMINATE` →
+      `CS_QUEUE_GROUP_TERMINATE` → `kbase_bo_free`) also confirmed clean,
+      no failed ioctls. Still doesn't prove GPU execution completed —
+      just that the whole submit/bind/kick/teardown lifecycle round-trips
+      without kernel-side rejection.
+- [ ] Confirm the completion/fence signaling mechanism kbase exposes for
+      a submitted queue — r49p1 (MediaTek fork) adds
+      `KBASE_IOCTL_INTERNAL_FENCE_WAIT` under `CONFIG_MALI_MTK_DEBUG_DUMP`/
+      `CONFIG_MALI_MTK_FENCE_DEBUG` that r44p0 doesn't have; worth
+      checking whether that's usable before designing a generic shim
+      (see `docs/kbase-notes.md`).
 - [ ] Map VkQueueSubmit onto kbase atom/command-stream submission.
 - [ ] Build the fence-translation shim between kbase's completion
       mechanism and whatever PanVK's sync code expects to wait/signal on.

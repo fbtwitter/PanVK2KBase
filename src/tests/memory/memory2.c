@@ -41,5 +41,11 @@ int main(void) {
   dump_hex(buffer->cpu, 64);
 
   printf("%lu, %p, %zu\n", buffer->gpu_va, buffer->cpu, buffer->size);
+
+  kbase_bo_free(fd, buffer);
+  kbase_bo_free(fd, buffer2);
+  kbase_bo_free(fd, buffer3);
+  kbase_bo_free(fd, buffer4);
+
   return 0;
 }
