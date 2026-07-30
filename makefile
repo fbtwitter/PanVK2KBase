@@ -116,5 +116,38 @@ live_kick_probe: ./src/tests/live_kick_probe/live_kick_probe.c $(MESA_PACK_H)
 	  -o ./build/live_kick_probe $< \
 	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
 
+# --- Phase 2: pan_kmod_kbase Mesa backend (see src/mesa/README.md) ---
+# The Mesa checkout is gitignored, so the backend source lives in this repo
+# and is synced into it. MESA_DIR/PAN_ARCH/KBASE_VERSION are shared with the
+# cs_encode_probe targets above.
+MESA_KMOD_DIR := $(MESA_DIR)/src/panfrost/lib/kmod
+
+.PHONY: mesa-backend-sync mesa-backend-check
+
+mesa-backend-sync:
+	@test -d "$(MESA_KMOD_DIR)" || { echo "error: $(MESA_KMOD_DIR) not found - see docs/mesa-cs-builder.md for the Mesa clone command"; exit 1; }
+	cp src/mesa/pan_kmod_kbase.c $(MESA_KMOD_DIR)/
+	@echo ""
+	@echo "Copied pan_kmod_kbase.c into $(MESA_KMOD_DIR)/"
+	@echo "Still to apply by hand (kept as readable patches since upstream moves):"
+	@echo "  - src/mesa/pan_kmod.c.kbase.patch  -> $(MESA_KMOD_DIR)/pan_kmod.c"
+	@echo "  - src/mesa/meson.build.kbase       -> $(MESA_KMOD_DIR)/meson.build"
+
+# Syntax-checks the backend against the REAL Mesa and kbase headers. Uses a
+# minimal libdrm stub (src/mesa/syntax-check-stubs/) because pan_kmod.h
+# includes <xf86drm.h> and libdrm is an unfetched meson wrap in a shallow
+# clone. This validates the source against real headers - it is NOT a full
+# Mesa build, which needs a complete meson configure.
+mesa-backend-check: mesa-backend-sync
+	$(CC) -fsyntax-only -Wall $(MALIFLAGS) $(MESA_CS_DEFS) \
+	  -include src/utils/kconfig_shim.h \
+	  -Isrc/mesa/syntax-check-stubs \
+	  -I$(MESA_DIR)/src/panfrost/lib -I$(MESA_KMOD_DIR) \
+	  -I$(MESA_DIR)/src/panfrost/model -I$(MESA_DIR)/src/panfrost/perf \
+	  -I$(MESA_DIR)/src/panfrost -I$(MESA_DIR)/src -I$(MESA_DIR)/src/util \
+	  -I$(MESA_DIR)/include -I$(KBASE_UAPI_DIR) \
+	  $(MESA_KMOD_DIR)/pan_kmod_kbase.c
+	@echo "pan_kmod_kbase.c: syntax OK against real Mesa + kbase headers"
+
 clean:
 	rm -f first_test

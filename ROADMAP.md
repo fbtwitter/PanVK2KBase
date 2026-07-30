@@ -75,22 +75,40 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       third_party/MESA-KMOD`). Local/ephemeral to this machine only —
       gitignored, won't persist across clones of this repo, re-run the
       clone command if it's missing.
-- [ ] Add a `pan_kmod_kbase` backend as a third `pan_kmod` backend
-      alongside `panfrost` and `panthor`. Confirmed real shape from the
-      clone (`src/panfrost/lib/kmod/`): `pan_kmod.c/h` (the vtable +
-      dispatch), `pan_kmod_backend.h`, `panfrost_kmod.c` (JM),
-      `panthor_kmod.c/h` (CSF, DRM) — mirror `panthor_kmod.*` since it's
-      the CSF sibling, not `panfrost_kmod.c` (JM). **Scope correction:**
-      the vtable only covers device/BO/VM, not submission — see Phase 4
-      and `docs/architecture.md`'s "Correction" section for why a
+- [x] Add a `pan_kmod_kbase` backend as a third `pan_kmod` backend
+      alongside `panfrost` and `panthor` — **skeleton landed** at
+      `src/mesa/pan_kmod_kbase.c`. Note it lives in *this* repo, not in
+      the gitignored Mesa clone, and is synced in via
+      `make mesa-backend-sync`; see `src/mesa/README.md` for why and for
+      the full status table. `make mesa-backend-check` syntax-checks it
+      against the real `pan_kmod.h`/`pan_kmod_backend.h` and real kbase
+      UAPI (clean against both r49p1 and r44p0). **Not** yet linked into
+      a real Mesa build — that needs a full meson configure.
+      **Scope correction (unchanged):** the vtable only covers
+      device/BO/VM, not submission — see Phase 4 and
+      `docs/architecture.md`'s "Correction" section for why a
       `pan_kmod_kbase` backend alone isn't sufficient.
-- [ ] Get device probe + enumeration working — this is where the
-      DRM-node-vs-misc-device mismatch in `docs/architecture.md` has to
-      actually be solved. Look at how Turnip's kgsl path is special-cased
-      in physical-device enumeration and mirror that shape. The
-      GPU-properties parsing already working in `utils/parse_gpu_props.h`
-      is the raw-decode half of this; the other half is wiring that into
-      `pan_kmod_dev_props`.
+- [x] Get device probe working — `dev_create` does
+      `VERSION_CHECK` → `SET_FLAGS` → `GET_GPUPROPS` and decodes the
+      property blob into `pan_kmod_dev_props`, which is exactly the
+      "wire `parse_gpu_props.h` into `pan_kmod_dev_props`" half noted
+      below. The DRM-node-vs-misc-device mismatch is solved the way
+      Turnip solves it for kgsl: `pan_kmod_dev_create()` gets a kbase
+      probe *before* `drmGetVersion()` (which fails on `/dev/mali0`),
+      using `KBASE_IOCTL_VERSION_CHECK` as a side-effect-free test. Kept
+      as a readable patch at `src/mesa/pan_kmod.c.kbase.patch` rather
+      than auto-applied, since upstream `pan_kmod.c` moves.
+- [ ] Enumeration above `pan_kmod` — the physical-device layer in PanVK
+      still has to learn about a non-DRM device path. The dispatch fix
+      above only covers `pan_kmod_dev_create()`; whoever *opens* the
+      device still has to find `/dev/mali0` instead of a
+      `/dev/dri/renderD*` node.
+- [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
+      (dma-buf, Phase 3 — and blocked above the backend too, since the
+      common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),
+      `vm_create`/`vm_destroy`/`vm_bind` (kbase has no explicit VM
+      object — needs a design decision, see `src/mesa/README.md`), and
+      `bo_wait` (blocked on the unsolved fence mechanism).
 
 ## Phase 3 — Memory management
 - [x] BO create through kbase's mem-alloc ioctl —
