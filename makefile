@@ -76,6 +76,8 @@ glb_iface_probe: ./src/tests/glb_iface_probe/glb_iface_probe.c
 # machine clones it) and a Python interpreter for the genxml codegen
 # step below.
 MESA_DIR ?= third_party/MESA-KMOD
+# llvm-nm from the same toolchain as CC, for the backend symbol check.
+NM ?= llvm-nm
 # Must match the target GPU's architecture major version, e.g. 12 for
 # this repo's Poco X8 Pro/Mali-G720 target (see utils/parse_gpu_props.h's
 # decode). A different device needs a different PAN_ARCH.
@@ -133,21 +135,44 @@ mesa-backend-sync:
 	@echo "  - src/mesa/pan_kmod.c.kbase.patch  -> $(MESA_KMOD_DIR)/pan_kmod.c"
 	@echo "  - src/mesa/meson.build.kbase       -> $(MESA_KMOD_DIR)/meson.build"
 
-# Syntax-checks the backend against the REAL Mesa and kbase headers. Uses a
-# minimal libdrm stub (src/mesa/syntax-check-stubs/) because pan_kmod.h
-# includes <xf86drm.h> and libdrm is an unfetched meson wrap in a shallow
-# clone. This validates the source against real headers - it is NOT a full
-# Mesa build, which needs a complete meson configure.
+# Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
+# <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to
+# the minimal stub in src/mesa/syntax-check-stubs/ when absent.
+MESA_LIBDRM := $(firstword $(wildcard $(MESA_DIR)/subprojects/libdrm-*))
+ifeq ($(MESA_LIBDRM),)
+DRM_INC := -Isrc/mesa/syntax-check-stubs
+DRM_KIND := stubbed libdrm
+else
+DRM_INC := -I$(MESA_LIBDRM) -I$(MESA_LIBDRM)/include/drm
+DRM_KIND := real libdrm ($(notdir $(MESA_LIBDRM)))
+endif
+
+MESA_BACKEND_INC := $(DRM_INC) \
+  -I$(MESA_DIR)/src/panfrost/lib -I$(MESA_KMOD_DIR) \
+  -I$(MESA_DIR)/src/panfrost/model -I$(MESA_DIR)/src/panfrost/perf \
+  -I$(MESA_DIR)/src/panfrost -I$(MESA_DIR)/src -I$(MESA_DIR)/src/util \
+  -I$(MESA_DIR)/include -I$(KBASE_UAPI_DIR)
+
+.PHONY: mesa-libdrm
+
+# Fetch real libdrm into the Mesa checkout via its own pinned wrap.
+mesa-libdrm:
+	cd $(MESA_DIR) && $(PYTHON) -m mesonbuild.mesonmain subprojects download libdrm
+
+# Compiles the backend to a real object file (not just -fsyntax-only)
+# against the real Mesa and kbase headers, then checks that the kbase
+# symbols pan_kmod.c needs are exactly the ones the backend defines. This
+# is a compile + symbol-resolution check, NOT a full Mesa build - see
+# src/mesa/README.md for why a full build needs LLVM.
 mesa-backend-check: mesa-backend-sync
-	$(CC) -fsyntax-only -Wall $(MALIFLAGS) $(MESA_CS_DEFS) \
-	  -include src/utils/kconfig_shim.h \
-	  -Isrc/mesa/syntax-check-stubs \
-	  -I$(MESA_DIR)/src/panfrost/lib -I$(MESA_KMOD_DIR) \
-	  -I$(MESA_DIR)/src/panfrost/model -I$(MESA_DIR)/src/panfrost/perf \
-	  -I$(MESA_DIR)/src/panfrost -I$(MESA_DIR)/src -I$(MESA_DIR)/src/util \
-	  -I$(MESA_DIR)/include -I$(KBASE_UAPI_DIR) \
+	@mkdir -p build/mesa-backend
+	@echo "using: $(DRM_KIND)"
+	$(CC) -c -O1 -Wall $(MALIFLAGS) -DHAVE_PTHREAD -DHAVE_STRUCT_TIMESPEC \
+	  -include src/utils/kconfig_shim.h $(MESA_BACKEND_INC) \
+	  -o build/mesa-backend/pan_kmod_kbase.o \
 	  $(MESA_KMOD_DIR)/pan_kmod_kbase.c
-	@echo "pan_kmod_kbase.c: syntax OK against real Mesa + kbase headers"
+	@echo "pan_kmod_kbase.c: compiles clean against real Mesa + kbase headers"
+	@echo "defines: $$($(NM) --defined-only -g build/mesa-backend/pan_kmod_kbase.o | awk '{print $$NF}' | tr '\n' ' ')"
 
 clean:
 	rm -f first_test

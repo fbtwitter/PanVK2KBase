@@ -1,0 +1,26 @@
+# Meson cross-file for building Mesa against the Android NDK, aarch64.
+#
+# Paths below are for the NDK installed by this repo's workflow
+# (ndk;29.0.14206865, see docs/mesa-cs-builder.md) on a Windows host running
+# Git Bash. Adjust NDK path / host tag ("windows-x86_64") for other setups -
+# on Linux it would be "linux-x86_64" and the compiler wrappers have no
+# .cmd suffix.
+#
+# API level 26 matches every other cross-compile in this repo.
+
+[binaries]
+c = 'C:/Users/User/AppData/Local/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang.cmd'
+cpp = 'C:/Users/User/AppData/Local/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang++.cmd'
+ar = 'C:/Users/User/AppData/Local/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe'
+strip = 'C:/Users/User/AppData/Local/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe'
+c_ld = 'lld'
+cpp_ld = 'lld'
+
+[host_machine]
+system = 'android'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true

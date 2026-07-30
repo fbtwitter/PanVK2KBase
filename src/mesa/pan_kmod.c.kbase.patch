@@ -2,69 +2,82 @@ Add a kbase (non-DRM) dispatch path to pan_kmod_dev_create().
 
 pan_kmod_dev_create() identifies a device by calling drmGetVersion() and
 matching the DRM driver name against a table. kbase is a misc character
-device (/dev/mali0), not a DRM node, so drmGetVersion() fails on it and
-the function bails before any backend is consulted.
+device (/dev/mali0), not a DRM node, so drmGetVersion() fails on it and the
+function bails before any backend is consulted.
 
 This adds a probe for kbase *before* the DRM path, mirroring how Turnip
 special-cases kgsl (/dev/kgsl-3d0) alongside DRM enumeration. The probe is
-KBASE_IOCTL_VERSION_CHECK, which is side-effect free and fails cleanly on
-a non-kbase fd (see pan_kmod_fd_is_kbase() in pan_kmod_kbase.c).
+KBASE_IOCTL_VERSION_CHECK, which is side-effect free and fails cleanly on a
+non-kbase fd (see pan_kmod_fd_is_kbase() in pan_kmod_kbase.c).
 
-The synthesised pan_kmod_driver version is the kbase UK interface version,
-which is the closest analogue to a DRM driver version - it is what kbase
-clients actually version-gate on.
+pan_kmod_fd_is_kbase() reports the kbase UK interface version through
+out-params rather than having this file issue the ioctl itself, specifically
+so that pan_kmod.c - generic, driver-agnostic code - needs no kbase UAPI
+headers. That UK version is used as the pan_kmod_driver version, since it is
+the closest analogue to a DRM driver version and is what kbase clients
+actually version-gate on.
+
+Note the `if (!allocator)` default is hoisted above the probe, because the
+kbase path needs the allocator too.
+
+Generated with `diff -u` against Mesa 26.3.0-devel (commit c439d52c) and
+verified: both translation units compile clean for aarch64-linux-android26,
+and pan_kmod.o's two undefined kbase symbols resolve exactly against
+pan_kmod_kbase.o.
 
 --- a/src/panfrost/lib/kmod/pan_kmod.c
 +++ b/src/panfrost/lib/kmod/pan_kmod.c
-@@ -13,6 +13,10 @@
-
+@@ -14,6 +14,14 @@
+ 
  extern const struct pan_kmod_ops panfrost_kmod_ops;
  extern const struct pan_kmod_ops panthor_kmod_ops;
 +extern const struct pan_kmod_ops kbase_kmod_ops;
 +
-+/* Defined in pan_kmod_kbase.c. */
-+bool pan_kmod_fd_is_kbase(int fd);
-
++/* Defined in pan_kmod_kbase.c. kbase is not a DRM driver, so it cannot be
++ * identified by drmGetVersion() like the backends above. Reports the kbase
++ * UK interface version through out-params so this file needs no kbase UAPI
++ * headers.
++ */
++bool pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor);
+ 
  static const struct {
     const char *name;
-@@ -50,12 +54,32 @@
- struct pan_kmod_dev *
+@@ -51,15 +59,34 @@
  pan_kmod_dev_create(int fd, uint32_t flags,
                      const struct pan_kmod_allocator *allocator)
  {
 -   drmVersionPtr version = drmGetVersion(fd);
 +   drmVersionPtr version;
     struct pan_kmod_dev *dev = NULL;
-
-+   if (!allocator)
-+      allocator = &default_allocator;
-+
-+   /* kbase is not a DRM driver - it is a misc character device with its own
-+    * ioctl surface, so drmGetVersion() cannot identify it. Probe for it
-+    * before falling through to DRM enumeration.
+ 
+-   if (!version)
+-      return NULL;
+-
+    if (!allocator)
+       allocator = &default_allocator;
+ 
++   /* kbase is not a DRM driver - it's a misc character device (/dev/mali0)
++    * with its own ioctl surface, so drmGetVersion() fails on it. Probe for
++    * it before falling through to DRM enumeration. This mirrors how Turnip
++    * special-cases kgsl (/dev/kgsl-3d0).
 +    */
-+   if (pan_kmod_fd_is_kbase(fd)) {
++   uint16_t kbase_uk_major = 0, kbase_uk_minor = 0;
++   if (pan_kmod_fd_is_kbase(fd, &kbase_uk_major, &kbase_uk_minor)) {
 +      /* kbase reports a UK interface version rather than a DRM driver
-+       * version; use it as the pan_kmod_driver version so the usual
-+       * pan_kmod_driver_version_at_least() gating still works.
++       * version. Use it as the pan_kmod_driver version so the usual
++       * pan_kmod_driver_version_at_least() gating keeps working.
 +       */
-+      struct kbase_ioctl_version_check ver = { .major = 0, .minor = 0 };
-+      ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver);
-+
 +      const struct pan_kmod_driver kbase_drv_info = {
-+         .version = { .major = ver.major, .minor = ver.minor },
++         .version = {.major = kbase_uk_major, .minor = kbase_uk_minor},
 +      };
 +
 +      return kbase_kmod_ops.dev_create(fd, flags, &kbase_drv_info, allocator);
 +   }
 +
 +   version = drmGetVersion(fd);
-    if (!version)
-       return NULL;
-
--   if (!allocator)
--      allocator = &default_allocator;
--
++   if (!version)
++      return NULL;
++
     const char *drv_name = version->name;
     const struct pan_kmod_driver drv_info = {
        .version = {

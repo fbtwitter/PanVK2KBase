@@ -75,26 +75,55 @@ than plausible-looking fakes:
 ## Building
 
 ```
+make mesa-libdrm           # once: fetch real libdrm via Mesa's own wrap
 make mesa-backend-sync     # copy the backend into the Mesa tree
-make mesa-backend-check    # syntax-check it against real headers
+make mesa-backend-check    # compile it for aarch64-android + check symbols
 ```
 
-`mesa-backend-check` compiles the backend with `-fsyntax-only` against the
-**real** `pan_kmod.h` / `pan_kmod_backend.h` from the Mesa checkout and the
-**real** vendored kbase UAPI headers. Verified clean against both
-`kbase-uapi-r49p1` and `kbase-uapi-r44p0`.
+### What has actually been verified
 
-Two honest caveats about what that does and doesn't prove:
+- **Compiles to a real object file** (`-c`, not `-fsyntax-only`) for
+  `aarch64-linux-android26`, against the **real** `pan_kmod.h` /
+  `pan_kmod_backend.h` from the Mesa checkout, the **real** vendored kbase
+  UAPI, and **real libdrm 2.4.133** (fetched via Mesa's own pinned wrap —
+  the stub in `syntax-check-stubs/` is only a fallback when libdrm hasn't
+  been downloaded). Clean, no warnings, against both `kbase-uapi-r49p1` and
+  `kbase-uapi-r44p0`.
+- **Integrates with the dispatch patch at link level.** With
+  `pan_kmod.c.kbase.patch` applied, `pan_kmod.c` also compiles clean, and
+  its two undefined kbase symbols (`kbase_kmod_ops`,
+  `pan_kmod_fd_is_kbase`) resolve exactly against the ones
+  `pan_kmod_kbase.c` defines — checked with `llvm-nm`.
 
-- It uses a minimal libdrm stub (`syntax-check-stubs/xf86drm.h`), because
-  `pan_kmod.h` includes `<xf86drm.h>` unconditionally and libdrm is a meson
-  wrap that a shallow Mesa clone doesn't fetch. The stub supplies only the
-  two symbols `pan_kmod.h` references. A real build links real libdrm and
-  never sees it.
-- It is a syntax/type check, **not** a full Mesa build or link. Building for
-  real needs a complete Mesa meson configure (Android cross-file, NDK
-  toolchain), which is its own piece of setup and hasn't been done.
+### What has *not* been verified
 
-So: this compiles against the real interfaces, and the ioctl sequences in it
-are ones verified on hardware — but it has never been linked into a running
-Mesa, let alone exercised.
+**A full Mesa build has not been done, and is blocked on a real
+dependency.** Modern Mesa requires LLVM to build any panfrost target:
+
+```
+meson.build:976: ERROR: Feature llvm cannot be disabled: CLC requires LLVM
+```
+
+`with_driver_using_cl` includes *both* `with_gallium_panfrost` and
+`with_panfrost_vk`, so there's no panfrost configuration that avoids CLC.
+The documented cross-build escape hatch, `-Dmesa-clc=system`, only moves the
+problem — it then requires a prebuilt native `mesa_clc`:
+
+```
+meson.build:965: ERROR: Program 'mesa_clc' not found or not executable
+```
+
+Building `mesa_clc` natively needs LLVM + Clang **development libraries on
+the build machine**. On this Windows host that's a substantial install, and
+Mesa cross-building from a Windows host to Android is an unusual path
+(Mesa's own docs assume a Linux host). A Linux build machine would make this
+straightforward.
+
+So the honest status: the backend compiles and links correctly against real
+Mesa interfaces, and the ioctl sequences in it were verified on real
+hardware by this repo's probes — but it has **never been built as part of
+Mesa, loaded, or executed**.
+
+An Android meson cross-file is checked in at `android-aarch64.cross` (meson
+accepts it and finds the NDK toolchain — configure gets as far as the LLVM
+error above, so the cross-file itself is good).

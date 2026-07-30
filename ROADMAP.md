@@ -80,10 +80,19 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `src/mesa/pan_kmod_kbase.c`. Note it lives in *this* repo, not in
       the gitignored Mesa clone, and is synced in via
       `make mesa-backend-sync`; see `src/mesa/README.md` for why and for
-      the full status table. `make mesa-backend-check` syntax-checks it
-      against the real `pan_kmod.h`/`pan_kmod_backend.h` and real kbase
-      UAPI (clean against both r49p1 and r44p0). **Not** yet linked into
-      a real Mesa build — that needs a full meson configure.
+      the full status table. `make mesa-backend-check` **compiles it to a
+      real object** for aarch64-android against the real
+      `pan_kmod.h`/`pan_kmod_backend.h`, real kbase UAPI, and real libdrm
+      2.4.133 (fetched via Mesa's own wrap) — clean on both r49p1 and
+      r44p0 — and confirms `pan_kmod.c`'s undefined kbase symbols resolve
+      exactly against the backend's. **A full Mesa build is blocked:**
+      any panfrost target forces CLC → LLVM
+      (`meson.build:976: Feature llvm cannot be disabled`), and the
+      cross-build escape hatch `-Dmesa-clc=system` just needs a prebuilt
+      native `mesa_clc` instead. That needs LLVM dev libraries on the
+      build machine; a Linux build host would make it straightforward.
+      An Android meson cross-file that meson accepts is checked in at
+      `src/mesa/android-aarch64.cross`.
       **Scope correction (unchanged):** the vtable only covers
       device/BO/VM, not submission — see Phase 4 and
       `docs/architecture.md`'s "Correction" section for why a

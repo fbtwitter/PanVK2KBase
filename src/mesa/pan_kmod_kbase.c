@@ -268,22 +268,36 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev)
 }
 
 /*
- * Returns true if `fd` refers to a kbase device. Used by the dispatch
- * special case in pan_kmod.c, since drmGetVersion() cannot identify a misc
- * device. KBASE_IOCTL_VERSION_CHECK is the natural probe: it is the very
- * first thing any kbase client must call, it is side-effect free, and it
- * fails cleanly on any fd that isn't kbase.
+ * Returns true if `fd` refers to a kbase device, and reports the kbase UK
+ * interface version it speaks. Used by the dispatch special case in
+ * pan_kmod.c, since drmGetVersion() cannot identify a misc device.
+ * KBASE_IOCTL_VERSION_CHECK is the natural probe: it is the very first
+ * thing any kbase client must call, it is side-effect free, and it fails
+ * cleanly on any fd that isn't kbase.
+ *
+ * The version is reported through out-params rather than having the caller
+ * issue the ioctl itself, specifically so that pan_kmod.c - which is
+ * generic, driver-agnostic code - does not need to include kbase UAPI
+ * headers or know the ioctl encoding.
  *
  * NOTE: VERSION_CHECK must be issued before KBASE_IOCTL_SET_FLAGS, and
  * SET_FLAGS may only be called once per context, so this deliberately does
  * not call SET_FLAGS - that happens in dev_create().
  */
 bool
-pan_kmod_fd_is_kbase(int fd)
+pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor)
 {
    struct kbase_ioctl_version_check ver = { .major = 0, .minor = 0 };
 
-   return ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver) >= 0;
+   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0)
+      return false;
+
+   if (uk_major)
+      *uk_major = ver.major;
+   if (uk_minor)
+      *uk_minor = ver.minor;
+
+   return true;
 }
 
 static struct pan_kmod_dev *
