@@ -18,6 +18,34 @@ failing loudly.
 A second target, `third_party/kbase-uapi-r49p1/`, is also vendored — see
 below for provenance and why it exists.
 
+**Writing code that targets "any vendored version", not just these
+two:** the build isn't hardcoded to r44p0/r49p1 — `KBASE_VERSION` in the
+root `makefile` accepts any `third_party/kbase-uapi-<name>/` directory
+(`make list-kbase-versions` lists what's actually vendored). To keep
+source files buildable against whichever version is selected:
+
+- If an ioctl/struct/flag isn't guaranteed present in every vendored
+  version (like `KBASE_IOCTL_INTERNAL_FENCE_WAIT`, r49p1-only), guard
+  its use with `#ifdef SYMBOL_NAME` rather than assuming it exists —
+  see `tests/fence_probe/fence_probe.c` for the pattern: the ioctl-only
+  parts are compiled in when the header declares them, and skipped
+  (with a clear runtime message) otherwise, so the *same source*
+  compiles and runs correctly against r44p0, r49p1, or a future version
+  that hasn't been vendored yet.
+- For a field *added to an already-present struct* at a specific UK
+  version bump (e.g. `cs_fault_report_enable` added at UK 1.22, see the
+  changelog comments atop `csf/mali_kbase_csf_ioctl.h`), prefer `#if
+  BASE_UK_VERSION_MINOR >= N` over an ioctl-name check — every vendored
+  version defines `BASE_UK_VERSION_MAJOR`/`_MINOR` unconditionally, so
+  this works even when there's no separate symbol to `#ifdef` on.
+- What this can't automate: a vendor sometimes ships an *incomplete*
+  drop (r49p1 was missing `mali_gpu_props.h` until this repo vendored it
+  separately — see below). Adding a genuinely new version still needs a
+  one-time check that all its `#include`s actually resolve within the
+  vendored directory; the `#ifdef`/`#if BASE_UK_VERSION_MINOR` patterns
+  above only handle *feature* differences between complete header sets,
+  not missing files.
+
 - Find the kbase kernel driver source that matches what's actually
   running on your target device (check kernel version + vendor + Mali
   driver version reported in `dmesg` or `/sys/kernel/debug` if available

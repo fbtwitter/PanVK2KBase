@@ -1,15 +1,31 @@
-// Probes whether KBASE_IOCTL_INTERNAL_FENCE_WAIT (r49p1-only, ioctl 80,
-// documented as gated behind CONFIG_MALI_MTK_FENCE_DEBUG) is actually
-// implemented by the running kernel, and - past that - whether it behaves
-// like a real completion-wait mechanism against a live, bound CS queue
-// (candidate for Phase 4's fence-translation shim) rather than a no-op
-// on degenerate input. See docs/kbase-notes.md and ROADMAP.md Phase 4.
+// Probes whether KBASE_IOCTL_INTERNAL_FENCE_WAIT (an MTK-only addition,
+// present in r49p1 but not r44p0, documented as gated behind
+// CONFIG_MALI_MTK_FENCE_DEBUG) is actually implemented by the running
+// kernel, and - past that - whether it behaves like a real completion-
+// wait mechanism against a live, bound CS queue (candidate for Phase 4's
+// fence-translation shim) rather than a no-op on degenerate input.
+// See docs/kbase-notes.md and ROADMAP.md Phase 4.
+//
+// Version-adaptive by design: KBASE_IOCTL_INTERNAL_FENCE_WAIT is only
+// #defined by header sets that actually declare it (r49p1; not r44p0,
+// and not necessarily any future vendored version either). Everything
+// specific to it is behind "#ifdef KBASE_IOCTL_INTERNAL_FENCE_WAIT" so
+// this file builds against any vendored kbase-uapi-* version - the
+// probe just skips what that header doesn't support instead of failing
+// to compile. Follow this pattern for future ioctls that aren't
+// guaranteed present across versions: gate on the ioctl/struct name for
+// "does this header declare it at all", or on
+// "BASE_UK_VERSION_MINOR >= N" (every version defines this) for fields
+// added to an already-present struct at a specific UK minor version -
+// see the changelog comments at the top of csf/mali_kbase_csf_ioctl.h
+// for which minor version introduced what.
 #include "csf/mali_kbase_csf_ioctl.h"
 #include "initialize.h"
 #include "memory.h"
 #include <time.h>
 #include <unistd.h>
 
+#ifdef KBASE_IOCTL_INTERNAL_FENCE_WAIT
 static double elapsed_ms(struct timespec *start, struct timespec *end) {
   return (end->tv_sec - start->tv_sec) * 1000.0 +
          (end->tv_nsec - start->tv_nsec) / 1e6;
@@ -38,13 +54,21 @@ static void try_fence_wait(int fd, const char *label, uint32_t pid,
   printf("[%s] ret=%d errno=%d (%s) elapsed=%.1fms (requested timeout=%.1fms)\n",
          label, ret, errno, strerror(errno), ms, timeout_us / 1000.0);
 }
+#endif /* KBASE_IOCTL_INTERNAL_FENCE_WAIT */
 
 int main(void) {
   int fd = open_gpu();
 
+#ifdef KBASE_IOCTL_INTERNAL_FENCE_WAIT
   // Reachability check with all-zero args (what the earlier version of
   // this probe did).
   try_fence_wait(fd, "zeroed args, no queue set up", 0, 0, 0, 0);
+#else
+  printf("KBASE_IOCTL_INTERNAL_FENCE_WAIT not declared by this header "
+         "set - skipping (see ROADMAP.md Phase 4: ruled out as the "
+         "fence mechanism on r49p1 anyway, so this is expected/fine on "
+         "any header set, MTK-derived or not).\n");
+#endif
 
   // ---- Set up a real queue group + bound queue, same shape as
   // ---- tests/queue_group/queue_group.c, so we have a real GPU VA to
@@ -97,6 +121,7 @@ int main(void) {
   }
 
   uint64_t queue_addr = (uint64_t)(uintptr_t)queue_bo->cpu;
+#ifdef KBASE_IOCTL_INTERNAL_FENCE_WAIT
   uint32_t pid = (uint32_t)getpid();
 
   // Before KICK: nothing submitted yet.
@@ -107,6 +132,7 @@ int main(void) {
                  BASE_INTERNAL_FENCE_WAIT_IDLE_FLAG |
                      BASE_INTERNAL_FENCE_WAIT_RESULT_FLAG,
                  2000000);
+#endif
 
   // Kick (same sentinel-word approach as queue_group.c - not a real
   // command stream, just exercising the doorbell).
@@ -123,6 +149,7 @@ int main(void) {
     printf("CS_QUEUE_KICK OK\n");
   }
 
+#ifdef KBASE_IOCTL_INTERNAL_FENCE_WAIT
   // After KICK: does timing or result change?
   try_fence_wait(fd, "bound, after kick, IDLE, pid=0", 0, queue_addr,
                  BASE_INTERNAL_FENCE_WAIT_IDLE_FLAG, 2000000);
@@ -133,6 +160,7 @@ int main(void) {
                  2000000);
   try_fence_wait(fd, "bound, after kick, DUMP, real pid", pid, queue_addr,
                  BASE_INTERNAL_FENCE_WAIT_DUMP_FLAG, 2000000);
+#endif
 
   // Teardown, same order confirmed clean in queue_group.c.
   if (munmap(queue_state, queue_state_size) < 0)
