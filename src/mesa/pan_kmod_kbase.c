@@ -36,6 +36,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -319,19 +320,23 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    pan_kmod_dev_init(&kbase_dev->base, fd, flags, drv_info, &kbase_kmod_ops,
                      allocator);
 
-   /* Handshake, in the order kbase requires. */
-   struct kbase_ioctl_version_check ver = { .major = 0, .minor = 0 };
-   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0) {
-      mesa_loge("kbase: VERSION_CHECK failed");
-      goto err_cleanup;
-   }
-
-   kbase_dev->uk_version.major = ver.major;
-   kbase_dev->uk_version.minor = ver.minor;
+   /* Deliberately NOT re-issuing KBASE_IOCTL_VERSION_CHECK here.
+    *
+    * kbase permits it exactly once per fd: a second call returns -EPERM,
+    * even though the handshake it performed is still in effect (SET_FLAGS
+    * afterwards still succeeds). Since pan_kmod_dev_create() already calls
+    * pan_kmod_fd_is_kbase() to identify the device, issuing it again here
+    * would fail every time - which is precisely why the UK version is
+    * handed to us in drv_info rather than being re-queried.
+    *
+    * See tests/double_handshake_probe/ for the probe that established this.
+    */
+   kbase_dev->uk_version.major = drv_info->version.major;
+   kbase_dev->uk_version.minor = drv_info->version.minor;
 
    struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
    if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags) < 0) {
-      mesa_loge("kbase: SET_FLAGS failed");
+      mesa_loge("kbase: SET_FLAGS failed: %s", strerror(errno));
       goto err_cleanup;
    }
 

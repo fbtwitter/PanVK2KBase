@@ -130,11 +130,36 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       using `KBASE_IOCTL_VERSION_CHECK` as a side-effect-free test. Kept
       as a readable patch at `src/mesa/pan_kmod.c.kbase.patch` rather
       than auto-applied, since upstream `pan_kmod.c` moves.
-- [ ] Enumeration above `pan_kmod` — the physical-device layer in PanVK
-      still has to learn about a non-DRM device path. The dispatch fix
-      above only covers `pan_kmod_dev_create()`; whoever *opens* the
-      device still has to find `/dev/mali0` instead of a
-      `/dev/dri/renderD*` node.
+- [x] **Enumeration above `pan_kmod` — done, and the backend now runs.**
+      `src/mesa/patch-panvk-kbase-enumeration.py` adds a
+      `physical_devices.enumerate` hook that opens `/dev/mali0`. Mesa's
+      `vk_instance` calls it before DRM enumeration and falls through on
+      `VK_ERROR_INCOMPATIBLE_DRIVER`, so one binary still works on
+      panfrost/panthor. Confirmed on-device via
+      `tests/driver_enum_probe/`: `kbase: SET_FLAGS ok` /
+      `props ok, gpu_id=0xc8700010` — matching what `first_test` reads
+      from the hardware. So `open` → `VERSION_CHECK` → `SET_FLAGS` →
+      `GET_GPUPROPS` → `pan_kmod_dev_props` all execute inside
+      `pan_kmod_kbase.c`.
+      **Non-obvious rule found doing this:** `KBASE_IOCTL_VERSION_CHECK`
+      may be issued only *once per fd* — a second call returns `-EPERM`
+      while leaving the handshake in effect
+      (`tests/double_handshake_probe/`). This broke the path twice: once
+      inside the backend, and once because PanVK probed *and* the
+      dispatch probed, so the dispatch saw the failing second call,
+      decided it wasn't kbase, and silently fell through to
+      `drmGetVersion()`. Only the dispatch may probe.
+      **Next blocker is Phase 4's, arriving early:** device init now
+      fails at `vk_drm_syncobj_get_type(dev->fd)`, which needs a real
+      DRM fd — `-3 VK_ERROR_INITIALIZATION_FAILED`. Exactly what
+      `docs/architecture.md` predicted.
+- [ ] Give PanVK a non-DRM `vk_sync` implementation. This is the new
+      blocker: `get_device_sync_types()` calls
+      `vk_drm_syncobj_get_type(dev->fd)` unconditionally, so physical
+      device creation cannot succeed on a misc device no matter what the
+      backend does. Needs a `vk_sync` type backed by whatever kbase
+      offers — which loops back to the unsolved completion-mechanism
+      question in `docs/kbase-notes.md`.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),

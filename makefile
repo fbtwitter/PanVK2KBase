@@ -72,6 +72,15 @@ glb_iface_probe: ./src/tests/glb_iface_probe/glb_iface_probe.c
 driver_load_probe: ./src/tests/driver_load_probe/driver_load_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_load_probe $<
 
+# Drives a built PanVK driver through its Android HAL entrypoint and calls
+# vkEnumeratePhysicalDevices - the end-to-end test of the kbase backend.
+driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_enum_probe $<
+
+# Establishes that KBASE_IOCTL_VERSION_CHECK is once-per-fd.
+double_handshake_probe: ./src/tests/double_handshake_probe/double_handshake_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/double_handshake_probe $<
+
 # --- Mesa CS instruction encoder (see docs/mesa-cs-builder.md) ---
 # Builds real Mali CSF instructions via Mesa's own encoder
 # (cs_builder.h) instead of sentinel bytes - see docs/kbase-notes.md's
@@ -133,12 +142,13 @@ MESA_KMOD_DIR := $(MESA_DIR)/src/panfrost/lib/kmod
 
 mesa-backend-sync:
 	@test -d "$(MESA_KMOD_DIR)" || { echo "error: $(MESA_KMOD_DIR) not found - see docs/mesa-cs-builder.md for the Mesa clone command"; exit 1; }
-	cp src/mesa/pan_kmod_kbase.c $(MESA_KMOD_DIR)/
+	cp src/mesa/pan_kmod_kbase.c src/mesa/pan_kmod_kbase.h $(MESA_KMOD_DIR)/
 	@echo ""
-	@echo "Copied pan_kmod_kbase.c into $(MESA_KMOD_DIR)/"
-	@echo "Still to apply by hand (kept as readable patches since upstream moves):"
-	@echo "  - src/mesa/pan_kmod.c.kbase.patch  -> $(MESA_KMOD_DIR)/pan_kmod.c"
-	@echo "  - src/mesa/meson.build.kbase       -> $(MESA_KMOD_DIR)/meson.build"
+	@echo "Copied pan_kmod_kbase.{c,h} into $(MESA_KMOD_DIR)/"
+	@echo "Still to apply (kept as readable patches since upstream moves):"
+	@echo "  - src/mesa/pan_kmod.c.kbase.patch      -> $(MESA_KMOD_DIR)/pan_kmod.c"
+	@echo "  - src/mesa/meson.build.kbase.patch     -> $(MESA_KMOD_DIR)/meson.build"
+	@echo "  - src/mesa/patch-panvk-kbase-enumeration.py <mesa-dir>  (PanVK enumeration)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
 # <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to

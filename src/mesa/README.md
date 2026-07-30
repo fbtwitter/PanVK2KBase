@@ -173,22 +173,74 @@ So every `NEEDED` dependency resolves on a stock device, and it exposes a
 well-formed Android hwvulkan HAL module — the same interface the device's
 own `vulkan.mali.so` uses (`ro.hardware.vulkan=mali`).
 
+### Enumeration — done, and the backend now really runs
+
+`patch-panvk-kbase-enumeration.py` adds a `physical_devices.enumerate` hook
+to PanVK that opens `/dev/mali0` directly. Mesa's `vk_instance` calls that
+hook *before* DRM enumeration and falls through to DRM if it returns
+`VK_ERROR_INCOMPATIBLE_DRIVER` — so one binary still works on
+panfrost/panthor hardware. (Turnip picks kgsl-or-DRM at build time; this is
+strictly more flexible.)
+
+**Confirmed on-device** with `make driver_enum_probe`, which drives the HAL
+directly and calls `vkEnumeratePhysicalDevices`:
+
+```
+kbase: dev_create entered, uk 1.30
+kbase: SET_FLAGS ok
+kbase: props ok, gpu_id=0xc8700010 variant=0x4
+Found compatible kbase device '/dev/mali0'.
+```
+
+That `gpu_id` matches exactly what `tests/first_test` reads from the
+hardware. So `open("/dev/mali0")` → `VERSION_CHECK` → `SET_FLAGS` →
+`GET_GPUPROPS` → decode into `pan_kmod_dev_props` all execute inside
+`pan_kmod_kbase.c`. **The backend is live code now, not a stub.**
+
+#### The once-per-fd VERSION_CHECK rule
+
+Getting there required a non-obvious fix. `KBASE_IOCTL_VERSION_CHECK` may
+be issued **exactly once per fd** — a second call returns `-EPERM`, even
+though the handshake it performed remains in effect (`SET_FLAGS` afterwards
+still succeeds). `tests/double_handshake_probe/` demonstrates this.
+
+That broke the path twice, in different places:
+
+1. `kbase_kmod_dev_create()` originally re-ran the handshake. Fixed by
+   taking the UK version from `drv_info`, which is exactly why
+   `pan_kmod_fd_is_kbase()` reports it through out-params.
+2. More subtly, the first version of the PanVK patch *also* probed with
+   `pan_kmod_fd_is_kbase()` before calling `pan_kmod_dev_create()` — making
+   the dispatch's own probe the second call. It returned `false`, so the
+   dispatch concluded this wasn't kbase and fell through to
+   `drmGetVersion()`, which fails on a misc device. The entire kbase path
+   silently never ran, with no error logged anywhere.
+
+Lesson worth keeping: only one place may probe, and it must be the
+dispatch.
+
 ### Not verified
 
-- **The driver cannot actually drive the GPU yet.** It builds and loads;
-  that is not the same as working. Two known blockers, both above this
-  backend:
-  - **Enumeration.** The dispatch patch fixes `pan_kmod_dev_create()`, but
-    whoever *opens* the device still looks for a `/dev/dri/renderD*` node,
-    not `/dev/mali0`. Nothing currently reaches the kbase backend.
-  - **Submission.** `panvk_vX_gpu_queue.c` issues `DRM_IOCTL_PANTHOR_*` and
-    libdrm `drmSyncobj*` on a DRM fd — neither works on a misc device. And
-    the underlying "queue group never gets scheduled" problem in
-    `docs/kbase-notes.md` is still unsolved.
-- **The backend's own code has never executed.** `dev_create` and
-  `bo_alloc`/`bo_free` use ioctl sequences verified on hardware by this
-  repo's standalone probes, but the backend functions themselves have never
-  been called.
+- **The driver still cannot drive the GPU.** Enumeration now reaches the
+  backend, but device creation fails immediately after, at exactly the
+  point `docs/architecture.md` predicted:
+
+  ```c
+  device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
+  if (!device->drm_syncobj_type.features)
+     return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, ...);
+  ```
+
+  `vk_drm_syncobj_get_type()` needs a real DRM fd; `/dev/mali0` is a misc
+  device, so it fails and `vkEnumeratePhysicalDevices` returns `-3`
+  (`VK_ERROR_INITIALIZATION_FAILED`). PanVK's sync model is DRM-syncobj
+  based from the ground up, so this needs a `vk_sync` implementation backed
+  by whatever kbase offers — and *that* is still blocked on the unsolved
+  "queue group never gets scheduled" problem in `docs/kbase-notes.md`.
+- **Submission is untouched.** `panvk_vX_gpu_queue.c` still issues
+  `DRM_IOCTL_PANTHOR_*` directly.
+- **BO/VM ops still never execute.** Initialisation fails before any
+  allocation happens.
 - **Not installed as the system driver.** Replacing
   `/vendor/lib64/hw/vulkan.mali.so` needs a writable `/vendor` (root) and
   would break the device's graphics if the driver misbehaves. Deliberately
