@@ -887,18 +887,37 @@ collect_cmdbuf_calls(struct panvk_device *dev,
           * application asked for render work. All three subqueues have a
           * context now, so that epilogue runs fine anywhere.
           *
-          * A stream that genuinely renders is the one that requests the
-          * tiler, IDVS or fragment endpoints, and that stream would
-          * dereference render.desc_ringbuf, which is deliberately 0 here.
+          * A stream that requests the tiler, IDVS or fragment endpoints only
+          * dereferences render.desc_ringbuf (deliberately 0 here) when the
+          * command buffer that built it carries
+          * VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT - verified against
+          * PanVK's own source, not assumed: every desc_ringbuf touch in
+          * panvk_vX_cmd_draw.c is gated on simul_use (get_tiler_desc's
+          * ringbuf-vs-per-cmdbuf-pool branch, the FBD patch-copy, the
+          * producer/consumer release pair), and render.tiler_heap /
+          * render.geom_buf / the tiler-OOM scratch FBD are already set
+          * correctly here regardless. So a non-simul_use render stream is
+          * refused by this check today for no reason the hardware actually
+          * needs - see docs/kbase-notes.md's "non-simul_use rendering"
+          * section for the full trace through Mesa's source.
+          *
+          * This is new ground, not a proven-safe path: no VERTEX_TILER or
+          * FRAGMENT stream has ever actually executed on this device in
+          * this repo before. tests/render_clear_probe is the first attempt,
+          * and it is deliberately gated the way tests/alias_cs_probe is.
           */
-         if (j != PANVK_SUBQUEUE_COMPUTE && b->req_resource_mask) {
+         bool simul_use =
+            cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+
+         if (j != PANVK_SUBQUEUE_COMPUTE && b->req_resource_mask &&
+             simul_use) {
             /* Logged as well as returned: panvk_errorf()'s message goes to a
              * debug messenger that these probes do not install, so the
              * VkResult would otherwise arrive with no explanation.
              */
             mesa_logw("kbase: command buffer %u requests resources 0x%x on "
-                      "subqueue %u, which needs the render descriptor "
-                      "ringbuf",
+                      "subqueue %u with SIMULTANEOUS_USE set, which needs "
+                      "the render descriptor ringbuf",
                       i, b->req_resource_mask, j);
 
             kbase_dump_stream("rejected stream", cs_root_chunk_gpu_addr(b),
@@ -906,8 +925,9 @@ collect_cmdbuf_calls(struct panvk_device *dev,
                               cs_root_chunk_size(b));
             return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                                 "kbase: command buffer %u needs the render "
-                                "descriptor ringbuf on subqueue %u, which "
-                                "kbase cannot express yet",
+                                "descriptor ringbuf on subqueue %u "
+                                "(SIMULTANEOUS_USE), which kbase cannot "
+                                "express yet",
                                 i, j);
          }
 
