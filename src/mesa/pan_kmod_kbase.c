@@ -1474,6 +1474,11 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 }
 
 /*
+ * BELONGS-UPSTREAM(pan_kmod): pan_kmod needs an import entry point that
+ * takes the dma-buf fd and dispatches to the backend *before* any DRM call,
+ * so a non-DRM backend can handle it. Until that exists this hook is
+ * unreachable and cannot be fixed from here - see below.
+ *
  * dma-buf import. Deliberately left unimplemented, and it is worth being
  * precise about why, because "fill in the stub" does not fix it.
  *
@@ -1508,6 +1513,11 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
 }
 
 /*
+ * BELONGS-UPSTREAM(kernel): there is nothing to implement here until kbase
+ * itself grows a dma-buf export path. This tag is a marker that the gap is
+ * known and deliberate, not an oversight - it is the one entry on the list
+ * that no amount of userspace work can close.
+ *
  * dma-buf export. Not "not yet" - not possible.
  *
  * kbase has no export mechanism at all: there is no PRIME ioctl, no

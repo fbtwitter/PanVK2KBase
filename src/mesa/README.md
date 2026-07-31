@@ -30,6 +30,7 @@ to be applied by hand.
 | `pan_kmod_kbase.h` | Declares `kbase_kmod_ops` and `pan_kmod_fd_is_kbase()`. Mirrors `panthor_kmod.h`. Not optional — Mesa builds with `-Werror=missing-prototypes`. |
 | `pan_kmod.c.kbase.patch` | The dispatch change: `pan_kmod_dev_create()` must probe for kbase *before* calling `drmGetVersion()`, which fails on a misc device. Kept as a readable patch rather than auto-applied, since upstream `pan_kmod.c` moves. |
 | `meson.build.kbase.patch` | The `meson.build` hunk: adds the source file, the kbase UAPI include path, `-DMALI_USE_CSF=1`, and the kconfig shim. |
+| `patch-panvk-kbase-*.py` | Hand-run, idempotent patches to PanVK itself (not to `pan_kmod`). Scripts rather than diffs because upstream moves. `enumeration` finds the device, `queue` / `subqueue-init` / `sync` bring up submission, `external-memory` stops the driver claiming dma-buf sharing it cannot do. They share target files, so changing one means restoring its targets in `/opt/mesa-src` and re-running **all** of them. |
 | `wsl-install-deps.sh` | Installs the Linux toolchain needed to build Mesa's panfrost targets. |
 | `wsl-build.sh` | Syncs the backend in, applies both patches, configures and builds `libpankmod_lib`. |
 | `android-aarch64.cross` | Meson cross-file for the eventual Android build. |
@@ -68,13 +69,45 @@ than plausible-looking fakes:
 
 - `bo_wait` — needs a working fence mechanism; none is known to work on
   kbase (see `docs/kbase-notes.md`).
-- `bo_import` / `bo_export` — dma-buf. The common `pan_kmod_bo_import()`
-  goes through `drmPrimeFDToHandle()` on `dev->fd`, so this needs changes
-  above the backend too. Phase 3.
+- `bo_import` — dma-buf in. kbase can do it (`MEM_IMPORT` /
+  `BASE_MEM_IMPORT_TYPE_UMM`), but the common `pan_kmod_bo_import()` calls
+  `drmPrimeFDToHandle()` on `dev->fd` before dispatching to the backend, so
+  this hook is never reached. Needs a change above the backend.
+- `bo_export` — dma-buf out. Not "not yet": kbase has no export path at
+  all, and `pan_kmod_bo_export()` is a `static inline` that calls
+  `drmPrimeHandleToFD()` itself. See ROADMAP Phase 3.
 - `vm_create` / `vm_destroy` / `vm_bind` — kbase has no explicit VM
   object; a context owns one address space and allocations are mapped at
   `MEM_ALLOC` time, with no separate bind step. Mapping pan_kmod's
   explicit-VM model onto that needs a design decision, not a guess.
+
+## `BELONGS-UPSTREAM`: work done here that shouldn't live here
+
+Some of what this port does is standing in for something PanVK, `pan_kmod`
+or the kernel ought to provide. Left unmarked, those stop-gaps quietly
+become permanent — so each one carries a tag naming who should own it:
+
+```
+BELONGS-UPSTREAM(panvk):    should live in the Vulkan driver
+BELONGS-UPSTREAM(pan_kmod): should live in the shared kmod layer
+BELONGS-UPSTREAM(kernel):   needs something kbase does not expose
+```
+
+Find them all with:
+
+```sh
+grep -rn "BELONGS-UPSTREAM" src/
+```
+
+Each tag says what upstream should provide, and why it is done here
+instead. When upstream grows the real thing, the tag is the delete list.
+
+| where | owner | what |
+|---|---|---|
+| `pan_kmod_kbase.c` `bo_import` | `pan_kmod` | an fd-taking import entry point that dispatches to the backend before any DRM call |
+| `pan_kmod_kbase.c` `bo_export` | `kernel` | kbase has no dma-buf export; nothing to build on |
+| `panvk_vX_kbase_queue.c` render ringbuf | `panvk` | a ring discipline that does not need one BO at two adjacent VAs — asked upstream, see `docs/upstream-ringbuf-question.md` |
+| external-memory capability gating | `panvk` | `panvk_physical_device.c` advertises dma-buf import/export unconditionally; it should ask the backend |
 
 
 ## Building
