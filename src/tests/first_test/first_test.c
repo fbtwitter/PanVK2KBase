@@ -71,7 +71,7 @@ int main(void) {
   printf("GET_GPUPROPS fetch OK\n");
   
   // parse the GPU properties from the obtained buffer
-  parse_gpuprops(props_buf, props_size);
+  parse_gpuprops(props_buf, props_size, NULL);
 
   // free the allocated memory
   free(props_buf);

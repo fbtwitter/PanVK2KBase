@@ -1,2 +1,3 @@
 -Ithird_party/kbase-uapi-r44p0
 -Isrc/utils
+-Ithird_party/mesa

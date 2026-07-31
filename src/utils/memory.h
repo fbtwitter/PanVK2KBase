@@ -96,6 +96,8 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
   printf("buffer cpu = 0x%016lx\n", bo->cpu);
   printf("buffer size   = %zu\n", bo->size);
 
+  bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
+
   // return the constructed buffer object
   return bo;
 }
