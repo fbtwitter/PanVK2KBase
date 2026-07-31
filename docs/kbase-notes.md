@@ -982,13 +982,47 @@ cookie handle, SAME_VA alias      -> Out of memory
 real GPU VA handle, SAME_VA alias -> OK   (gpu_va=0x41000, va_pages=8)
 ```
 
-**The alias is not CPU-mappable**: `mmap()` on it returns `EPERM`. Not a
-problem for the ringbuf, which is allocated `PAN_KMOD_BO_FLAG_NO_MMAP` and is
-GPU-only whenever tracing is off — but it does mean the probe cannot confirm
-from the CPU that the two windows are genuinely the same pages. The ioctl
-composing the region as asked is good evidence, not proof; proving it needs a
-command stream that writes through one window and reads through the other.
-Worth doing before the ringbuf is relied on.
+**`out.gpu_va` is an mmap cookie, not an address.** `out.flags` comes back
+`0x400d` = `NEED_MMAP | GPU_WR | GPU_RD | CPU_RD` — note `SAME_VA` is absent,
+because `kbase_mem_alias()` strips it. `BASE_MEM_NEED_MMAP` means the region
+has no mapping, GPU or CPU, until userspace `mmap()`s it. **Check this flag
+before doing anything with the returned value.**
+
+**This cost two device reboots.** `tests/alias_cs_probe` pointed a command
+stream at `out.gpu_va + stride`, assuming it was an address because `SAME_VA`
+had been stripped. Writing to an unmapped GPU address faulted, and the fault
+wedged the kbase context past `kill -9` — the process sits in uninterruptible
+`D` state and only a reboot clears it. The GPU itself survives: a fresh
+context opens fine afterwards and `live_kick_probe` still passes 3/3. The
+probe now refuses to run without `--i-know-it-hangs`.
+
+Two `kbase_context_mmap()` constraints then box the whole approach in:
+
+- `PROT_WRITE` is refused with `EPERM` ("VM flags inconsistent with region
+  flags"), because `CPU_WR` is not in `kbase_mem_alias()`'s accepted mask.
+- `nr_pages > stride` is refused with `EINVAL`, so **a single mapping can
+  never span more than one window**.
+
+That last constraint is the real obstacle. PanVK's ringbuf needs *one* VA
+range covering both windows back to back — that is the entire point of the
+double mapping — and a mapping capped at `stride` pages cannot produce one.
+So `MEM_ALIAS` composes the region as asked, and its entries genuinely share
+`alloc->pages` (confirmed in the kernel source, `kbase_mem_phy_alloc_get()`),
+but the route from there to a usable 2x GPU VA range is not established.
+
+Worth trying before concluding it is impossible: whether `stride` set to the
+full span rather than the window size changes what `mmap()` will accept, and
+whether an alias placed via the FIXED_VA zone (`BASE_MEM_FIXABLE` on the
+source) comes back addressable instead of as a cookie. Note `FIXED` and
+`FIXABLE` are mutually exclusive per context, so that interacts with the
+backend's existing commitment to `FIXED`.
+
+**Method note that cost real time here:** `adb push` run from Git Bash has
+its destination path mangled (`/data/local/tmp/x` becomes
+`C:/Program Files/Git/data/local/tmp/x`), and it still reports "1 file
+pushed". The device silently keeps running the old binary. Two of the
+conclusions above were briefly wrong because of it. Push from PowerShell, or
+verify with `md5sum` on both sides.
 
 ## Where to ask
 

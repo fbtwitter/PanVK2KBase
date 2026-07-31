@@ -92,6 +92,15 @@ driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 alias_probe: ./src/tests/alias_probe/alias_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/alias_probe $<
 
+# The other half of the aliasing question: alias_probe shows MEM_ALIAS
+# composes the region, this shows the two windows are the same pages. Needs
+# a command stream because the CPU cannot reach window 1 at all - see the
+# file header.
+alias_cs_probe: ./src/tests/alias_cs_probe/alias_cs_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/alias_cs_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
 remap_probe: ./src/tests/remap_probe/remap_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/remap_probe $<
 

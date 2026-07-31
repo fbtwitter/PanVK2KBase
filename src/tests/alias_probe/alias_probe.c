@@ -144,6 +144,21 @@ main(void)
       }
 
       printf("  %-36s -> OK\n", attempts[i].what);
+      printf("    gpu_va=0x%llx va_pages=%llu out.flags=0x%llx%s\n",
+             (unsigned long long)alias.out.gpu_va,
+             (unsigned long long)alias.out.va_pages,
+             (unsigned long long)alias.out.flags,
+             (alias.out.flags & BASE_MEM_NEED_MMAP) ? "  <- NEED_MMAP: gpu_va "
+                                                      "is a COOKIE, not an "
+                                                      "address"
+                                                    : "");
+
+      /* Whether out.gpu_va is an address or an mmap cookie decides whether
+       * a command stream can be pointed at the alias at all. Getting this
+       * wrong is not a failed ioctl - it is a GPU page fault that wedges
+       * the kbase context past kill -9 and needs a device reboot. Ask here,
+       * where it costs nothing, rather than finding out from the GPU.
+       */
       aliased = true;
       break;
    }
@@ -172,11 +187,28 @@ main(void)
                     fd, (off_t)alias.out.gpu_va);
    if (map == MAP_FAILED) {
       perror("  mmap of the alias");
-      printf("\n=> The alias exists but is not CPU-mappable at that address.\n"
-             "   That is not fatal for PanVK - the ringbuf is GPU-only\n"
-             "   (PAN_KMOD_BO_FLAG_NO_MMAP) - but it means this probe cannot\n"
-             "   verify the aliasing from the CPU, and a command stream\n"
-             "   would be needed to confirm it.\n");
+      printf("\n=> Measured on a Mali-G720 / r49p1: out.flags carries\n"
+             "   BASE_MEM_NEED_MMAP (0x400d = NEED_MMAP|GPU_WR|GPU_RD|CPU_RD,\n"
+             "   and note SAME_VA is absent - kbase_mem_alias() strips it).\n"
+             "   So out.gpu_va is an mmap COOKIE, not a GPU address, and the\n"
+             "   region has no GPU mapping until userspace mmap()s it.\n"
+             "\n"
+             "   Two kernel-side constraints then box this in, both in\n"
+             "   kbase_context_mmap():\n"
+             "     - PROT_WRITE is refused (EPERM, \"VM flags inconsistent\n"
+             "       with region flags\") because CPU_WR is not in the\n"
+             "       accepted mask - which is the failure above; and\n"
+             "     - nr_pages > stride is refused (EINVAL), so one mapping\n"
+             "       can never span more than a single window.\n"
+             "\n"
+             "   That last one is the problem. PanVK's ringbuf needs ONE VA\n"
+             "   range covering both windows back to back; a mapping capped\n"
+             "   at `stride` pages cannot produce it.\n"
+             "\n"
+             "   DO NOT hand out.gpu_va to a command stream to test this.\n"
+             "   tests/alias_cs_probe did exactly that, and writing to a\n"
+             "   cookie faulted the GPU and wedged the kbase context past\n"
+             "   kill -9 - twice - each time needing a device reboot.\n");
       return failures ? 1 : 0;
    }
 

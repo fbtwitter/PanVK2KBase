@@ -446,17 +446,35 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       mmap cookie and the real address is the CPU pointer. The cookie fails
       `ENOMEM`, which reads like a resource limit but means "no such
       allocation at that address".
-      **Caveat, not yet closed**: the alias is not CPU-mappable (`mmap` →
-      `EPERM`), so the probe cannot confirm from the CPU that both windows
-      are the same pages. The ioctl composing the region as asked is good
-      evidence, not proof — a command stream writing through one window and
-      reading through the other should confirm it before the ringbuf is
-      relied on. Not a problem for PanVK itself, which allocates the
-      ringbuf `PAN_KMOD_BO_FLAG_NO_MMAP`.
-      Remaining work: an alias operation in the kbase backend, a way for
-      `init_render_desc_ringbuf()`'s two `MAP` ops to reach it, then
-      dropping the compute-only restriction. `kbase_queue_submit()` keeps
-      refusing submits carrying command buffers until then.
+      **But the returned value is a cookie, not an address, and that is a
+      real obstacle.** `out.flags` is `0x400d` =
+      `NEED_MMAP | GPU_WR | GPU_RD | CPU_RD` — `SAME_VA` stripped by
+      `kbase_mem_alias()`, `BASE_MEM_NEED_MMAP` set. The region has no GPU
+      mapping until userspace `mmap()`s it, and `kbase_context_mmap()` then
+      refuses `nr_pages > stride` (`EINVAL`). **So a single mapping can
+      never span both windows** — which is exactly what the ringbuf needs.
+      `MEM_ALIAS` composes the region and its entries do share
+      `alloc->pages`, but the route to a usable 2x GPU VA range is not
+      established.
+      **This cost two device reboots.** `tests/alias_cs_probe` pointed a
+      command stream at `out.gpu_va + stride` on the assumption it was an
+      address; writing to unmapped GPU memory faulted and wedged the kbase
+      context past `kill -9`, needing a reboot each time. The GPU survives
+      (`live_kick_probe` still passes 3/3 afterwards). That probe now
+      refuses to run without `--i-know-it-hangs`, and `alias_probe` reports
+      `out.flags` so the cookie case is visible without touching the GPU.
+      Next things to try, before concluding the ringbuf cannot be built
+      this way: whether `stride` set to the full span rather than the
+      window size changes what `mmap()` accepts, and whether an alias whose
+      source carries `BASE_MEM_FIXABLE` lands in the FIXED_VA zone with a
+      real address instead of a cookie — noting `FIXED`/`FIXABLE` are
+      mutually exclusive per context, so that interacts with the backend's
+      existing commitment to `FIXED`.
+      If neither works, the fallback is to stop relying on the mapping to
+      wrap and bounds-check the ring in the command stream instead, which
+      is a change to shared PanVK code rather than to the backend.
+      `kbase_queue_submit()` keeps refusing submits carrying command
+      buffers until one of those lands.
       Still not done either: **GPU-side waits**. `vk_submit->waits` are
       satisfied on the CPU before anything is published, so
       `VK_SYNC_FEATURE_GPU_WAIT` stays unadvertised and semaphores still
