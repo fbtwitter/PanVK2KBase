@@ -251,9 +251,24 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `BASE_MEM_FIXED`; everything that currently treats the CPU pointer
       as the GPU VA has to stop (this backend, and the assumption is baked
       into `tests/` too — see `docs/kbase-notes.md`'s SAME_VA section).
-      Worth probing `BASE_MEM_FIXED` standalone first, the way
-      `tests/remap_probe` settled the mmap-offset question, before
-      rewriting the backend around it.
+      **Probed first, and it works** — `tests/fixed_va_probe`, 3/3
+      reproducible. `MEM_ALLOC_EX` + `BASE_MEM_FIXED` honours a requested
+      GPU VA exactly, two adjacent allocations land where asked, and the
+      allocation is CPU-mappable at an unrelated CPU address (which is the
+      point: GPU VA becomes ours to choose). Full writeup in
+      `docs/kbase-notes.md`. Three constraints it turned up, all of which
+      the implementation has to respect:
+      (1) there is a **FIXED_VA zone at `0x800200000000`** on this device
+      and requests outside it fail `ENOMEM` — including `0xfffff000`,
+      which is exactly what PanVK's `util_vma_heap` asked for, so PanVK's
+      VA range must be constrained to the zone; the zone's size is still
+      unmeasured;
+      (2) `BASE_MEM_FIXED` and `BASE_MEM_FIXABLE` are **mutually exclusive
+      per context** — one `FIXABLE` allocation makes every later `FIXED`
+      request fail `EINVAL`, so the backend must commit to one mode;
+      (3) `ENOMEM` means "address unavailable" (outside the zone, or
+      already allocated) while `EINVAL` means "wrong mode" — do not read
+      `EINVAL` as unsupported.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),

@@ -88,6 +88,12 @@ driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 remap_probe: ./src/tests/remap_probe/remap_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/remap_probe $<
 
+# Answers whether kbase can allocate at a caller-chosen GPU VA
+# (KBASE_IOCTL_MEM_ALLOC_EX + BASE_MEM_FIXED). Decides whether pan_kmod's
+# vm_bind contract is implementable at all - see docs/kbase-notes.md.
+fixed_va_probe: ./src/tests/fixed_va_probe/fixed_va_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/fixed_va_probe $<
+
 # Establishes that KBASE_IOCTL_VERSION_CHECK is once-per-fd.
 double_handshake_probe: ./src/tests/double_handshake_probe/double_handshake_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/double_handshake_probe $<

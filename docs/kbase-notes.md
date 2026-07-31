@@ -846,6 +846,61 @@ GPU-side waits; and error propagation through the error word. Those are
 implementation detail for the real `vk_sync`, not open questions about the
 mechanism.
 
+## Caller-chosen GPU VAs: BASE_MEM_FIXED works, in one zone, in one mode
+
+This decides whether `pan_kmod`'s `vm_bind` contract is implementable on
+kbase at all. `BASE_MEM_SAME_VA` lets the *kernel* pick an address, but
+PanVK picks its own and then dereferences it during `vkCreateDevice`'s
+mempool setup — so a backend that cannot place an allocation where the
+caller asked cannot work. Answered by `tests/fixed_va_probe`, 3/3
+reproducible on the Poco X8 Pro (r49p1), unprivileged, no root.
+
+**It works.** `KBASE_IOCTL_MEM_ALLOC_EX` (nr 59, UK 1.9+) takes an
+`in.fixed_address` that is honoured exactly when the allocation carries
+`BASE_MEM_FIXED`:
+
+```
+FIXED @ 0x800200000000   -> gpu_va=0x800200000000   *** HONOURED exactly ***
+FIXED @ 0x800200100000   -> gpu_va=0x800200100000   *** HONOURED exactly ***
+FIXED @ 0x800210000000   -> gpu_va=0x800210000000   *** HONOURED exactly ***
+FIXED @ 0xfffff000       -> FAILED (Out of memory)
+```
+
+and placement is genuinely under userspace control — two allocations
+requested at `zone + 0x30000000` and `+ 4K` both landed exactly there.
+
+Four things a real implementation has to respect:
+
+- **There is a FIXED_VA zone, and it is not where PanVK allocates.** On
+  this device it is at **`0x800200000000`**. Requests outside it fail
+  `ENOMEM` — including `0xfffff000`, which is literally what PanVK's
+  `util_vma_heap` asked `vm_bind` for. So PanVK's VA allocator has to be
+  constrained to this zone (`pan_clamp_to_usable_va_range`, and the
+  `util_vma_heap` setup in `panvk_vX_device.c`). The zone's *size* is not
+  established here; allocations up to `zone + 0x30001000` were accepted.
+- **`BASE_MEM_FIXED` and `BASE_MEM_FIXABLE` are mutually exclusive per
+  context.** Once a `FIXABLE` allocation exists, every later `FIXED`
+  request fails `EINVAL`, and vice versa. This cost real time: a first
+  version of the probe located the zone with a `FIXABLE` allocation and
+  then found every `FIXED` request rejected — the same address that had
+  returned `ENOMEM` in a run without a preceding `FIXABLE` returned
+  `EINVAL` with one. The mode, not the address, was the difference.
+- **errno tells you which problem you have.** `ENOMEM` = address
+  unavailable: outside the zone, or already allocated (re-requesting a
+  page the probe itself had taken reproduces it). `EINVAL` = wrong mode,
+  per the previous point. Do not read `EINVAL` as "unsupported".
+- **The CPU mapping is separate, and that is the point.** `mmap()`ing the
+  fd at the fixed `gpu_va` gives a working CPU view at an unrelated CPU
+  address (`cpu=0x71730bc000` for `gpu_va=0x800200000000`), verified by a
+  sentinel write/read. Under SAME_VA the two were the same number; here
+  the GPU address is ours to choose and the CPU address is wherever it
+  lands. Anything treating the CPU pointer as the GPU VA — this repo's
+  backend and most of `tests/` — has to stop.
+
+Consequence for the backend: `bo_alloc` should stop using SAME_VA, and
+`vm_bind` should do the real mapping at `op->va.start` with
+`MEM_ALLOC_EX` + `BASE_MEM_FIXED`. See ROADMAP.md Phase 2.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/
