@@ -172,10 +172,11 @@ main(int argc, char **argv)
              "\n"
              "   Check `adb logcat -d | grep MESA` for the reason. Expected\n"
              "   as of now:\n"
-             "     'kbase: vm_create not implemented yet'\n"
-             "   pan_kmod's explicit-VM model has no kbase equivalent - a\n"
-             "   kbase context owns exactly one address space and MEM_ALLOC\n"
-             "   maps into it directly. See ROADMAP.md Phase 2.\n",
+             "     'kbase: vm_bind cannot honour a caller-chosen VA'\n"
+             "   BOs are allocated BASE_MEM_SAME_VA, so the kernel picks the\n"
+             "   address; PanVK picks its own and then dereferences it.\n"
+             "   Honouring the request needs BASE_MEM_FIXED allocation - see\n"
+             "   ROADMAP.md Phase 2.\n",
              r);
       return 1;
    }

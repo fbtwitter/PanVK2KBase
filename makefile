@@ -83,6 +83,11 @@ driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
 driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_sync_probe $<
 
+# Settles what a SAME_VA kbase BO can be re-mmap-ed with (cookie vs resolved
+# address). Decides kbase_kmod_bo_get_mmap_offset()'s implementation.
+remap_probe: ./src/tests/remap_probe/remap_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/remap_probe $<
+
 # Establishes that KBASE_IOCTL_VERSION_CHECK is once-per-fd.
 double_handshake_probe: ./src/tests/double_handshake_probe/double_handshake_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/double_handshake_probe $<

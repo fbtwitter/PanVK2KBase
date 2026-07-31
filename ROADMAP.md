@@ -217,24 +217,43 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `get_device_sync_types()` in place of
       `vk_drm_syncobj_get_type(dev->fd)` — the mechanism question is
       closed, the Mesa-side implementation is not.
-- [ ] **`vm_create` is now the blocker for `vkCreateDevice`.** With sync
-      and the dup-fd probe fixed, logical device creation reaches
-      `pan_kmod_vm_create()` (`panvk_vX_device.c:419`) and fails there:
-      `-1 VK_ERROR_OUT_OF_HOST_MEMORY`, with
-      `E MESA: kbase: vm_create not implemented yet` in logcat. This is the
-      design decision noted below, not a bug — kbase has no explicit VM
-      object: a context owns exactly one address space, and `MEM_ALLOC`
-      maps into it directly rather than through a separate bind step.
-      Two ways to model it, and they are genuinely different:
-      (a) emulate a single implicit VM per device — `vm_create` returns a
-      bookkeeping object, `vm_bind` is a no-op for the SAME_VA allocations
-      this backend makes; simple, but leaves PanVK's VA management
-      believing it controls placement when it does not;
-      (b) push real VA management down into the backend and stop using
-      SAME_VA, so `vm_bind` maps at PanVK's chosen addresses; more faithful
-      to `pan_kmod`'s contract and probably required eventually, but a much
-      larger change that touches every allocation path already verified
-      on hardware.
+- [x] **VM ops implemented as a single implicit VM — and that model is now
+      measured to be insufficient.** `vm_create`/`vm_destroy`/`vm_bind` are
+      no longer stubs: `vm_create` returns a bookkeeping object with
+      handle 0 (what `pan_kmod.h` documents for KMDs with one VM per
+      context), `vm_bind` handles `MAP`/`UNMAP`/`SYNC_ONLY`, and
+      `bo_get_mmap_offset` works too.
+      `bo_get_mmap_offset` was settled empirically by
+      `tests/remap_probe`: re-using the `MEM_ALLOC` cookie fails `EINVAL`
+      (kbase consumes it on first mmap), but the **resolved SAME_VA
+      address works as an mmap offset** and aliases the same pages —
+      confirmed by writing a sentinel through the first mapping and
+      reading it back through the second. So the backend returns that.
+      **The finding that matters: option (a) does not work.** The theory
+      was that a no-op `vm_bind` is harmless until something submits GPU
+      work. It is not. PanVK dereferences addresses from its own
+      `util_vma_heap` during `vkCreateDevice`'s mempool setup, so
+      returning success turned a clean error into a **segfault inside
+      device creation**. The divergence is not marginal — logcat showed
+      `requested 0xfffff000, BO is at 0x7ca2928000`.
+      `vm_bind` therefore now **fails** on a caller-chosen VA it cannot
+      honour, so `vkCreateDevice` returns an error instead of crashing.
+      That is the honest state.
+- [ ] **Real VA management is required, not optional — this is the
+      blocker for `vkCreateDevice`.** Option (b) from the earlier writeup,
+      now the only viable path. kbase supports it: the vendored headers
+      define `BASE_MEM_FIXED` (`csf/mali_base_csf_kernel.h:34`) and
+      `BASE_MEM_FIXABLE` (`:58`), which is the mechanism for allocating at
+      a caller-chosen GPU VA instead of letting the kernel pick via
+      `BASE_MEM_SAME_VA`.
+      Shape of the work: `bo_alloc` stops using SAME_VA and defers
+      placement; `vm_bind` does the real mapping at `op->va.start` using
+      `BASE_MEM_FIXED`; everything that currently treats the CPU pointer
+      as the GPU VA has to stop (this backend, and the assumption is baked
+      into `tests/` too — see `docs/kbase-notes.md`'s SAME_VA section).
+      Worth probing `BASE_MEM_FIXED` standalone first, the way
+      `tests/remap_probe` settled the mmap-offset question, before
+      rewriting the backend around it.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),

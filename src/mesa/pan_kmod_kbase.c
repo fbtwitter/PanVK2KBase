@@ -35,6 +35,7 @@
  */
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -95,6 +96,23 @@ struct kbase_kmod_dev {
     */
    bool already_initialized;
 };
+
+/* The implicit-VM shim's state. See kbase_kmod_vm_create() for what this
+ * does and does not model.
+ */
+struct kbase_kmod_vm {
+   struct pan_kmod_vm base;
+
+   uint32_t map_count;
+   uint32_t mismatch_count;
+   bool warned;
+};
+
+static struct kbase_kmod_vm *
+to_kbase_kmod_vm(struct pan_kmod_vm *vm)
+{
+   return container_of(vm, struct kbase_kmod_vm, base);
+}
 
 static struct kbase_kmod_dev *
 to_kbase_kmod_dev(struct pan_kmod_dev *dev)
@@ -548,11 +566,35 @@ static off_t
 kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 {
    /* kbase BOs are mapped at allocation time (see bo_alloc), because the
-    * SAME_VA address only exists once mmap() has resolved the cookie. There
-    * is no separate "get an offset then mmap it later" step to expose.
+    * SAME_VA address only exists once mmap() has resolved the cookie.
+    * pan_kmod_bo_mmap() is a static inline that always calls this and then
+    * os_mmap()s the result, so it needs an offset that works a second time.
+    *
+    * kbase looks a region up by mmap offset >> PAGE_SHIFT, and after the
+    * cookie has been resolved the region is addressable by its resolved
+    * address - so handing that back produces a second, aliasing mapping of
+    * the same pages.
+    *
+    * Measured, not assumed (tests/remap_probe, Poco X8 Pro / r49p1):
+    *   - re-using the original MEM_ALLOC cookie fails EINVAL, so kbase
+    *     consumes it on first mmap
+    *   - the resolved SAME_VA address succeeds, and reads back a sentinel
+    *     written through the first mapping
+    *
+    * Caveat that matters: the alias lands at a different CPU address from
+    * the original mapping, and under SAME_VA it is the *original* that is
+    * also the GPU address. So the pointer pan_kmod_bo_mmap() returns is a
+    * valid CPU view but is not the GPU VA. Same caller-VA-vs-real-VA
+    * divergence documented in kbase_kmod_vm_create().
     */
-   mesa_loge("kbase: bo_get_mmap_offset is not meaningful for SAME_VA BOs");
-   return (off_t)-1;
+   struct kbase_kmod_bo *kbase_bo = to_kbase_kmod_bo(bo);
+
+   if (!kbase_bo->cpu) {
+      mesa_loge("kbase: bo_get_mmap_offset called on an unmapped BO");
+      return (off_t)-1;
+   }
+
+   return (off_t)(uintptr_t)kbase_bo->cpu;
 }
 
 static bool
@@ -605,27 +647,135 @@ kbase_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
 {
    /* kbase has no explicit VM object: a context owns exactly one address
     * space, and an allocation is mapped into it at MEM_ALLOC time rather
-    * than through a separate bind step. Faithfully modelling pan_kmod's
-    * explicit-VM semantics on top of that needs a design decision (emulate
-    * a single implicit VM, or push VA management down here), so it is left
-    * unimplemented rather than guessed at.
+    * than through a separate bind step.
+    *
+    * This is the "single implicit VM" model: the VM is a bookkeeping
+    * object, handle 0 (which pan_kmod.h documents as the value for KMDs
+    * with one VM per context), and vm_bind does not move anything because
+    * BASE_MEM_SAME_VA already placed every BO at a fixed address chosen by
+    * the kernel.
+    *
+    * READ THIS BEFORE TRUSTING GPU-VISIBLE ADDRESSES. It is not the
+    * faithful implementation. pan_kmod's contract is that the caller picks
+    * a VA and vm_bind maps the BO there; here the address is whatever the
+    * kernel already gave us, so a caller that computes GPU addresses from
+    * its own VA allocator will disagree with reality. PanVK does exactly
+    * that (panvk_vX_device.c builds util_vma_heaps and hands addresses to
+    * the mempools). vm_bind below therefore checks each mapping and warns
+    * when the requested VA is not the BO's real one, rather than failing
+    * silently - so the divergence shows up in logcat instead of as
+    * corrupted descriptors later.
+    *
+    * That is survivable right now only because nothing submits GPU work
+    * yet. Making the GPU dereference PanVK-assigned addresses correctly
+    * needs the other design: drop SAME_VA and do real VA management here.
+    * See ROADMAP.md Phase 2 for both options.
     */
-   mesa_loge("kbase: vm_create not implemented yet");
-   return NULL;
+   struct kbase_kmod_vm *vm = pan_kmod_alloc(dev->allocator, sizeof(*vm));
+
+   if (!vm) {
+      mesa_loge("kbase: failed to allocate VM object");
+      return NULL;
+   }
+
+   /* handle 0: one address space per context, nothing to allocate. */
+   pan_kmod_vm_init(&vm->base, dev, 0, flags);
+
+   vm->map_count = 0;
+   vm->mismatch_count = 0;
+   vm->warned = false;
+
+   return &vm->base;
 }
 
 static void
 kbase_kmod_vm_destroy(struct pan_kmod_vm *vm)
 {
-   mesa_loge("kbase: vm_destroy not implemented yet");
+   struct kbase_kmod_vm *kbase_vm = to_kbase_kmod_vm(vm);
+
+   if (kbase_vm->mismatch_count) {
+      mesa_logw("kbase: VM torn down after %u of %u mappings landed at a "
+                "different address than requested (SAME_VA shim)",
+                kbase_vm->mismatch_count, kbase_vm->map_count);
+   }
+
+   pan_kmod_vm_cleanup(vm);
+   pan_kmod_free(vm->dev->allocator, kbase_vm);
 }
 
 static int
 kbase_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
                    struct pan_kmod_vm_op *ops, uint32_t op_count)
 {
-   mesa_loge("kbase: vm_bind not implemented yet");
-   return -1;
+   struct kbase_kmod_vm *kbase_vm = to_kbase_kmod_vm(vm);
+
+   for (uint32_t i = 0; i < op_count; i++) {
+      struct pan_kmod_vm_op *op = &ops[i];
+
+      switch (op->type) {
+      case PAN_KMOD_VM_OP_TYPE_MAP: {
+         /* SAME_VA: the BO is already mapped, at this address. */
+         uint64_t real_va =
+            (uint64_t)(uintptr_t)to_kbase_kmod_bo(op->map.bo)->cpu +
+            (uint64_t)op->map.bo_offset;
+
+         kbase_vm->map_count++;
+
+         if (op->va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
+            /* Caller let us choose - report where it actually is. This is
+             * the one case the shim models correctly.
+             */
+            op->va.start = real_va;
+            break;
+         }
+
+         if (op->va.start != real_va) {
+            kbase_vm->mismatch_count++;
+
+            /* FAIL, do not pretend. An earlier version of this shim logged
+             * a warning and returned success, on the theory that a wrong
+             * VA is harmless until something submits GPU work. That is
+             * false: PanVK dereferences addresses from its own VA
+             * allocator during vkCreateDevice's mempool setup, so
+             * succeeding here turns a clean error into a segfault inside
+             * device creation. Measured - see ROADMAP.md Phase 2.
+             *
+             * Returning an error makes vkCreateDevice fail cleanly instead,
+             * which is the honest state until BASE_MEM_FIXED-based
+             * allocation lands and this can actually honour the request.
+             */
+            if (!kbase_vm->warned) {
+               kbase_vm->warned = true;
+               mesa_loge("kbase: vm_bind cannot honour a caller-chosen VA - "
+                         "requested 0x%" PRIx64 ", BO is at 0x%" PRIx64
+                         " (SAME_VA). Failing rather than returning a "
+                         "mapping the caller would dereference at the wrong "
+                         "address. See kbase_kmod_vm_create()'s comment.",
+                         op->va.start, real_va);
+            }
+            return -1;
+         }
+         break;
+      }
+
+      case PAN_KMOD_VM_OP_TYPE_UNMAP:
+         /* Nothing to do: the mapping goes away with the BO, when
+          * kbase_kmod_bo_free() munmaps it. See docs/kbase-notes.md on
+          * SAME_VA free semantics.
+          */
+         break;
+
+      case PAN_KMOD_VM_OP_TYPE_SYNC_ONLY:
+         /* No VM queue to order against - binds take effect immediately. */
+         break;
+
+      default:
+         mesa_loge("kbase: unknown vm_op type %d", op->type);
+         return -1;
+      }
+   }
+
+   return 0;
 }
 
 const struct pan_kmod_ops kbase_kmod_ops = {
