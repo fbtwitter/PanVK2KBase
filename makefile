@@ -32,5 +32,9 @@ queue_group: ./src/tests/queue_group/queue_group.c
 command: ./src/tests/command/command.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESAFLAGS) -o ./build/command $<
 
+# Needs no Mesa checkout - only the kbase uapi headers.
+same_va_probe: ./src/tests/same_va_probe/same_va_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/same_va_probe $<
+
 clean:
 	rm -f first_test
