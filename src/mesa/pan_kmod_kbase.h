@@ -195,3 +195,132 @@ int pan_kmod_kbase_queue_create(struct pan_kmod_dev *dev,
  */
 void pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
                                   struct pan_kmod_kbase_cs *cs);
+
+/* ------------------------------------------------------------------ *
+ * Ringing a bound queue, and observing what the GPU did with it.
+ *
+ * These are the panthor DRM_IOCTL_PANTHOR_GROUP_SUBMIT equivalent, split
+ * the way kbase splits it: publishing new work is a store to the queue's
+ * own user-IO input page plus an ioctl, and there is no fence object to
+ * wait on - completion is observed either in the command stream's own
+ * output (CS_EXTRACT) or in a BASE_MEM_CSF_EVENT slot the stream writes.
+ *
+ * Deliberately thin. Ring-buffer management - where in the ring to write,
+ * when it wraps, how much room is left - is the caller's, because that is
+ * where the command stream is built and where the choice of how many
+ * submissions may be in flight belongs. What lives here is only the part
+ * that needs the kbase UAPI headers.
+ *
+ * Proven on hardware by tests/live_kick_probe (kick, CS_EXTRACT) and
+ * tests/event_slot_probe (event slot, notification), both of which do
+ * exactly this sequence against a queue bound the same way.
+ * ------------------------------------------------------------------ */
+
+/**
+ * pan_kmod_kbase_queue_kick() - Publish work on a bound queue and ring it.
+ * @dev: kbase device.
+ * @cs: A queue from pan_kmod_kbase_queue_create().
+ * @insert: New value for CS_INSERT.
+ *
+ * @insert is a *byte count*, not an address and not a ring offset: it is
+ * the total number of command-stream bytes ever written to this queue, and
+ * both hardware and firmware take the ring position as @insert modulo the
+ * ring size. It only ever increases. The caller must have written the
+ * bytes into @cs->ringbuf_cpu before calling; this publishes them with a
+ * barrier, matching the dmb(osh) the kernel does before ringing doorbells.
+ *
+ * Returning 0 means the kernel accepted the kick, which is *not* the same
+ * as the GPU having run anything - the KICK handler only flags the queue
+ * and wakes the scheduler kthread, which rings the real hardware doorbell
+ * asynchronously afterward. An earlier version of this repo read a
+ * successful KICK as proof of execution and spent a long time chasing a
+ * phantom (see docs/kbase-notes.md). Use pan_kmod_kbase_queue_extract() or
+ * an event slot to find out what actually happened.
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
+                              const struct pan_kmod_kbase_cs *cs,
+                              uint64_t insert);
+
+/**
+ * pan_kmod_kbase_queue_extract() - How much of the stream the GPU consumed.
+ * @cs: A queue from pan_kmod_kbase_queue_create().
+ *
+ * The counterpart to the @insert passed to pan_kmod_kbase_queue_kick(), in
+ * the same units and on the same monotonic scale: once it reaches a given
+ * @insert, everything published up to that point has been read off the
+ * ring. Written by firmware into the queue's user-IO output page, so it
+ * costs a load, no ioctl.
+ *
+ * "Consumed" means read out of the ring, not finished: a stream whose last
+ * instruction is asynchronous is fully extracted before its effects have
+ * landed. For real completion, have the stream write an event slot.
+ *
+ * Return: the current CS_EXTRACT.
+ */
+uint64_t pan_kmod_kbase_queue_extract(const struct pan_kmod_kbase_cs *cs);
+
+/**
+ * pan_kmod_kbase_queue_active() - Whether firmware has this stream running.
+ * @cs: A queue from pan_kmod_kbase_queue_create().
+ *
+ * Distinguishes "the group never got scheduled onto a CSG slot" from "it
+ * ran and is waiting on something", which is the difference between a
+ * setup bug and a stream bug when CS_EXTRACT is not advancing.
+ *
+ * Return: true if CS_ACTIVE is set.
+ */
+bool pan_kmod_kbase_queue_active(const struct pan_kmod_kbase_cs *cs);
+
+/**
+ * enum pan_kmod_kbase_event_type - What a kbase notification reported.
+ * @PAN_KMOD_KBASE_EVENT_KERNEL: Ordinary kernel event; something the
+ *                               context is waiting on may have moved.
+ * @PAN_KMOD_KBASE_EVENT_GROUP_ERROR: A queue group hit a fatal error or
+ *                                    fault. The group is dead.
+ * @PAN_KMOD_KBASE_EVENT_OTHER: A type this backend does not decode (the
+ *                              CPU-queue-dump notification, which only
+ *                              exists in MTK debug builds).
+ */
+enum pan_kmod_kbase_event_type {
+   PAN_KMOD_KBASE_EVENT_KERNEL,
+   PAN_KMOD_KBASE_EVENT_GROUP_ERROR,
+   PAN_KMOD_KBASE_EVENT_OTHER,
+};
+
+/**
+ * struct pan_kmod_kbase_event - A decoded kbase notification.
+ * @type: Which kind of notification this was.
+ * @group_handle: Group that failed. GROUP_ERROR only.
+ * @error_type: kbase's base_gpu_queue_group_error_type. GROUP_ERROR only.
+ *
+ * Decoded rather than handed back raw so that callers do not need the
+ * kbase UAPI headers, which only this translation unit is built with.
+ */
+struct pan_kmod_kbase_event {
+   enum pan_kmod_kbase_event_type type;
+   uint8_t group_handle;
+   uint8_t error_type;
+};
+
+/**
+ * pan_kmod_kbase_read_event() - Block for a notification from the device.
+ * @dev: kbase device.
+ * @timeout_ms: Milliseconds to wait; 0 polls, negative blocks forever.
+ * @out: Filled in when a notification is read. May be NULL to just drain.
+ *
+ * kbase reports asynchronously through the device fd rather than through
+ * fences: poll() for readability, then read() one struct off it. This is
+ * what lets a waiter block instead of spinning on an event slot, and it is
+ * the only way a GPU-side fault is reported at all - a group that dies
+ * stops advancing CS_EXTRACT and says nothing else.
+ *
+ * ONE OWNER ONLY. read() consumes a notification, so two threads polling
+ * the same fd will steal each other's wakeups. Anything built on this
+ * needs a single reader that dispatches, not a read() per waiter.
+ *
+ * Return: 1 if a notification was read, 0 on timeout, -1 on error.
+ */
+int pan_kmod_kbase_read_event(struct pan_kmod_dev *dev, int timeout_ms,
+                              struct pan_kmod_kbase_event *out);

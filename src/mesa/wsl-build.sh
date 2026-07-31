@@ -16,6 +16,9 @@ cd "$MESA"
 echo "=== 1. sync backend source ==="
 cp "$REPO/src/mesa/pan_kmod_kbase.c" src/panfrost/lib/kmod/
 cp "$REPO/src/mesa/pan_kmod_kbase.h" src/panfrost/lib/kmod/
+# Not part of the vendored uapi header set (firmware-interface offsets, not
+# ioctl uapi), so it travels next to the backend rather than via -I.
+cp "$REPO/src/utils/csf_user_regs.h" src/panfrost/lib/kmod/
 
 echo "=== 2. apply dispatch change to pan_kmod.c ==="
 if grep -q kbase_kmod_ops src/panfrost/lib/kmod/pan_kmod.c; then

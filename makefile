@@ -180,10 +180,11 @@ MESA_KMOD_DIR := $(MESA_DIR)/src/panfrost/lib/kmod
 mesa-backend-sync:
 	@test -d "$(MESA_KMOD_DIR)" || { echo "error: $(MESA_KMOD_DIR) not found - see docs/mesa-cs-builder.md for the Mesa clone command"; exit 1; }
 	cp src/mesa/pan_kmod_kbase.c src/mesa/pan_kmod_kbase.h $(MESA_KMOD_DIR)/
+	cp src/utils/csf_user_regs.h $(MESA_KMOD_DIR)/
 	cp src/mesa/panvk_kbase_sync.c src/mesa/panvk_kbase_sync.h $(MESA_DIR)/src/panfrost/vulkan/
 	cp src/mesa/panvk_vX_kbase_queue.c $(MESA_DIR)/src/panfrost/vulkan/csf/
 	@echo ""
-	@echo "Copied pan_kmod_kbase.{c,h} into $(MESA_KMOD_DIR)/"
+	@echo "Copied pan_kmod_kbase.{c,h} and csf_user_regs.h into $(MESA_KMOD_DIR)/"
 	@echo "Copied panvk_kbase_sync.{c,h} into $(MESA_DIR)/src/panfrost/vulkan/"
 	@echo "Still to apply (kept as readable patches since upstream moves):"
 	@echo "  - src/mesa/pan_kmod.c.kbase.patch      -> $(MESA_KMOD_DIR)/pan_kmod.c"
@@ -222,10 +223,16 @@ mesa-libdrm:
 # symbols pan_kmod.c needs are exactly the ones the backend defines. This
 # is a compile + symbol-resolution check, NOT a full Mesa build - see
 # src/mesa/README.md for why a full build needs LLVM.
+#
+# The -DHAVE_* defines stand in for the config header meson generates and
+# this hand-rolled compile does not have. HAVE_ENDIAN_H is what lets
+# util/u_endian.h consult glibc's <endian.h>; without it that header hits
+# its own #error before the compiler ever reaches backend code.
 mesa-backend-check: mesa-backend-sync
 	@mkdir -p build/mesa-backend
 	@echo "using: $(DRM_KIND)"
 	$(CC) -c -O1 -Wall $(MALIFLAGS) -DHAVE_PTHREAD -DHAVE_STRUCT_TIMESPEC \
+	  -DHAVE_ENDIAN_H \
 	  -include src/utils/kconfig_shim.h $(MESA_BACKEND_INC) \
 	  -o build/mesa-backend/pan_kmod_kbase.o \
 	  $(MESA_KMOD_DIR)/pan_kmod_kbase.c

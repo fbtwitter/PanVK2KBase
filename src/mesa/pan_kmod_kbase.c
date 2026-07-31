@@ -36,6 +36,7 @@
 
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -65,7 +66,16 @@
 #include "mali_base_common_kernel.h" /* BASE_MEM_PROT_* */
 #include "mali_base_kernel.h"        /* base_mem_alloc_flags */
 #include "mali_kbase_ioctl.h"
+#include "csf/mali_base_csf_kernel.h" /* base_csf_notification */
 #include "csf/mali_kbase_csf_ioctl.h"
+
+/* CS_INSERT / CS_EXTRACT / CS_ACTIVE offsets and, more importantly, which
+ * of the three mmap'd user-IO pages each lives in. Copied into the Mesa
+ * tree next to this file by `make mesa-backend-sync`, since it is not part
+ * of the vendored uapi header set - these are firmware-interface offsets,
+ * not ioctl uapi. src/utils/csf_user_regs.h in this repo is the original.
+ */
+#include "csf_user_regs.h"
 
 /* Forward declaration; the definition is at the bottom of this file.
  * Declared in pan_kmod_kbase.h.
@@ -945,6 +955,124 @@ pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
    simple_mtx_unlock(&kbase_dev->va.lock);
 
    memset(cs, 0, sizeof(*cs));
+}
+
+/* The user-IO pages are [doorbell][input][output], measured on-device by
+ * tests/user_io_probe rather than read off the uapi comment, which describes
+ * the contents and not the order. Getting this wrong does not fail loudly:
+ * CS_INSERT lands in the doorbell page, CS_EXTRACT is read out of a page
+ * firmware never writes, and everything looks like the GPU is ignoring you.
+ * That cost this repo several commits - see csf_user_regs.h.
+ */
+static volatile uint8_t *
+kbase_cs_page(const struct pan_kmod_kbase_cs *cs, unsigned page)
+{
+   return (volatile uint8_t *)cs->user_io + page * 4096;
+}
+
+int
+pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
+                          const struct pan_kmod_kbase_cs *cs, uint64_t insert)
+{
+   if (!cs->user_io) {
+      mesa_loge("kbase: kick on a queue that is not bound");
+      return -1;
+   }
+
+   /* One 64-bit store, which is a single STR on aarch64 and so satisfies
+    * the kernel's requirement that CS_INSERT be accessed atomically.
+    */
+   volatile uint8_t *input = kbase_cs_page(cs, CSF_USER_INPUT_PAGE);
+   *(volatile uint64_t *)(input + CSF_USER_CS_INSERT_LO) = insert;
+
+   /* Order the ring-buffer writes and CS_INSERT ahead of the kick. The
+    * kernel does the equivalent (dmb(osh)) before ringing a doorbell.
+    */
+   __sync_synchronize();
+
+   struct kbase_ioctl_cs_queue_kick kick = {
+      .buffer_gpu_addr = cs->ringbuf_gpu_va,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick) < 0) {
+      mesa_loge("kbase: CS_QUEUE_KICK failed: %s", strerror(errno));
+      return -1;
+   }
+
+   return 0;
+}
+
+uint64_t
+pan_kmod_kbase_queue_extract(const struct pan_kmod_kbase_cs *cs)
+{
+   if (!cs->user_io)
+      return 0;
+
+   volatile uint8_t *output = kbase_cs_page(cs, CSF_USER_OUTPUT_PAGE);
+   return *(volatile uint64_t *)(output + CSF_USER_CS_EXTRACT_LO);
+}
+
+bool
+pan_kmod_kbase_queue_active(const struct pan_kmod_kbase_cs *cs)
+{
+   if (!cs->user_io)
+      return false;
+
+   volatile uint8_t *output = kbase_cs_page(cs, CSF_USER_OUTPUT_PAGE);
+   return *(volatile uint32_t *)(output + CSF_USER_CS_ACTIVE) != 0;
+}
+
+int
+pan_kmod_kbase_read_event(struct pan_kmod_dev *dev, int timeout_ms,
+                          struct pan_kmod_kbase_event *out)
+{
+   struct pollfd pfd = {
+      .fd = dev->fd,
+      .events = POLLIN,
+   };
+
+   int pret = poll(&pfd, 1, timeout_ms);
+   if (pret == 0)
+      return 0;
+   if (pret < 0) {
+      if (errno == EINTR)
+         return 0;
+      mesa_loge("kbase: poll on the device fd failed: %s", strerror(errno));
+      return -1;
+   }
+
+   /* A short read would leave the stream misaligned for every later
+    * reader, so treat anything but a whole notification as an error
+    * rather than trying to piece it together.
+    */
+   struct base_csf_notification notif = { 0 };
+   ssize_t r = read(dev->fd, &notif, sizeof(notif));
+   if (r != (ssize_t)sizeof(notif)) {
+      mesa_loge("kbase: notification read returned %zd of %zu bytes: %s", r,
+                sizeof(notif), strerror(errno));
+      return -1;
+   }
+
+   if (!out)
+      return 1;
+
+   memset(out, 0, sizeof(*out));
+
+   switch (notif.type) {
+   case BASE_CSF_NOTIFICATION_EVENT:
+      out->type = PAN_KMOD_KBASE_EVENT_KERNEL;
+      break;
+   case BASE_CSF_NOTIFICATION_GPU_QUEUE_GROUP_ERROR:
+      out->type = PAN_KMOD_KBASE_EVENT_GROUP_ERROR;
+      out->group_handle = notif.payload.csg_error.handle;
+      out->error_type = notif.payload.csg_error.error.error_type;
+      break;
+   default:
+      out->type = PAN_KMOD_KBASE_EVENT_OTHER;
+      break;
+   }
+
+   return 1;
 }
 
 const struct drm_panthor_csif_info *

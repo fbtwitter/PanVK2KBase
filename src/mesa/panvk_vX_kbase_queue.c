@@ -35,9 +35,10 @@
  *   returns an error. Mapping VkQueueSubmit onto kbase means writing the
  *   command stream into the bound ring buffer, updating CS_INSERT in the
  *   user-IO input page, ringing via CS_QUEUE_KICK, and waiting on a
- *   BASE_MEM_CSF_EVENT slot - every one of those steps is proven
- *   individually by tests/live_kick_probe and tests/event_slot_probe, but
- *   none of it is wired up here yet.
+ *   BASE_MEM_CSF_EVENT slot. Each of those is now a backend call
+ *   (pan_kmod_kbase_queue_kick/_extract/_active, _read_event), proven on
+ *   hardware by tests/live_kick_probe and tests/event_slot_probe - but
+ *   nothing here calls them yet.
  *
  *   Also not done: the per-subqueue init command stream panthor runs at
  *   creation time (init_subqueue() in the panthor file) to set up subqueue
@@ -190,13 +191,21 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
 {
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
-   /* Deliberately an error rather than a silent success. Every primitive
-    * this needs is proven on hardware - write the command stream into
-    * subqueues[i].ringbuf_cpu, publish CS_INSERT in the user-IO input page
-    * (page 1, see src/utils/csf_user_regs.h), CS_QUEUE_KICK, then wait on
-    * a BASE_MEM_CSF_EVENT slot signalled by a SYNC_SET64 in the stream -
-    * but none of it is assembled here yet, and pretending a submit
-    * succeeded would corrupt every fence and semaphore above it.
+   /* Deliberately an error rather than a silent success. Pretending a
+    * submit succeeded would corrupt every fence and semaphore above it.
+    *
+    * What remains is assembly, not discovery. The backend now exposes each
+    * step: build the command stream into subqueues[i].ringbuf_cpu, publish
+    * it with pan_kmod_kbase_queue_kick() (which handles CS_INSERT and the
+    * KICK ioctl), and observe completion either with
+    * pan_kmod_kbase_queue_extract() or - for real completion rather than
+    * "read off the ring" - a BASE_MEM_CSF_EVENT slot the stream signals
+    * with SYNC_SET64, which is what panvk_kbase_sync already waits on.
+    * pan_kmod_kbase_read_event() is how a GPU-side fault gets reported.
+    *
+    * Still owned by this file, because it is where the command stream is
+    * built: where in the ring to write, when it wraps, and how many
+    * submissions may be in flight at once.
     */
    return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "kbase: VkQueueSubmit is not implemented yet "

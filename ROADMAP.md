@@ -323,15 +323,46 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       signal a slot from the GPU. That is the intended behaviour —
       advertising it would hand out semaphores that could never complete.
       `vkDeviceWaitIdle` returns `-8` from the submit stub, as designed.
+- [x] **The kick/observe primitives are in the backend.** They existed only
+      inside `tests/live_kick_probe` and `tests/event_slot_probe`, so
+      nothing the driver links could ring a queue at all.
+      `pan_kmod_kbase.{c,h}` now has `pan_kmod_kbase_queue_kick()`
+      (publishes `CS_INSERT`, barriers, `CS_QUEUE_KICK`),
+      `_queue_extract()` / `_queue_active()` (loads out of the user-IO
+      output page, no ioctl), and `pan_kmod_kbase_read_event()`
+      (`poll()` + `read()` of a `base_csf_notification`, decoded so callers
+      need no kbase headers — this is the only way a GPU-side fault is
+      reported at all, since a dead group just stops advancing
+      `CS_EXTRACT`).
+      Deliberately thin: ring management — where to write, when it wraps,
+      how many submissions may be in flight — stays with the caller, which
+      is where the command stream is built. `insert` is a monotonic byte
+      *count*, not a ring offset; hardware takes it modulo the ring size.
+      `csf_user_regs.h` is now copied into the Mesa tree next to the
+      backend by `mesa-backend-sync` rather than duplicated, so the
+      measured `[doorbell][input][output]` page order has one definition.
+      Verified: compiles `-Wall`-clean against both vendored header sets
+      (r44p0 and r49p1), links into `libpankmod_lib.a` through Mesa's real
+      meson build, and cross-builds into the aarch64 Android driver. The
+      four symbols are absent from the linked `.so` because nothing calls
+      them yet and visibility is hidden — expected until the item below.
+      **`ONE OWNER ONLY` on `read_event()`**: `read()` consumes a
+      notification, so two threads polling the fd steal each other's
+      wakeups. Anything built on it needs a single reader that dispatches.
+      Also fixed on the way: `make mesa-backend-check` had been failing in
+      `util/u_endian.h` before reaching backend code at all — it stands in
+      for meson's config header, and was missing `-DHAVE_ENDIAN_H`.
 - [ ] **Submission is what is left.** `panvk_per_arch(kbase_queue_submit)`
       returns `VK_ERROR_FEATURE_NOT_PRESENT` rather than pretending.
-      Mapping `VkQueueSubmit` onto kbase means: write the command stream
-      into the bound ring buffer, publish `CS_INSERT` in the user-IO input
-      page (page 1 — `utils/csf_user_regs.h`), `CS_QUEUE_KICK`, and wait on
-      a `BASE_MEM_CSF_EVENT` slot signalled by a `SYNC_SET64` in the
-      stream. Every one of those steps is individually proven on hardware
-      by `tests/live_kick_probe` and `tests/event_slot_probe`; none is
-      assembled in the driver yet.
+      With the primitives above in place this is assembly, not discovery:
+      build the command stream into the bound ring buffer, `_queue_kick()`,
+      and wait on a `BASE_MEM_CSF_EVENT` slot signalled by a `SYNC_SET64`
+      in the stream — which is what `panvk_kbase_sync` already polls.
+      Smallest useful first target is an *empty* `vkQueueSubmit`: a stream
+      that does nothing but signal the submit's signal-sync. No command
+      buffers, no tiler, no subqueue context — but it is the first time the
+      GPU rather than the CPU signals a `vk_sync`, and it keeps
+      `vkCreateDevice` working while the machinery is debugged.
       Also still missing: the per-subqueue init command stream panthor runs
       at queue-creation time (`init_subqueue()`), which sets up subqueue
       context registers. It needs submission, so it waits on the above. A

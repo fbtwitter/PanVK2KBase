@@ -32,6 +32,7 @@ echo "=== sync backend + patches (same as the native build) ==="
 bash "$REPO/src/mesa/wsl-build.sh" --sync-only 2>/dev/null || {
   cp "$REPO/src/mesa/pan_kmod_kbase.c" src/panfrost/lib/kmod/
   cp "$REPO/src/mesa/pan_kmod_kbase.h" src/panfrost/lib/kmod/
+  cp "$REPO/src/utils/csf_user_regs.h" src/panfrost/lib/kmod/
 }
 
 echo "=== configure Android cross build ==="
