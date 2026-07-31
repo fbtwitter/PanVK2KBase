@@ -33,6 +33,8 @@ endif
 # build against any KBASE_VERSION and just skip what that header
 # doesn't declare - see tests/fence_probe/fence_probe.c for the pattern
 # to follow when adding new version-sensitive code.
+# (The -include itself is on the INCLUDES line below.)
+
 # An in-tree Mesa checkout (third_party/mesa, gitignored) plus the C11
 # threads.h stubs under stubs/. Only the targets that pull in Mesa headers
 # directly - the ones built with $(MESAFLAGS) - need these; the standalone
@@ -154,6 +156,14 @@ pipeline_probe_shader:
 # VERTEX_TILER/FRAGMENT subqueues can be initialised.
 alias_probe: ./src/tests/alias_probe/alias_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/alias_probe $<
+
+# Which number is an allocation's real GPU address - out.gpu_va, or the CPU
+# pointer? Answers it per allocation kind (plain / GPU_EX / FIXABLE) using
+# MEM_ALIAS as an oracle, and exits non-zero if the rule kbase_bo_create()
+# encodes does not hold. Re-run this when moving to a new device or a new
+# KBASE_VERSION. Upstreamed as Joshua-Micheletti/PanVK2KBase#2.
+same_va_probe: ./src/tests/same_va_probe/same_va_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/same_va_probe $<
 
 # The other half of the aliasing question: alias_probe shows MEM_ALIAS
 # composes the region, this shows the two windows are the same pages. Needs

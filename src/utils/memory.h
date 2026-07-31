@@ -118,13 +118,47 @@ struct kbase_bo *kbase_bo_create_flags(int fd, size_t size,
   }
 
   /*
-      Only under SAME_VA is the CPU pointer the GPU address. A non-SAME_VA
-      allocation - BASE_MEM_FIXABLE or BASE_MEM_FIXED, as extra_flags - is
-      placed in the FIXED_VA zone (0x800200000000 on the tested device) and
-      its CPU mapping lands somewhere unrelated; there out.gpu_va is already
-      the real address and must not be overwritten. See "Caller-chosen GPU
-      VAs" in docs/kbase-notes.md, and tests/alias_probe's FIXABLE section,
-      which passes bo->gpu_va to MEM_ALIAS and gets ENOMEM if this is wrong.
+      Why this is an if/else and not just an assignment.
+
+      kbase can report an allocation's GPU address in two different ways,
+      and you can only tell which one you got by looking at out.flags.
+
+      Case 1 - BASE_MEM_SAME_VA (extra_flags == 0, the common path).
+      MEM_ALLOC does not return an address at all. It returns a small
+      placeholder number, a "cookie", and the memory has no GPU mapping
+      yet. Calling mmap() with that cookie as the offset is what actually
+      creates the mapping, and the CPU address mmap() gives back is then
+      *also* the GPU address - the same number works for both sides. So
+      here the real address is bo->cpu.
+
+      Case 2 - no SAME_VA (BASE_MEM_PROT_GPU_EX, or BASE_MEM_FIXED /
+      BASE_MEM_FIXABLE passed as extra_flags). kbase maps the memory
+      immediately and out.gpu_va is already the real GPU address. The CPU
+      mapping ends up somewhere completely unrelated, so using bo->cpu
+      here would throw away a valid address for a meaningless one.
+
+      Measured on the Poco X8 Pro (Mali-G720, UK 1.30) by
+      tests/same_va_probe, three allocations from this same function:
+
+        plain     SAME_VA=YES   out.gpu_va=0x41000         cpu=0x799ae21000
+        GPU_EX    SAME_VA=NO    out.gpu_va=0x800000001000  cpu=0x799ae1d000
+        FIXABLE   SAME_VA=NO    out.gpu_va=0x800200000000  cpu=0x799ae19000
+
+      Note the two non-SAME_VA rows land in two different regions - the
+      EXEC_VA zone and the FIXED_VA zone - so this is about whether SAME_VA
+      was granted, not about any one flag.
+
+      Note also the flags are read from out.flags, not the in.flags we
+      sent: kbase adds SAME_VA on our behalf, so we ask for 0xf and get
+      0x200f back. The request cannot tell you which case you are in -
+      only the reply can.
+
+      Getting this wrong is not a clean failure. tests/alias_probe passes
+      bo->gpu_va to MEM_ALIAS for its FIXABLE source and gets ENOMEM, which
+      reads like a resource limit rather than a bad address. Handing a
+      cookie to a command stream is worse - it faults the GPU and wedges
+      the kbase context past kill -9. See "Caller-chosen GPU VAs" in
+      docs/kbase-notes.md.
   */
   if (alloc.out.flags & BASE_MEM_SAME_VA)
     bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
