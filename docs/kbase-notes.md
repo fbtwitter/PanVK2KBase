@@ -1102,12 +1102,64 @@ Not yet attempted. It does not unblock rendering — that still needs the
 ringbuf, see the MEM_ALIAS section — it unblocks *compute*, which is
 currently blocked on render subqueues that are only along for the ride.
 
+### Confirmed by disassembly, not inference
+
+`PANVK_KBASE_DUMP=1` (added in `panvk_vX_kbase_queue.c`) prints every stream
+before it is kicked, and every stream this driver rejects. The rejected
+VERTEX_TILER stream from the barrier-only command buffer above, 176 bytes:
+
+```
+ [ 0] 0x0242000000000000  MOVE32          flush id = 0
+ [ 1] 0x2400420000000200  FLUSH_CACHE2    the barrier's own flush
+ [ 2] 0x0300000000010000  WAIT
+ [ 3] 0x0300000000030000  WAIT
+ [ 4] 0x14427a0000030000  LOAD_MULTIPLE   <- from reg 0x7a = 122
+ [ 5] 0x0300000000010000  WAIT
+ [ 6] 0x1142420000000000  ADD_IMMEDIATE64
+ [ 7] 0x0144000000000001  MOVE48
+ [ 8] 0x3300424400000005  SYNC_ADD64      barrier signals the VT syncobj
+ [ 9] 0x1174740000000001  ADD_IMMEDIATE64 <- reg 0x74 = 116, progress seqno
+ [10] 0x1176760000000001  ADD_IMMEDIATE64 <- reg 0x76 = 118, progress seqno
+ [11] 0x0300000000ff0000  WAIT            finish_cs's wait on all slots
+ [12] 0x14427a0000030000  LOAD_MULTIPLE   <- from reg 0x7a = 122 again
+ [13] 0x0300000000010000  WAIT
+ [14] 0x1444420000010008  LOAD_MULTIPLE
+ [15] 0x0300000000010000  WAIT
+ [16] 0x1600440020000002  BRANCH
+ [17] 0x15447a000001000c  STORE_MULTIPLE  -> reg 122 + 0xc, last_error
+ [18] 0x0300000000010000  WAIT
+ [19] 0x0242000000000000  MOVE32
+ [20] 0x2400420000000011  FLUSH_CACHE2    end-of-cmdbuf clean
+ [21] 0x0300000000010000  WAIT
+```
+
+Register 122 is `PANVK_CS_REG_SUBQUEUE_CTX_START`. `[4]`, `[12]` and `[17]`
+go through it, and on VERTEX_TILER it is still 0 - so this stream would read
+and write around address 0. That is the fault, seen rather than reasoned
+about.
+
+**And it is the whole extent of the problem.** Everything reached through
+register 122 here is `syncobjs` and `last_error`, both plain fields of the
+subqueue context. Registers 116 and 118 are progress seqnos, which live in
+the register file and need no memory at all. There is no `RUN_IDVS`, no
+tiler heap access, and nothing touching the descriptor ringbuf anywhere in
+the stream. So loading the context register is sufficient to make this
+stream safe - the ringbuf question does not gate it.
+
 ### Side finding: `PANVK_DEBUG=trace` cannot be used here
 
 `vkCreateDevice` fails with `-2` (`VK_ERROR_OUT_OF_DEVICE_MEMORY`) under
 `PANVK_DEBUG=trace`, with nothing in logcat. Trace mode switches the
 subqueue allocations to the non-cached pool and adds a per-subqueue
-tracebuf; one of those is not serviceable by this backend. Worth fixing on
-its own merits, because trace is what `pandecode_cs_binary()` hangs off —
-it is the only way to disassemble a stream before running it, which is
-exactly the pre-flight check this repo has twice wished it had.
+tracebuf. The tracebuf is the blocker, and it is not a small fix:
+`init_subqueue_tracing()` reserves a caller-chosen VA with `panvk_as_alloc()`
+and binds the BO into it with `pan_kmod_vm_bind()`, leaving a deliberate
+guard page unmapped. kbase has no VM object to bind into — a region's GPU VA
+is fixed when it is allocated — so this is the same class of gap as the
+`MEM_ALIAS` one, not a missing flag.
+
+Superseded in practice by `PANVK_KBASE_DUMP=1`, which prints instruction
+words and opcode names straight from the submit path and depends on none of
+that machinery. Less capable than `pandecode` — operands stay hex — but it
+answers "is this the stream I meant to build", which is the question that
+matters before a kick.

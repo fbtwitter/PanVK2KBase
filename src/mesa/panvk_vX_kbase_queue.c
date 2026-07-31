@@ -72,6 +72,7 @@
 #include "genxml/gen_macros.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* For struct drm_panthor_csif_info - panthor_kmod.h only forward-declares
@@ -495,6 +496,117 @@ panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *gpu_queue,
                        pan_kmod_kbase_queue_active(cs));
 }
 
+/* Disassemble-ish dump of a command stream, gated on PANVK_KBASE_DUMP=1.
+ *
+ * This exists because the usual way to look at a stream before running it -
+ * PANVK_DEBUG=trace, which is what pandecode_cs_binary() hangs off - cannot
+ * be used on kbase: init_subqueue_tracing() allocates a tracebuf at a
+ * caller-chosen VA through panvk_as_alloc() and pan_kmod_vm_bind(), and
+ * there is no VM object here to bind into. vkCreateDevice fails with
+ * OUT_OF_DEVICE_MEMORY under trace as a result.
+ *
+ * So this prints the raw instruction words plus the opcode name, which is
+ * the top byte of each 8-byte instruction. Not a real disassembler - the
+ * operands are left as hex - but enough to answer "is this the stream I
+ * meant to build", which is the question that matters before a kick. Two
+ * device hangs in this repo came from kicking a stream verified only by
+ * reasoning about the code that built it.
+ */
+static const char *
+kbase_cs_opcode_name(uint8_t opcode)
+{
+   /* genxml's "CS Opcode" enum, v12. Kept complete rather than trimmed to
+    * what this file emits, because the streams worth reading here are the
+    * ones built elsewhere - a CALLed command buffer, or a stream this
+    * driver rejected and wants to explain.
+    */
+   switch (opcode) {
+   case 0:  return "NOP";
+   case 1:  return "MOVE48";
+   case 2:  return "MOVE32";
+   case 3:  return "WAIT";
+   case 4:  return "RUN_COMPUTE";
+   case 7:  return "RUN_FRAGMENT";
+   case 8:  return "RUN_FULLSCREEN";
+   case 9:  return "FINISH_TILING";
+   case 11: return "FINISH_FRAGMENT";
+   case 12: return "RUN_IDVS2";
+   case 16: return "ADD_IMMEDIATE32";
+   case 17: return "ADD_IMMEDIATE64";
+   case 18: return "COMPARE_SELECT32";
+   case 19: return "LOGIC_OP32";
+   case 20: return "LOAD_MULTIPLE";
+   case 21: return "STORE_MULTIPLE";
+   case 22: return "BRANCH";
+   case 23: return "SET_SB_ENTRY";
+   case 24: return "PROGRESS_WAIT";
+   case 25: return "SET_EXCEPTION_HANDLER";
+   case 26: return "NEXT_SB_ENTRY";
+   case 27: return "SET_STATE";
+   case 28: return "SET_STATE_IMM32";
+   case 30: return "SHARED_SB_INC";
+   case 31: return "SHARED_SB_DEC";
+   case 32: return "CALL";
+   case 33: return "JUMP";
+   case 34: return "REQ_RESOURCE";
+   case 36: return "FLUSH_CACHE2";
+   case 37: return "SYNC_ADD32";
+   case 38: return "SYNC_SET32";
+   case 39: return "SYNC_WAIT32";
+   case 40: return "STORE_STATE";
+   case 41: return "PROT_REGION";
+   case 42: return "PROGRESS_STORE";
+   case 43: return "PROGRESS_LOAD";
+   case 44: return "RUN_COMPUTE_INDIRECT";
+   case 47: return "ERROR_BARRIER";
+   case 48: return "HEAP_SET";
+   case 49: return "HEAP_OPERATION";
+   case 50: return "TRACE_POINT";
+   case 51: return "SYNC_ADD64";
+   case 52: return "SYNC_SET64";
+   case 53: return "SYNC_WAIT64";
+   default: return "?";
+   }
+}
+
+static bool
+kbase_dump_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0) {
+      const char *v = getenv("PANVK_KBASE_DUMP");
+      enabled = v && *v && *v != '0';
+   }
+
+   return enabled;
+}
+
+static void
+kbase_dump_stream(const char *what, uint64_t gpu_va, const void *cpu,
+                  uint32_t size)
+{
+   if (!kbase_dump_enabled())
+      return;
+
+   mesa_logi("kbase dump: %s, %u bytes at 0x%" PRIx64, what, size, gpu_va);
+
+   if (!cpu) {
+      mesa_logi("  (no CPU mapping - not dumped)");
+      return;
+   }
+
+   const uint64_t *instrs = cpu;
+
+   for (uint32_t i = 0; i < size / 8; i++) {
+      uint64_t instr = instrs[i];
+      uint8_t opcode = instr >> 56;
+
+      mesa_logi("  [%3u] 0x%016" PRIx64 "  %s", i, instr,
+                kbase_cs_opcode_name(opcode));
+   }
+}
+
 /* Collect the command-buffer streams this submit should CALL, and reject
  * anything this driver cannot honestly run.
  *
@@ -516,6 +628,11 @@ struct kbase_submit_calls {
    struct {
       uint64_t addr;
       uint32_t size;
+      /* Only for the dump below - the GPU reads this stream through `addr`.
+       * cs_builder keeps the host mapping of the root chunk alongside its
+       * GPU address, so dumping a CALLed stream costs nothing extra.
+       */
+      const void *cpu;
    } entries[PANVK_KBASE_MAX_SUBMIT_CS_SIZE / (8 * PANVK_KBASE_CALL_INSTRS)];
    uint32_t count;
 
@@ -557,6 +674,16 @@ collect_cmdbuf_calls(struct panvk_device *dev,
             mesa_logw("kbase: command buffer %u has a %u-byte stream on "
                       "subqueue %u, which has no GPU-side context yet",
                       i, cs_root_chunk_size(b), j);
+
+            /* Dumped rather than only counted: vkEndCommandBuffer appends an
+             * epilogue to every subqueue, so this stream may be nothing but
+             * that - which is the difference between "the application asked
+             * for render work" and "PanVK tidied up a subqueue nobody
+             * touched". Only the second is worth trying to make runnable.
+             */
+            kbase_dump_stream("rejected stream", cs_root_chunk_gpu_addr(b),
+                              b->root_chunk.buffer.cpu,
+                              cs_root_chunk_size(b));
             return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                                 "kbase: command buffer %u carries work on "
                                 "subqueue %u, which has no GPU-side context "
@@ -573,6 +700,7 @@ collect_cmdbuf_calls(struct panvk_device *dev,
 
          calls->entries[calls->count].addr = cs_root_chunk_gpu_addr(b);
          calls->entries[calls->count].size = cs_root_chunk_size(b);
+         calls->entries[calls->count].cpu = b->root_chunk.buffer.cpu;
          calls->count++;
          calls->req_resource_mask |= b->req_resource_mask;
       }
@@ -759,6 +887,19 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
    cs_builder_fini(&b);
 
    assert(size <= bound_instrs * 8);
+
+   /* Before the kick, never after: the point is to be able to read what was
+    * about to run when a run does not come back.
+    */
+   if (kbase_dump_enabled()) {
+      kbase_dump_stream("ring stream", root_cs.gpu, stream, size);
+
+      for (uint32_t i = 0; i < calls.count; i++) {
+         kbase_dump_stream("CALLed command-buffer stream",
+                           calls.entries[i].addr, calls.entries[i].cpu,
+                           calls.entries[i].size);
+      }
+   }
 
    /* The compute subqueue: the only one with a context, which
     * collect_cmdbuf_calls() has already enforced for the command buffers.
