@@ -1163,3 +1163,59 @@ words and opcode names straight from the submit path and depends on none of
 that machinery. Less capable than `pandecode` — operands stay hex — but it
 answers "is this the stream I meant to build", which is the question that
 matters before a kick.
+
+## Shader code needs the EXEC_VA zone, not the FIXED_VA one
+
+Found by `tests/driver_compute_probe --fill`, which segfaulted during
+*recording* - before any GPU work - with a null deref at fault address `0x8`.
+
+The chain, from the symbolised backtrace (`llvm-symbolizer` against the
+unstripped `.so`; frames were `cmd_dispatch_prepare_tls` <-
+`dispatch_precomp` <- `CmdFillBuffer`):
+
+1. `kbase_kmod_bo_alloc()` refused every BO carrying flags, because
+   `supported_bo_flags` was 0.
+2. PanVK's `dev->mempools.exec` asks for `PAN_KMOD_BO_FLAG_EXECUTABLE`, so
+   `panvk_shader_upload()` failed for every shader.
+3. `create_shader_from_binary()` returned failure, so
+   `precomp_cache_get()` returned NULL.
+4. `dispatch_precomp()` has `assert(shader)` - **compiled out under NDEBUG** -
+   and passed NULL to `cmd_dispatch_prepare_tls()`, which read
+   `cs->info.tls_size` off it.
+
+So a missing allocator flag surfaced as a null deref three frames away. Worth
+remembering as a shape: a release build turns "this returned NULL" into a
+crash somewhere else entirely.
+
+### The fix, and the wrong first attempt
+
+Adding `BASE_MEM_PROT_GPU_EX` to the existing `MEM_ALLOC_EX` call was not
+enough - it returned `ENOMEM`. kbase keeps executable memory in its own
+**EXEC_VA** zone, the one `KBASE_IOCTL_MEM_EXEC_INIT` reserves, while
+`BASE_MEM_FIXED` places an allocation in the **FIXED_VA** zone. The two are
+mutually exclusive, and `ENOMEM` is what asking for both gets you.
+
+Executable BOs therefore take a different path: plain `KBASE_IOCTL_MEM_ALLOC`
+with `CPU_RD | CPU_WR | GPU_RD | GPU_EX`, no `BASE_MEM_FIXED`, and the kernel
+picks the address. `BASE_MEM_SAME_VA` is absent, so the returned `gpu_va` is a
+real GPU address rather than an mmap cookie, and doubles as the mmap offset
+exactly as the fixed-address path's does. No `GPU_WR`: shader code is not
+written by the GPU.
+
+Two consequences worth keeping:
+
+- `MEM_EXEC_INIT` finally has a purpose here. This backend called it because
+  the vendor blob does (see the RE section above) and nothing had needed it
+  since.
+- `kbase_kmod_bo_free()` must **not** return an executable BO's address to the
+  FIXED_VA heap - the kernel chose it, the heap never owned it, and inserting
+  it would corrupt every later allocation. Guarded on the flag.
+
+### Result
+
+`driver_compute_probe --fill` passes 4/4: a `vkCmdFillBuffer` compute shader
+dispatches, the fence comes back signalled by the GPU, and the buffer reads
+back holding the pattern. The buffer is seeded with the complement of the
+pattern first, so a pass cannot be memory that already happened to match.
+
+That is the first shader this port has executed.

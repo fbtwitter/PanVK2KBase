@@ -354,7 +354,11 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev)
       /* Conservative: no special BO flags are claimed until each is
        * verified against a real kbase kernel.
        */
-      .supported_bo_flags = 0,
+      /* EXECUTABLE maps onto BASE_MEM_PROT_GPU_EX - see kbase_kmod_bo_alloc().
+       * Deliberately not WB_MMAP: this backend's mappings are write-combine,
+       * which is what makes pan_kmod_queue_bo_map_sync() a no-op here.
+       */
+      .supported_bo_flags = PAN_KMOD_BO_FLAG_EXECUTABLE,
       .supported_vm_op_flags = 0,
 
       /* COHERENCY_* is queryable via the props blob, but this backend does
@@ -1155,10 +1159,14 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
                     struct pan_kmod_vm *exclusive_vm, uint64_t size,
                     uint32_t flags)
 {
-   /* Nothing in supported_bo_flags is advertised yet, so refuse anything
-    * with flags rather than silently ignoring them.
+   /* Only what supported_bo_flags advertises. Refused rather than silently
+    * ignored: a BO that quietly comes back without the property the caller
+    * asked for fails later and further away, which is exactly how the
+    * EXECUTABLE case first showed up - as a null deref two frames into a
+    * dispatch, because the shader upload had failed and the assert that
+    * would have caught it is compiled out under NDEBUG.
     */
-   if (flags) {
+   if (flags & ~(uint32_t)PAN_KMOD_BO_FLAG_EXECUTABLE) {
       mesa_loge("kbase: BO flags 0x%x not supported yet", flags);
       return NULL;
    }
@@ -1175,6 +1183,47 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       return NULL;
 
    uint64_t aligned = ALIGN_POT(size, 4096);
+
+   /* Shader code goes in the EXEC_VA zone, and nowhere else.
+    *
+    * kbase keeps executable memory in its own zone, reserved by the
+    * KBASE_IOCTL_MEM_EXEC_INIT in dev_create(). BASE_MEM_FIXED places an
+    * allocation in the FIXED_VA zone instead, so the two are mutually
+    * exclusive: asking for both returns ENOMEM, which is what this backend
+    * did on its first attempt at executable memory.
+    *
+    * So the address cannot come from this backend's own allocator here. The
+    * kernel picks it, and because BASE_MEM_SAME_VA is absent the returned
+    * gpu_va is a real GPU address rather than an mmap cookie - the same
+    * address is then used as the mmap offset by bo_get_mmap_offset(), which
+    * is how the CPU gets to write the code in.
+    *
+    * No GPU_WR: shader code is not written by the GPU, and asking for write
+    * and execute on the same region is worth not doing by default.
+    */
+   if (flags & PAN_KMOD_BO_FLAG_EXECUTABLE) {
+      union kbase_ioctl_mem_alloc alloc = { 0 };
+      alloc.in.va_pages = aligned / 4096;
+      alloc.in.commit_pages = aligned / 4096;
+      alloc.in.extension = 0;
+      alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_EX;
+
+      if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &alloc) < 0) {
+         mesa_loge("kbase: MEM_ALLOC for %" PRIu64
+                   " bytes of executable memory failed: %s",
+                   aligned, strerror(errno));
+         pan_kmod_dev_free(dev, bo);
+         return NULL;
+      }
+
+      bo->gpu_va = alloc.out.gpu_va;
+
+      pan_kmod_bo_init(&bo->base, dev, exclusive_vm, aligned, flags,
+                       (uint32_t)(bo->gpu_va >> 12));
+
+      return &bo->base;
+   }
 
    /* Pick the GPU address ourselves, from the FIXED_VA zone.
     *
@@ -1202,6 +1251,19 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
                     BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
                     BASE_MEM_FIXED;
+
+   /* Shader code. PanVK's dev->mempools.exec asks for this, and every shader
+    * binary - including the precompiled ones behind vkCmdFillBuffer and
+    * friends - is uploaded through it, so without this nothing that runs a
+    * shader can work.
+    *
+    * kbase wants the executable region declared up front too, which is what
+    * the KBASE_IOCTL_MEM_EXEC_INIT in dev_create() is for; the vendor blob
+    * calls it and this backend copied that before it had a use for it.
+    */
+   if (flags & PAN_KMOD_BO_FLAG_EXECUTABLE)
+      alloc.in.flags |= BASE_MEM_PROT_GPU_EX;
+
    alloc.in.fixed_address = va;
 
    if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &alloc) < 0) {
@@ -1330,9 +1392,16 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
       mesa_loge("kbase: MEM_FREE of 0x%" PRIx64 " failed: %s",
                 kbase_bo->gpu_va, strerror(errno));
 
-   simple_mtx_lock(&kbase_dev->va.lock);
-   util_vma_heap_free(&kbase_dev->va.heap, kbase_bo->gpu_va, bo->size);
-   simple_mtx_unlock(&kbase_dev->va.lock);
+   /* Only addresses this backend handed out go back to it. An executable BO
+    * lives in kbase's EXEC_VA zone and its address was chosen by the kernel,
+    * so returning it here would insert a range the heap never owned and
+    * corrupt every later allocation.
+    */
+   if (!(bo->flags & PAN_KMOD_BO_FLAG_EXECUTABLE)) {
+      simple_mtx_lock(&kbase_dev->va.lock);
+      util_vma_heap_free(&kbase_dev->va.heap, kbase_bo->gpu_va, bo->size);
+      simple_mtx_unlock(&kbase_dev->va.lock);
+   }
 
    pan_kmod_bo_cleanup(bo);
    pan_kmod_dev_free(bo->dev, kbase_bo);
