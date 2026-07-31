@@ -550,6 +550,13 @@ collect_cmdbuf_calls(struct panvk_device *dev,
             continue;
 
          if (j != PANVK_SUBQUEUE_COMPUTE) {
+            /* Logged as well as returned: panvk_errorf()'s message goes to a
+             * debug messenger that these probes do not install, so the
+             * VkResult would otherwise arrive with no explanation.
+             */
+            mesa_logw("kbase: command buffer %u has a %u-byte stream on "
+                      "subqueue %u, which has no GPU-side context yet",
+                      i, cs_root_chunk_size(b), j);
             return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                                 "kbase: command buffer %u carries work on "
                                 "subqueue %u, which has no GPU-side context "

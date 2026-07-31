@@ -72,6 +72,18 @@ glb_iface_probe: ./src/tests/glb_iface_probe/glb_iface_probe.c
 driver_load_probe: ./src/tests/driver_load_probe/driver_load_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_load_probe $<
 
+# The driver_* probes below load a real Android Vulkan driver, so unlike the
+# rest of this makefile they must be cross-compiled against the NDK sysroot -
+# the default gcc has no <vulkan/vulkan.h> and could not run on the device
+# anyway. From WSL:
+#
+#   CC=/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/\
+#   aarch64-linux-android34-clang make driver_compute_probe
+#
+# Push with PowerShell, not Git Bash: Git Bash rewrites the remote path in
+# `adb push`, which has previously left stale binaries on the device while
+# the log claimed a fresh one. Verify md5 on both ends afterwards.
+#
 # Drives a built PanVK driver through its Android HAL entrypoint and calls
 # vkEnumeratePhysicalDevices - the end-to-end test of the kbase backend.
 driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
@@ -82,6 +94,13 @@ driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
 # the sync type works, not merely that it registered.
 driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_sync_probe $<
+
+# The first command buffer to reach the GPU on kbase. Staged: recording only
+# by default (cannot hang the device), --submit kicks a CALLed stream for the
+# first time, --fill runs a real shader and checks the result. Run them as
+# separate invocations, in that order.
+driver_compute_probe: ./src/tests/driver_compute_probe/driver_compute_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_compute_probe $<
 
 # Settles what a SAME_VA kbase BO can be re-mmap-ed with (cookie vs resolved
 # address). Decides kbase_kmod_bo_get_mmap_offset()'s implementation.

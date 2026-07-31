@@ -1056,3 +1056,58 @@ The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/
 PanVK/Panthor upstream discussion happens. Worth lurking before you start
 and posting once Phase 1 (standalone probe — already working here) is
 solid — see Phase 9 in `ROADMAP.md` for why raising it early matters.
+
+## Every command buffer touches all three subqueues, even a compute-only one
+
+Found by `tests/driver_compute_probe --submit`, the first attempt to submit a
+real command buffer. The command buffer recorded nothing but a
+compute-to-compute `VkMemoryBarrier2`. `vkQueueSubmit` returned `-8`
+(`VK_ERROR_FEATURE_NOT_PRESENT`) — this driver's own refusal to run work on a
+subqueue with no GPU-side context.
+
+The reason is `finish_cs()` in `csf/panvk_vX_cmd_buffer.c`, which
+`vkEndCommandBuffer` calls in a loop over **every** subqueue, not only the
+ones the application touched. So `cs_is_empty()` is false for all three after
+recording anything at all, and "empty" is not a usable test for "carries no
+work" once a command buffer has been ended.
+
+That epilogue is not harmless on kbase. It does:
+
+- `cs_wait_slots(all_mask)` — fine on an untouched CS, nothing is pending;
+- a `last_error` check that does `cs_load64_to(sync_addr,
+  cs_subqueue_ctx_reg(b), offsetof(..., syncobjs))`.
+
+The second one dereferences the subqueue context register. `init_gpu_queue()`
+only loads that register for COMPUTE here, so on VERTEX_TILER and FRAGMENT it
+is still 0 — a GPU read of address 0, i.e. a page fault, i.e. the wedged
+context that has previously needed a reboot. Refusing the submit is the
+correct behaviour and it is what happened; the guard did its job.
+
+### Why this is smaller than it looks
+
+The epilogue needs exactly one thing from the context: `syncobjs`. And
+`init_subqueue()` sets `.syncobjs` for every subqueue unconditionally, at the
+top. Everything that needs the render descriptor ringbuf — `render.tiler_heap`,
+`render.geom_buf`, `render.desc_ringbuf`, `tiler_oom_ctx.ir_scratch_fbd_ptr` —
+is set further down, under the render-only branch.
+
+So a **minimal context init** for VERTEX_TILER and FRAGMENT looks possible
+without solving the ringbuf at all: allocate the context, populate `syncobjs`
+and `iter_sb`, run the short init stream that loads
+`cs_subqueue_ctx_reg`, and skip the render fields. The epilogue then has
+everything it dereferences, and a compute-only command buffer can be
+submitted with its two render streams published as the no-ops they are.
+
+Not yet attempted. It does not unblock rendering — that still needs the
+ringbuf, see the MEM_ALIAS section — it unblocks *compute*, which is
+currently blocked on render subqueues that are only along for the ride.
+
+### Side finding: `PANVK_DEBUG=trace` cannot be used here
+
+`vkCreateDevice` fails with `-2` (`VK_ERROR_OUT_OF_DEVICE_MEMORY`) under
+`PANVK_DEBUG=trace`, with nothing in logcat. Trace mode switches the
+subqueue allocations to the non-cached pool and adds a per-subqueue
+tracebuf; one of those is not serviceable by this backend. Worth fixing on
+its own merits, because trace is what `pandecode_cs_binary()` hangs off —
+it is the only way to disassemble a stream before running it, which is
+exactly the pre-flight check this repo has twice wished it had.
