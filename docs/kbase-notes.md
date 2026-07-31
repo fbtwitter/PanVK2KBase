@@ -1010,12 +1010,38 @@ So `MEM_ALIAS` composes the region as asked, and its entries genuinely share
 `alloc->pages` (confirmed in the kernel source, `kbase_mem_phy_alloc_get()`),
 but the route from there to a usable 2x GPU VA range is not established.
 
-Worth trying before concluding it is impossible: whether `stride` set to the
-full span rather than the window size changes what `mmap()` will accept, and
-whether an alias placed via the FIXED_VA zone (`BASE_MEM_FIXABLE` on the
-source) comes back addressable instead of as a cookie. Note `FIXED` and
-`FIXABLE` are mutually exclusive per context, so that interacts with the
-backend's existing commitment to `FIXED`.
+**Both remaining variants were tried, and both fail the same way.** `stride`
+set to the full span returns `va_pages = 16` and still `NEED_MMAP`. A
+`BASE_MEM_FIXABLE` source — which does itself land at a real address,
+`0x800200000000` in the FIXED_VA zone — aliases fine but the *alias* still
+comes back `NEED_MMAP`.
+
+So the conclusion is negative, and it follows from the kernel's own
+arithmetic rather than from any one error code:
+
+- `NEED_MMAP` means there is no GPU mapping until userspace `mmap()`s the
+  cookie, and the GPU address is assigned at that point;
+- `nr_pages == va_pages` requires `va_pages > stride`, which
+  `kbase_context_mmap()` rejects `EINVAL`;
+- `nr_pages <= stride` covers exactly one window.
+
+**Therefore the GPU can only ever address one window, and the ringbuf's
+wraparound is not expressible via `MEM_ALIAS` on this kernel.** The aliasing
+itself is real — the entries share `alloc->pages`, and the region is composed
+exactly as asked — it is the *addressability* that fails.
+
+The fallback is to stop relying on the mapping to wrap and bounds-check the
+ring in the command stream instead. That is a change to shared PanVK code
+(`init_render_desc_ringbuf()` and whatever consumes `render.desc_ringbuf`),
+not to the kbase backend.
+
+**Two error codes worth not misreading**, both of which cost time here:
+`ENOMEM` from `MEM_ALIAS` means "no allocation at that handle", not a
+resource limit — passing a FIXABLE allocation's *CPU* pointer as the handle
+produces it, because the SAME_VA rule that the CPU pointer is the GPU address
+does not hold for FIXABLE. And `EPERM` from `mmap()` is the flags check
+(`CPU_RD` absent from the alias), not a blanket refusal, so it masks the
+`EINVAL` you would otherwise get from the page-count check.
 
 **Method note that cost real time here:** `adb push` run from Git Bash has
 its destination path mangled (`/data/local/tmp/x` becomes

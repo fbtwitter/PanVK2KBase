@@ -463,18 +463,31 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       (`live_kick_probe` still passes 3/3 afterwards). That probe now
       refuses to run without `--i-know-it-hangs`, and `alias_probe` reports
       `out.flags` so the cookie case is visible without touching the GPU.
-      Next things to try, before concluding the ringbuf cannot be built
-      this way: whether `stride` set to the full span rather than the
-      window size changes what `mmap()` accepts, and whether an alias whose
-      source carries `BASE_MEM_FIXABLE` lands in the FIXED_VA zone with a
-      real address instead of a cookie — noting `FIXED`/`FIXABLE` are
-      mutually exclusive per context, so that interacts with the backend's
-      existing commitment to `FIXED`.
-      If neither works, the fallback is to stop relying on the mapping to
-      wrap and bounds-check the ring in the command stream instead, which
-      is a change to shared PanVK code rather than to the backend.
+      **Both remaining variants were tried, and the answer is negative.**
+      `stride` = full span returns `va_pages = 16`, still `NEED_MMAP`. A
+      `BASE_MEM_FIXABLE` source — which does itself land at a real address,
+      `0x800200000000` in the FIXED_VA zone — aliases fine, but the alias
+      is still `NEED_MMAP`. The conclusion follows from the kernel's own
+      arithmetic rather than any single error: `nr_pages == va_pages`
+      requires `va_pages > stride`, rejected `EINVAL`; `nr_pages <= stride`
+      covers one window. Since the GPU address is assigned at mmap time,
+      **the GPU can only ever address one window**, so the wraparound is
+      not expressible via `MEM_ALIAS` here. The aliasing itself is real —
+      entries share `alloc->pages` and the region is composed as asked — it
+      is the addressability that fails.
+- [ ] **Next: bounds-check the ring instead of relying on the mapping.**
+      With aliasing ruled out, `init_render_desc_ringbuf()` and whatever
+      consumes `render.desc_ringbuf` have to stop assuming a read running
+      off the end wraps into a second mapping, and handle the wrap
+      explicitly in the command stream. That is a change to **shared PanVK
+      code**, not to the kbase backend — a different kind of change from
+      everything in Phase 4 so far, and the first that would alter
+      behaviour for panthor too unless it is conditioned on `is_kbase`.
+      Worth thinking about before starting, and worth raising upstream
+      (Phase 9) since it touches code panthor relies on.
+      Until it lands, `init_gpu_queue()` stays compute-only and
       `kbase_queue_submit()` keeps refusing submits carrying command
-      buffers until one of those lands.
+      buffers.
       Still not done either: **GPU-side waits**. `vk_submit->waits` are
       satisfied on the CPU before anything is published, so
       `VK_SYNC_FEATURE_GPU_WAIT` stays unadvertised and semaphores still
