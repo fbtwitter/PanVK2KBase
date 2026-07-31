@@ -49,6 +49,23 @@ ROADMAP.md                     phased plan from here to a working PanVK
 4. See `docs/architecture.md` for the core problem (kbase is not a DRM
    device) that has to be solved before Mesa integration can start.
 
+## Vendored headers
+
+ALL THIRD PARTY LIBRARIES COME WITH THEIR OWN LICENSE AND USAGE, ALL CREDIT
+GOES TO THE ORIGINAL AUTHORS.
+
+### kbase r44p0 uapi headers
+
+Vendored from:
+https://nest-open-source.googlesource.com/manifest_repos/mali-driver
+path: bifrost/r44p0/kernel/include/uapi/gpu/arm/midgard
+commit: 0f8397eced2de6bc649a9cc32d0fae77a1dc34dc
+
+Pulled to match UK interface 44.10 for a Mali-G615-MC2 target.
+Unmodified except as noted in individual file diffs, if any.
+Original license notices preserved in each file - see file headers,
+not this README, for authoritative licensing.
+
 ## License
 
 MIT, to match Mesa's licensing, so anything here can eventually be

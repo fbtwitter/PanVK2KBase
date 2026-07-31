@@ -318,7 +318,7 @@ static uint64_t read_value(uint8_t *buf, size_t size) {
 }
 
 // Takes a buffer and its lenght, and prints the GPU properties
-void parse_gpuprops(void *buffer, size_t length) {
+void parse_gpuprops(void *buffer, size_t length, uint64_t *out_shader_present) {
   // get a pointer to the buffer (at offset 0)
   uint8_t *buf = buffer;
 
@@ -393,6 +393,9 @@ void parse_gpuprops(void *buffer, size_t length) {
 
     case 25: /* RAW_SHADER_PRESENT */
       printf("\n       Shader cores: %d\n\n", __builtin_popcountll(value));
+      if (out_shader_present) {
+        *out_shader_present = value;
+      }
       break;
 
     case 27: /* RAW_L2_PRESENT */

@@ -2,3 +2,4 @@
 !/build/.gitkeep
 /third_party/MESA-KMOD
 /third_party/PANFORK
+/third_party/mesa
