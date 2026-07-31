@@ -16,8 +16,33 @@
 
 #define PAGE_SIZE 4096
 
+/*
+    A kbase allocation, in the two forms its address takes.
+
+    Under BASE_MEM_SAME_VA - which this device's kbase grants for our flag
+    combination whether or not we ask for it - MEM_ALLOC does NOT return a
+    GPU address. It returns a reusable mmap *cookie*, and the region has no
+    GPU mapping at all until userspace mmap()s that cookie; the CPU address
+    mmap() hands back is then the real GPU VA. See the SAME_VA/cookie
+    section in docs/kbase-notes.md for how this was established.
+
+    Both values are kept because under SAME_VA they are different numbers
+    and picking the wrong one is not a clean failure:
+      - cookie: exactly what MEM_ALLOC reported, and the correct mmap()
+        offset. Under SAME_VA it is single-use and reused across
+        allocations (every BO tends to report the same value).
+      - gpu_va: the real GPU address. This is what goes into command
+        streams, MEM_ALIAS handles, and any other ioctl wanting an address.
+
+    For a non-SAME_VA allocation (BASE_MEM_FIXABLE/BASE_MEM_FIXED) the two
+    are the same number and the CPU pointer is the unrelated one instead.
+
+    Handing a cookie to the GPU faults it and wedges the kbase context past
+    kill -9, needing a device reboot - see tests/alias_probe.
+*/
 struct kbase_bo {
-  uint64_t gpu_va;
+  uint64_t gpu_va; // real GPU address (== cpu under SAME_VA)
+  uint64_t cookie; // MEM_ALLOC's out.gpu_va; an mmap offset, not an address
   void *cpu;
   size_t size;
 };
@@ -75,21 +100,15 @@ struct kbase_bo *kbase_bo_create_flags(int fd, size_t size,
   // initialize the output buffer object
   struct kbase_bo *bo = calloc(1, sizeof(*bo));
 
-  // pass the allocated memory gpu address to the output object
-  bo->gpu_va = alloc.out.gpu_va;
+  // whatever MEM_ALLOC returned, it is the right mmap() offset; whether it
+  // is also a usable GPU address depends on SAME_VA, resolved below
+  bo->cookie = alloc.out.gpu_va;
   bo->size = size;
 
-  // map the GPU address to a CPU readable buffer
+  // resolve the cookie into a mapping; the address this returns is both the
+  // CPU pointer and, under SAME_VA, the real GPU VA
   bo->cpu =
-      mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bo->gpu_va);
-
-  /*bo->cpu =
-    mmap((void *)(uintptr_t)bo->gpu_va,
-         size,
-         PROT_READ | PROT_WRITE,
-         MAP_SHARED | MAP_FIXED,
-         fd,
-         (off_t)bo->gpu_va);*/
+      mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bo->cookie);
 
   // in case of error, return null
   if (bo->cpu == MAP_FAILED) {
@@ -98,14 +117,27 @@ struct kbase_bo *kbase_bo_create_flags(int fd, size_t size,
     return NULL;
   }
 
+  /*
+      Only under SAME_VA is the CPU pointer the GPU address. A non-SAME_VA
+      allocation - BASE_MEM_FIXABLE or BASE_MEM_FIXED, as extra_flags - is
+      placed in the FIXED_VA zone (0x800200000000 on the tested device) and
+      its CPU mapping lands somewhere unrelated; there out.gpu_va is already
+      the real address and must not be overwritten. See "Caller-chosen GPU
+      VAs" in docs/kbase-notes.md, and tests/alias_probe's FIXABLE section,
+      which passes bo->gpu_va to MEM_ALIAS and gets ENOMEM if this is wrong.
+  */
+  if (alloc.out.flags & BASE_MEM_SAME_VA)
+    bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
+  else
+    bo->gpu_va = alloc.out.gpu_va;
+
   // initialize the memory area with 0s
   memset(bo->cpu, 0, size);
 
-  printf("buffer gpu_va = 0x%016lx\n", bo->gpu_va);
-  printf("buffer cpu = 0x%016lx\n", bo->cpu);
+  printf("buffer gpu_va = 0x%016llx\n", (unsigned long long)bo->gpu_va);
+  printf("buffer cookie = 0x%016llx\n", (unsigned long long)bo->cookie);
+  printf("buffer cpu    = %p\n", bo->cpu);
   printf("buffer size   = %zu\n", bo->size);
-
-  bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
 
   // return the constructed buffer object
   return bo;

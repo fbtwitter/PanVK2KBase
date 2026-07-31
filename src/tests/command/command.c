@@ -106,9 +106,20 @@ int main(void) {
 
   printf("GET_GPUPROPS fetch OK\n");
 
+  // parse the GPU properties from the obtained buffer, for the human
+  parse_gpuprops(props_buf, props_size);
+
+  // and pull out the one property this test has to act on: the real
+  // shader-core mask for CS_QUEUE_GROUP_CREATE below. Reuses the buffer
+  // already fetched above rather than re-running the GET_GPUPROPS pair.
   uint64_t shader_present = 0;
-  // parse the GPU properties from the obtained buffer
-  parse_gpuprops(props_buf, props_size, &shader_present);
+  if (!gpuprops_lookup(props_buf, props_size, KBASE_GPUPROP_RAW_SHADER_PRESENT,
+                       &shader_present)) {
+    fprintf(stderr, "RAW_SHADER_PRESENT not present in gpuprops\n");
+    free(props_buf);
+    close(fd);
+    return 1;
+  }
 
   printf("\n== probe complete, device is talking ==\n");
 

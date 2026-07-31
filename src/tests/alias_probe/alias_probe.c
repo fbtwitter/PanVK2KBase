@@ -63,8 +63,10 @@ main(void)
 
    printf("=== 1. the allocation to be aliased ===\n");
 
-   /* A plain SAME_VA allocation: its gpu_va doubles as the handle every
-    * other kbase memory ioctl takes, which is what MEM_ALIAS wants.
+   /* A plain SAME_VA allocation. Which of its two addresses MEM_ALIAS wants
+    * as a handle is the whole question this section 2 exists to answer, so
+    * keep both and try each: bo->cookie is what MEM_ALLOC reported (an mmap
+    * offset), bo->gpu_va is what that cookie resolved to (a real address).
     */
    struct kbase_bo *bo = kbase_bo_create(fd, RING_BYTES);
    if (!bo) {
@@ -72,9 +74,9 @@ main(void)
       return 1;
    }
 
-   uint64_t handle = bo->gpu_va;
-   printf("  allocated %d bytes, handle/gpu_va = 0x%llx\n", RING_BYTES,
-          (unsigned long long)handle);
+   printf("  allocated %d bytes, cookie = 0x%llx, real gpu_va = 0x%llx\n",
+          RING_BYTES, (unsigned long long)bo->cookie,
+          (unsigned long long)bo->gpu_va);
 
    /* Seed through the original mapping so we can tell "the alias sees the
     * same pages" from "the alias is a fresh zeroed region".
@@ -87,12 +89,12 @@ main(void)
 
    struct base_mem_aliasing_info ai[2] = {
       {
-         .handle = { .basep = { .handle = handle } },
+         .handle = { .basep = { .handle = bo->gpu_va } },
          .offset = 0,
          .length = RING_PAGES,
       },
       {
-         .handle = { .basep = { .handle = handle } },
+         .handle = { .basep = { .handle = bo->gpu_va } },
          .offset = 0,
          .length = RING_PAGES,
       },
@@ -103,21 +105,25 @@ main(void)
     * the real GPU VA is the CPU pointer (see the SAME_VA/cookie section in
     * docs/kbase-notes.md). Both are plausible handles, and the flags may
     * matter too, so try the combinations rather than guessing one.
+    *
+    * These four attempts only discriminate as long as bo->cookie and
+    * bo->gpu_va stay distinct fields - they are two different numbers and
+    * conflating them collapses this table to a flags-only test.
     */
    const struct {
       const char *what;
       uint64_t handle;
       uint64_t flags;
    } attempts[] = {
-      { "cookie handle, SAME_VA alias", handle,
+      { "cookie handle, SAME_VA alias", bo->cookie,
         BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD |
            BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA },
-      { "real GPU VA handle, SAME_VA alias", (uint64_t)(uintptr_t)bo->cpu,
+      { "real GPU VA handle, SAME_VA alias", bo->gpu_va,
         BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD |
            BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA },
-      { "real GPU VA handle, GPU-only alias", (uint64_t)(uintptr_t)bo->cpu,
+      { "real GPU VA handle, GPU-only alias", bo->gpu_va,
         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR },
-      { "cookie handle, GPU-only alias", handle,
+      { "cookie handle, GPU-only alias", bo->cookie,
         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR },
    };
 
@@ -233,8 +239,8 @@ main(void)
     * mmap cookie is single-use, and the failed attempt above most likely
     * consumed it. Re-aliasing costs nothing and removes the doubt.
     */
-   ai[0].handle.basep.handle = (uint64_t)(uintptr_t)bo->cpu;
-   ai[1].handle.basep.handle = (uint64_t)(uintptr_t)bo->cpu;
+   ai[0].handle.basep.handle = bo->gpu_va;
+   ai[1].handle.basep.handle = bo->gpu_va;
 
    union kbase_ioctl_mem_alias fresh = { 0 };
    fresh.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_GPU_RD |
@@ -269,8 +275,8 @@ main(void)
     * back - which is not what the ringbuf wants even if it maps. Worth
     * measuring rather than reasoning about.
     */
-   ai[0].handle.basep.handle = (uint64_t)(uintptr_t)bo->cpu;
-   ai[1].handle.basep.handle = (uint64_t)(uintptr_t)bo->cpu;
+   ai[0].handle.basep.handle = bo->gpu_va;
+   ai[1].handle.basep.handle = bo->gpu_va;
 
    union kbase_ioctl_mem_alias wide = { 0 };
    wide.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
