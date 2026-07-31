@@ -427,8 +427,22 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       point rather than adding one.
       Verified on hardware: `vkCreateDevice` still returns 0 and
       `driver_sync_probe` still passes every check.
-- [ ] **The render subqueues, blocked on BO aliasing — now unblocked in
-      principle.** `init_gpu_queue()` still loops over
+- [x] **The render subqueues' *contexts* — done, and the ringbuf turned out
+      not to gate them.** `init_gpu_queue()` now initialises all three
+      subqueues on kbase. The belief that it could not was wrong, and
+      disassembling a rejected stream with `PANVK_KBASE_DUMP=1` is what
+      showed it: what VERTEX_TILER and FRAGMENT actually dereference for an
+      ordinary command buffer is the subqueue context register, for
+      `syncobjs` and `last_error`, in the epilogue `vkEndCommandBuffer`
+      appends to *every* subqueue whether the application touched it or not.
+      Leaving that register at 0 is what made those streams unrunnable — a
+      GPU read of address 0. Only the `render.desc_ringbuf` field of the
+      context needs the ringbuf; it is left zeroed on purpose, so anything
+      that actually draws null-derefs it rather than running against a
+      plausible wrong address. **Rendering is still blocked on the ringbuf;
+      compute never was.** Original note follows.
+- [ ] **(superseded, kept for the reasoning) The render subqueues, blocked on
+      BO aliasing.** `init_gpu_queue()` used to loop over
       `PANVK_SUBQUEUE_COMPUTE` only. What stops the other two is
       `init_render_desc_ringbuf()`, and the reason is more interesting than
       it first looked: its syncobj is a `panvk_cs_sync32` in device memory,
@@ -724,7 +738,35 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `ro.debuggable=0`, SELinux enforcing as `u:r:shell:s0`. No
       developer-options toggle changes this. Full writeup in
       `docs/kbase-notes.md`.
-- [ ] Map VkQueueSubmit onto kbase atom/command-stream submission. Real
+- [x] **Map VkQueueSubmit onto kbase command-stream submission — done for
+      compute, confirmed on hardware.** One ring stream per subqueue, each
+      CALLing that subqueue's command-buffer streams where they lie rather
+      than copying them into the ring: a cs_builder stream that outgrew its
+      first chunk links chunk to chunk by absolute address, so a relocated
+      copy would jump back to the original. Panthor's kernel CALLs
+      stream_addr/stream_size for the same reason; this does it in userspace
+      because on kbase there is no kernel in the submit path at all.
+      That absence is also why the cache flush panthor's kernel emits ahead
+      of the CALL has to be in the stream here, and why it invalidates rather
+      than only cleaning: command-buffer and descriptor memory is recycled
+      through the command pool, so the GPU can hold valid lines for an
+      address the CPU has since rewritten. Flush id 0 — always flush;
+      panthor's `latest_flush` skip optimisation reads a register page kbase
+      does not expose the same way.
+      Proven by `tests/driver_compute_probe` and
+      `tests/driver_pipeline_probe`: a command buffer runs, a
+      `vkCmdFillBuffer` shader runs and its pattern reads back, a compute
+      pipeline built from application SPIR-V dispatches and writes
+      `i * multiplier` to a storage buffer through a descriptor set and a
+      push constant, and 2000 back-to-back submits wrap the 64KB ring
+      repeatedly without failure.
+      **Not done: rendering.** A stream requesting the tiler, IDVS or
+      fragment endpoints is refused — on the requested resources rather than
+      on which subqueue it landed on, because the latter cannot tell real
+      render work from the epilogue above.
+      Original note follows.
+- [ ] **(superseded) Map VkQueueSubmit onto kbase atom/command-stream
+      submission.** Real
       target identified from the Mesa clone (`third_party/MESA-KMOD`,
       see `docs/architecture.md`): `src/panfrost/vulkan/csf/
       panvk_vX_gpu_queue.c` calls `DRM_IOCTL_PANTHOR_GROUP_CREATE` /
@@ -740,7 +782,18 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       heap may in fact be part of the answer — one hypothesis for the
       unscheduled group is that it needs more setup before the scheduler
       considers it schedulable.
-- [ ] Build the fence-translation shim between kbase's completion
+- [x] **Fence translation — done.** `panvk_kbase_sync` is a vk_sync type
+      backed by a 64-bit slot in `BASE_MEM_CSF_EVENT` memory, signalled from
+      the command stream by `SYNC_SET64` at system scope. No DRM syncobj is
+      involved, which is the point: the original note below correctly
+      identified that the mechanism PanVK assumes does not exist here.
+      Still missing: **GPU-side waits.** `vk_submit->waits` are satisfied on
+      the CPU before anything is published, so `VK_SYNC_FEATURE_GPU_WAIT`
+      stays unadvertised and semaphores cannot be created. That needs
+      `SYNC_WAIT64` in the stream, and it is the next sync-layer job.
+      Original note follows.
+- [ ] **(superseded) Build the fence-translation shim between kbase's
+      completion
       mechanism and whatever PanVK's sync code expects to wait/signal on.
       Confirmed harder than "translate the ioctls": the same file signals
       completion via libdrm `drmSyncobj*` calls on `dev->drm_fd`, which
@@ -749,6 +802,38 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       wrong-ioctl-number problem, it's "the mechanism PanVK's sync code
       assumes doesn't exist on this kernel driver at all."
 - [ ] Budget the most time here. This was the long pole for kgsl too.
+
+## Where this actually is (2026-07-31)
+
+Working end to end on the Poco X8 Pro (Mali-G720 MC8, kbase r49p1):
+`vkCreateDevice` → command buffer → compute pipeline from application
+SPIR-V → `vkCmdDispatch` → GPU-signalled fence → correct results read back.
+Stable across 2000 back-to-back submits.
+
+**Compute works. Rendering does not, and the one thing blocking it is the
+render descriptor ringbuf** — `init_render_desc_ringbuf()` maps one BO at
+two adjacent GPU VAs, and kbase cannot express that (see the `MEM_ALIAS`
+section in `docs/kbase-notes.md` for why, measured and then confirmed
+against the kernel source). The fix is a change to *shared* PanVK code, not
+to this backend, which is why `docs/upstream-ringbuf-question.md` exists.
+
+**That question is drafted and still unsent, and it is the highest-value
+next action.** It is also now a better question than when it was written:
+the ringbuf was assumed to block the render subqueues entirely, and it turns
+out to block only rendering itself.
+
+Tools worth knowing about before touching any of this:
+
+- `PANVK_KBASE_DUMP=1` prints every stream, with opcode names, before it is
+  kicked — and every stream this driver refuses. It is the only pre-flight
+  disassembly available here (`PANVK_DEBUG=trace` cannot run on kbase; see
+  `docs/kbase-notes.md`), and it has already overturned one wrong belief.
+- Mesa logs go to logcat under the `MESA` tag, not to a probe's stdout:
+  `adb logcat -d -s MESA`.
+- The `patch-panvk-kbase-*.py` scripts are run **by hand**, not by
+  `wsl-build*.sh`, and self-skip when already applied. Changing one means
+  restoring its target files in `/opt/mesa-src` and re-running *all* of
+  them, since they share targets.
 
 ## Phase 5 — Headless triangle
 - [ ] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
