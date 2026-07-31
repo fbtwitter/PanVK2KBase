@@ -12,6 +12,17 @@ instead, which changes behaviour for panthor too.
 
 Status: **drafted, not yet sent.**
 
+Sharpened 2026-07-31, after disassembling a rejected command stream. The
+earlier draft asked this from a weaker position — it implied the ringbuf
+blocked bringing up the render subqueues at all. It does not. All three
+subqueue contexts initialise and run on kbase; the only field that needs the
+double mapping is `render.desc_ringbuf`, and the only thing that needs *that*
+is actual draw work. Compute is complete and unaffected. So the question is
+narrower than it was, and it is now the single remaining blocker rather than
+one of several unknowns — worth stating that way, because it is the
+difference between "help me port this" and "one specific design decision,
+please confirm before I change shared code".
+
 ---
 
 ## The message
@@ -22,10 +33,13 @@ first on purpose — the rest only exists to show the constraint is real.
 ```
 Hi — I'm porting PanVK to the legacy Arm kbase driver (Mali-G720, r49p1,
 out-of-tree experiment: github.com/fbtwitter/PanVK2KBase). Most of the CSF
-path ports cleanly; vkCreateDevice and an empty vkQueueSubmit work, with the
-GPU signalling a vk_sync via SYNC_SET64 into BASE_MEM_CSF_EVENT memory.
+path ports cleanly. Compute works end to end: a compute pipeline built from
+application SPIR-V, vkCmdDispatch, and a VkFence signalled by the GPU via
+SYNC_SET64 into BASE_MEM_CSF_EVENT memory (kbase has no fences, so that's the
+completion primitive). All three subqueue contexts initialise and run.
 
-I'm stuck on init_render_desc_ringbuf(), and I'd rather ask than guess.
+The one thing left is init_render_desc_ringbuf(), and I'd rather ask than
+guess, because the fix I can see touches shared code.
 
 It maps one BO at dev_addr and again at dev_addr + size. kbase can't express
 that. KBASE_IOCTL_MEM_ALIAS composes the region correctly (entries do share
@@ -35,6 +49,14 @@ rejects nr_pages > stride, so a mapping can never cover both windows. Since
 the GPU address is assigned at mmap time, the GPU can only ever address one
 window. I tried stride = full span and a BASE_MEM_FIXABLE source; both still
 come back NEED_MMAP.
+
+To be precise about what this does and doesn't block, since I had it wrong
+myself at first: it isn't the render subqueues. Those come up fine — what an
+ordinary command buffer dereferences on VERTEX_TILER and FRAGMENT is just the
+subqueue context register, and vkEndCommandBuffer appends that epilogue to
+every subqueue whether the app drew anything or not. render.desc_ringbuf is
+the only field that needs the double mapping, and only draw work reads it.
+So this is a rendering blocker, not a bring-up blocker.
 
 Reading the consumers, the pointer wraparound is already handled in the CS by
 cs_render_desc_ringbuf_move_ptr(). What the second mapping seems to buy is
