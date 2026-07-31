@@ -45,12 +45,19 @@
  *   duplicated. Only the submit at the end of it is ours, through
  *   kbase_submit_and_wait() below. See patch-panvk-kbase-subqueue-init.py.
  *
+ *   Implemented, NOT YET RUN ON HARDWARE: compute command buffers. A submit
+ *   whose work all lands on PANVK_SUBQUEUE_COMPUTE builds a ring stream that
+ *   CALLs each command buffer's own stream where it lies, ahead of the
+ *   SYNC_SET64s. Every line of it is reasoned from the panthor path and from
+ *   upstream's standalone compute runner; none of it has executed yet. Treat
+ *   a first run as capable of faulting the GPU until it has not.
+ *
  *   NOT implemented: the VERTEX_TILER and FRAGMENT subqueues' contexts.
  *   Those additionally need a tiler heap descriptor, a geometry buffer, a
  *   scratch FBD and a render descriptor ringbuf, none of which this path
- *   builds - so init_gpu_queue() only loops over COMPUTE on kbase.
- *   kbase_queue_submit() still refuses any submit carrying command buffers,
- *   because a render one would run against an uninitialised context.
+ *   builds - so init_gpu_queue() only loops over COMPUTE on kbase, and
+ *   kbase_queue_submit() refuses a command buffer carrying work on either of
+ *   them rather than running it against a zeroed context.
  *
  *   NOT implemented: GPU-side waits. vk_submit->waits are satisfied on the
  *   CPU before anything is published, so VK_SYNC_FEATURE_GPU_WAIT stays
@@ -105,12 +112,27 @@
  * allocated.
  */
 
-/* Upper bound on a submit's command stream. Each signalled sync costs a
- * MOVE64 for the address, a MOVE64 for the value and a SYNC_SET64, all
- * 8-byte instructions; the rest is slack for the stream epilogue. A submit
- * that would exceed this is rejected rather than silently truncated.
+/* Upper bound on a submit's command stream. A submit whose computed bound
+ * exceeds this is rejected rather than silently truncated - see
+ * submit_stream_bound() for the accounting.
  */
 #define PANVK_KBASE_MAX_SUBMIT_CS_SIZE 4096
+
+/* Per-item instruction budgets for the ring stream this file builds, in
+ * 8-byte CS instructions. Upper bounds, not exact counts: cs_move64_to()
+ * emits one MOVE48 for a value below 2^48 and two MOVE32s otherwise, so
+ * every 64-bit move is budgeted at 2.
+ *
+ *   REQ_RESOURCE (emitted at most once per subqueue, ever)
+ *   flush: MOVE32 (flush id), FLUSH_CACHE2, WAIT
+ *   per call: MOVE64 (address), MOVE32 (size), CALL
+ *   per signal: MOVE64 (address), MOVE64 (value), SYNC_SET64
+ */
+#define PANVK_KBASE_REQ_RES_INSTRS  1
+#define PANVK_KBASE_FLUSH_INSTRS    3
+#define PANVK_KBASE_CALL_INSTRS     4
+#define PANVK_KBASE_SIGNAL_INSTRS   5
+#define PANVK_KBASE_EPILOGUE_INSTRS 4
 
 /* Embeds panvk_gpu_queue rather than vk_queue directly, because the
  * per-subqueue GPU context setup is shared with panthor - see
@@ -311,8 +333,6 @@ panvk_per_arch(destroy_kbase_queue)(struct vk_queue *vk_queue)
 }
 
 /* cs_builder wants somewhere to go when a stream outgrows its buffer. This
-
-/* cs_builder wants somewhere to go when a stream outgrows its buffer. This
  * one builds into a fixed staging buffer that is bounds-checked up front,
  * so overflow means the bound was computed wrong - a driver bug, not a
  * runtime condition to recover from.
@@ -475,6 +495,85 @@ panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *gpu_queue,
                        pan_kmod_kbase_queue_active(cs));
 }
 
+/* Collect the command-buffer streams this submit should CALL, and reject
+ * anything this driver cannot honestly run.
+ *
+ * Only PANVK_SUBQUEUE_COMPUTE has a GPU-side context - init_gpu_queue()
+ * loops over that one alone on kbase, because the render subqueues also
+ * need the descriptor ringbuf that BO aliasing cannot express here. Work
+ * recorded against a render subqueue would execute against a zeroed
+ * context, so it is refused rather than run.
+ *
+ * The streams are not copied into the ring. Each is CALLed at the address
+ * the command buffer built it at, which is what panthor's kernel does with
+ * stream_addr/stream_size, and it is not merely an optimisation: a
+ * cs_builder stream that outgrew its first chunk contains absolute
+ * addresses linking chunk to chunk, so a stream relocated by a ring copy
+ * would jump back to the original chunk. Only streams built to be executed
+ * where they lie survive that, and these are not.
+ */
+struct kbase_submit_calls {
+   struct {
+      uint64_t addr;
+      uint32_t size;
+   } entries[PANVK_KBASE_MAX_SUBMIT_CS_SIZE / (8 * PANVK_KBASE_CALL_INSTRS)];
+   uint32_t count;
+
+   /* OR of the resource masks the collected streams ask for. */
+   uint32_t req_resource_mask;
+};
+
+static VkResult
+collect_cmdbuf_calls(struct panvk_device *dev,
+                     const struct vk_queue_submit *vk_submit,
+                     struct kbase_submit_calls *calls)
+{
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf = container_of(
+         vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+
+      for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+
+         /* A builder that went invalid recorded a failure that
+          * vkEndCommandBuffer already reported. Running its partial stream
+          * would be worse than refusing it.
+          */
+         if (!cs_is_valid(b)) {
+            return panvk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                                "kbase: command buffer %u has an invalid "
+                                "stream on subqueue %u",
+                                i, j);
+         }
+
+         if (cs_is_empty(b))
+            continue;
+
+         if (j != PANVK_SUBQUEUE_COMPUTE) {
+            return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                                "kbase: command buffer %u carries work on "
+                                "subqueue %u, which has no GPU-side context "
+                                "yet (compute only)",
+                                i, j);
+         }
+
+         if (calls->count >= ARRAY_SIZE(calls->entries)) {
+            return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                "kbase: more than %zu command streams in one "
+                                "submit",
+                                ARRAY_SIZE(calls->entries));
+         }
+
+         calls->entries[calls->count].addr = cs_root_chunk_gpu_addr(b);
+         calls->entries[calls->count].size = cs_root_chunk_size(b);
+         calls->count++;
+         calls->req_resource_mask |= b->req_resource_mask;
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
 VkResult
 panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
                                    struct vk_queue_submit *vk_submit)
@@ -483,18 +582,13 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
+   struct panvk_subqueue *subq =
+      &queue->gpu.subqueues[PANVK_SUBQUEUE_COMPUTE];
 
-   /* Command buffers need the per-subqueue context that init_subqueue()
-    * would have set up, and that does not exist yet - see the file comment.
-    * Refusing is the honest answer; running them against an uninitialised
-    * context would produce wrong results rather than an error.
-    */
-   if (vk_submit->command_buffer_count) {
-      return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                          "kbase: command buffer submission is not "
-                          "implemented yet (%u in this submit)",
-                          vk_submit->command_buffer_count);
-   }
+   struct kbase_submit_calls calls = { 0 };
+   VkResult result = collect_cmdbuf_calls(dev, vk_submit, &calls);
+   if (result != VK_SUCCESS)
+      return result;
 
    /* No GPU-side wait exists yet - panvk_kbase_sync deliberately withholds
     * VK_SYNC_FEATURE_GPU_WAIT - so waits are satisfied on the CPU before
@@ -503,21 +597,37 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
     * because a semaphore cannot currently be created at all.
     */
    for (uint32_t i = 0; i < vk_submit->wait_count; i++) {
-      VkResult result = vk_sync_wait(&dev->vk, vk_submit->waits[i].sync,
-                                     vk_submit->waits[i].wait_value,
-                                     VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      result = vk_sync_wait(&dev->vk, vk_submit->waits[i].sync,
+                            vk_submit->waits[i].wait_value,
+                            VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
       if (result != VK_SUCCESS)
          return result;
    }
 
-   if (!vk_submit->signal_count)
+   if (!calls.count && !vk_submit->signal_count)
       return VK_SUCCESS;
 
-   /* One SYNC_SET64 per signalled sync, at system scope so the write lands
-    * where the CPU can see it - CSG scope would keep it inside the group.
-    * This is the whole submit: with no command buffers there is nothing
-    * else to run, which is exactly what makes it a useful first target.
+   /* Resources the subqueue has not asked the firmware for yet. Tracked on
+    * the shared panvk_subqueue exactly as the panthor path tracks it, so
+    * REQ_RESOURCE is emitted once rather than on every submit.
     */
+   const uint32_t new_resources =
+      calls.req_resource_mask & ~subq->req_resource.mask;
+
+   const uint32_t bound_instrs =
+      (new_resources ? PANVK_KBASE_REQ_RES_INSTRS : 0) +
+      (calls.count ? PANVK_KBASE_FLUSH_INSTRS : 0) +
+      calls.count * PANVK_KBASE_CALL_INSTRS +
+      vk_submit->signal_count * PANVK_KBASE_SIGNAL_INSTRS +
+      PANVK_KBASE_EPILOGUE_INSTRS;
+
+   if (bound_instrs * 8 > PANVK_KBASE_MAX_SUBMIT_CS_SIZE) {
+      return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "kbase: submit needs up to %u bytes of command "
+                          "stream, over the %u-byte staging buffer",
+                          bound_instrs * 8, PANVK_KBASE_MAX_SUBMIT_CS_SIZE);
+   }
+
    uint8_t stream[PANVK_KBASE_MAX_SUBMIT_CS_SIZE];
    const struct drm_panthor_csif_info *csif_info =
       panthor_kmod_get_csif_props(dev->kmod.dev);
@@ -543,17 +653,76 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
    struct cs_builder b;
    cs_builder_init(&b, &conf, root_cs);
 
-   /* SYNC_SET64 takes register indices, not immediates, so the address and
+   /* Scratch registers throughout, never cs_reg*() directly. The register
+    * file is shared with the command-buffer streams CALLed below: registers
+    * up to PANVK_CS_REG_SCRATCH_END are theirs to clobber, but the progress
+    * seqnos and the subqueue context pointer live above it and must survive
+    * between submits - init_gpu_queue() is what loaded the context pointer,
+    * and every command buffer dereferences it.
+    *
+    * The CALLed streams clobber the scratch registers too (finish_cs() uses
+    * scratch 0-2 for its error check), so anything needed after a CALL is
+    * reloaded rather than assumed to have survived it.
+    */
+   struct cs_index scratch32 = cs_scratch_reg32(&b, 0);
+   struct cs_index addr_reg = cs_scratch_reg64(&b, 2);
+   struct cs_index val_reg = cs_scratch_reg64(&b, 4);
+
+   if (new_resources)
+      cs_req_res(&b, new_resources | subq->req_resource.mask);
+
+   if (calls.count) {
+      /* Invalidate before reading anything the CPU just wrote.
+       *
+       * On panthor the kernel emits this ahead of the CALL and uses the
+       * submit's latest_flush to let the hardware skip it when the caches
+       * are known clean. Nothing does that here: kbase has no kernel in the
+       * submit path at all, since userspace writes the ring and rings the
+       * doorbell itself. So the flush has to be in the stream, and the
+       * flush id is 0 - "never already flushed" - which always flushes.
+       *
+       * It has to invalidate, not just clean. Command-buffer and descriptor
+       * memory is recycled through the command pool, so the GPU's caches
+       * can hold valid lines for an address the CPU has since rewritten
+       * with a different allocation's contents. Cleaning writes back dirty
+       * lines but leaves them valid, which is the half PanVK already emits
+       * at the end of every command buffer for the opposite hazard.
+       *
+       * Modes match src/panfrost/compiler/kraid/hw_runner, the standalone
+       * compute runner upstream, which is the closest thing to this stream
+       * that already runs on hardware.
+       */
+      cs_move32_to(&b, scratch32, 0);
+      cs_flush_caches(&b, MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
+                      MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
+                      MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, scratch32,
+                      cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
+      cs_wait_slot(&b, SB_ID(IMM_FLUSH));
+   }
+
+   /* CALL, not JUMP: the stream has to come back here so the signals below
+    * still run. Safe to signal straight after, because finish_cs() opens
+    * with cs_wait_slots(all_mask) - a command buffer's stream waits for its
+    * own outstanding work before it ends, so the CALL returning means the
+    * work is done, not merely issued.
+    */
+   for (uint32_t i = 0; i < calls.count; i++) {
+      cs_move64_to(&b, addr_reg, calls.entries[i].addr);
+      cs_move32_to(&b, scratch32, calls.entries[i].size);
+      cs_call(&b, addr_reg, scratch32);
+   }
+
+   /* One SYNC_SET64 per signalled sync, at system scope so the write lands
+    * where the CPU can see it - CSG scope would keep it inside the group.
+    * SYNC_SET64 takes register indices, not immediates, so the address and
     * value go through registers first. Same shape as tests/event_slot_probe
     * and as Panfork's 0x48/0x4a pair.
     */
-   struct cs_index addr_reg = cs_reg64(&b, 0);
-   struct cs_index val_reg = cs_reg64(&b, 2);
-
    for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
       struct vk_sync *sync = vk_submit->signals[i].sync;
 
       if (sync->type != &phys_dev->kbase_sync_type.base) {
+         cs_builder_fini(&b);
          return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                              "kbase: cannot signal a sync of a foreign type");
       }
@@ -582,11 +751,22 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
    uint32_t size = cs_root_chunk_size(&b);
    cs_builder_fini(&b);
 
-   /* The compute subqueue, because an empty submit needs no tiler or
-    * fragment resources and this one is not carrying any real work. When
-    * command buffers arrive they will pick per their own subqueue.
+   assert(size <= bound_instrs * 8);
+
+   /* The compute subqueue: the only one with a context, which
+    * collect_cmdbuf_calls() has already enforced for the command buffers.
     */
-   return submit_stream(dev, queue, PANVK_SUBQUEUE_COMPUTE, stream, size);
+   result = submit_stream(dev, queue, PANVK_SUBQUEUE_COMPUTE, stream, size);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Only once the stream carrying it has actually been published. Recording
+    * the request before the submit could fail would leave the subqueue
+    * believing it holds resources it never asked for.
+    */
+   subq->req_resource.mask |= new_resources;
+
+   return VK_SUCCESS;
 }
 
 VkResult
