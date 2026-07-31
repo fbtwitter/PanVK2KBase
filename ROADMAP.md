@@ -955,6 +955,14 @@ waiting, and all three are now done:
   Android cross toolchain, links, the driver still enumerates, and
   `tests/driver_extmem_probe` confirms on-device that both handle types now
   report `externalMemoryFeatures = 0x0`.
+  The whole working feature set was then re-run against that same build, so
+  the gate is known not to have cost anything: `driver_enum_probe`
+  enumerates, `driver_compute_probe --fill` 0 failures,
+  `driver_pipeline_probe` 0 failures (all 1024 elements correct),
+  `driver_semaphore_probe` 0 failures (binary chain and a timeline the GPU
+  drove to 42). That is the first full regression pass recorded against
+  Mesa 26.3.0-devel rather than against whatever the previous build was, so
+  it doubles as the baseline for the next rebase.
 - **`vm_create`/`vm_bind`** — no decision was outstanding. It had already
   been made and implemented (force `PAN_KMOD_VM_FLAG_AUTO_VA`, backend picks
   the address from the zone kbase accepts, PanVK adopts it); only the docs
