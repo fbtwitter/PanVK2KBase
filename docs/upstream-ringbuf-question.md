@@ -74,8 +74,21 @@ please confirm before I change shared code".
 
 ## The message
 
-Short form, for `#panfrost` (Matrix, bridged to OFTC IRC). The question is
-first on purpose — the rest only exists to show the constraint is real.
+Short form, for `#panfrost` — an **IRC channel on OFTC**, not a native
+Matrix room. Reachable either way:
+
+- IRC directly: `irc.oftc.net`, `#panfrost` (webchat at `webchat.oftc.net`)
+- Matrix, via the OFTC bridge: `#_oftc_#panfrost:matrix.org` — note the
+  `#_oftc_#` prefix; plain `#panfrost:matrix.org` does not exist
+
+**NickServ registration is required to speak in the channel** (anti-spam),
+so joining and pasting immediately will not work — register the nick first.
+That friction is worth weighing against filing a Mesa GitLab issue at
+`gitlab.freedesktop.org/mesa/mesa/-/issues` instead, which is async and
+citable but slower to get a design answer from.
+
+The question is first on purpose — the rest only exists to show the
+constraint is real.
 
 ```
 Hi — I'm porting PanVK to the legacy Arm kbase driver (Mali-G720, r49p1,
