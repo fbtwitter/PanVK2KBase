@@ -12,6 +12,53 @@ instead, which changes behaviour for panthor too.
 
 Status: **drafted, not yet sent.**
 
+Re-checked 2026-08-01 against the actual tree in `/opt/mesa-src`
+(**26.3.0-devel**), because sending stale line numbers upstream would be
+worse than not asking. Three things changed the question:
+
+1. **The function moved.** `init_render_desc_ringbuf()` now lives in
+   `csf/panvk_vX_gpu_queue.c`, not `panvk_vX_queue.c`. All five
+   `panvk_vX_cmd_draw.c` line references below still resolve correctly
+   (`:1199`, `:1208`, `:1632`, `:4005`, `:4108`) — verified individually.
+
+2. **The double mapping has a documented reason, and the earlier draft
+   asked as if it might not.** Directly above the VA reservation:
+
+   ```c
+   /* We choose the alignment to guarantee that we won't ever cross a 4G
+    * boundary when accessing the mapping. This way we can encode the
+    * wraparound using 32-bit operations. */
+   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap,
+                             ringbuf->size * 2, ringbuf->size * 2);
+   ```
+
+   `cs_render_desc_ringbuf_move_ptr()` confirms the dependency: it
+   increments and wraps `ptr_lo`, the **low 32 bits** of the 64-bit
+   address, and never touches the high word. That only works while the
+   whole window stays inside one 4G span.
+
+   Note this is two separate design decisions wearing one number:
+   the 2x *reservation* buys contiguity for reads that straddle the end,
+   the 2x *alignment* buys the 32-bit arithmetic. Tail-padding removes
+   the need for the first but not the second — a padded ring still wants
+   alignment so `move_ptr` can stay 32-bit, just `size` rather than
+   `size * 2`.
+
+3. **Upstream already runs this with a single mapping.** In tracing mode
+   only the first `vm_op` is submitted:
+
+   ```c
+   /* If tracing is enabled, we keep the second part of the mapping
+    * unmapped to serve as a guard region. */
+   ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE,
+                          vm_ops, tracing_enabled ? 1 : ARRAY_SIZE(vm_ops));
+   ```
+
+   and `:1208` passes `wrap_around = !tracing_enabled`, so the wrap is
+   already a parameter that is already sometimes false. That is a much
+   better thing to build on than a new kbase-only branch, and it means
+   the ask is "extend an existing mode", not "add a special case".
+
 Sharpened 2026-07-31, after disassembling a rejected command stream. The
 earlier draft asked this from a weaker position — it implied the ringbuf
 blocked bringing up the render subqueues at all. It does not. All three
@@ -39,7 +86,7 @@ SYNC_SET64 into BASE_MEM_CSF_EVENT memory (kbase has no fences, so that's the
 completion primitive). All three subqueue contexts initialise and run.
 
 The one thing left is init_render_desc_ringbuf(), and I'd rather ask than
-guess, because the fix I can see touches shared code.
+guess, because the change I can see touches shared code.
 
 It maps one BO at dev_addr and again at dev_addr + size. kbase can't express
 that. KBASE_IOCTL_MEM_ALIAS composes the region correctly (entries do share
@@ -48,7 +95,8 @@ no GPU mapping until userspace mmaps the cookie — and kbase_context_mmap()
 rejects nr_pages > stride, so a mapping can never cover both windows. Since
 the GPU address is assigned at mmap time, the GPU can only ever address one
 window. I tried stride = full span and a BASE_MEM_FIXABLE source; both still
-come back NEED_MMAP.
+come back NEED_MMAP. Measurements and the kernel-side reasoning are written
+up if useful.
 
 To be precise about what this does and doesn't block, since I had it wrong
 myself at first: it isn't the render subqueues. Those come up fine — what an
@@ -58,24 +106,33 @@ every subqueue whether the app drew anything or not. render.desc_ringbuf is
 the only field that needs the double mapping, and only draw work reads it.
 So this is a rendering blocker, not a bring-up blocker.
 
-Reading the consumers, the pointer wraparound is already handled in the CS by
-cs_render_desc_ringbuf_move_ptr(). What the second mapping seems to buy is
-letting a single allocation straddle the end — panvk_vX_cmd_draw.c:1632 does
-address arithmetic past desc_ringbuf.ptr to reach the FBDs, so a split block
-would break.
+I think I understand what the two mappings buy, and I don't want to break
+either property:
 
-So: was the double mapping chosen over tail-padding (skip to offset 0 when a
-block would straddle) for a reason, or just because the VA was free on
-panthor?
+ - contiguity, so a block straddling the end stays addressable —
+   cmd_draw.c:1632 does address arithmetic past desc_ringbuf.ptr to reach
+   the FBDs, so a split block would break;
+ - and, from the alignment comment, keeping the window inside one 4G span
+   so move_ptr() can wrap ptr_lo with 32-bit ops.
 
-If tail-padding is acceptable I'm happy to write it. It'd drop the 2x VA
-reservation for panthor too. The wrinkle I can see is that producer and
-consumer both advance by calc_render_descs_size() independently, so the
-padding has to be accounted symmetrically on both sides or the ring leaks —
-I think putting the decision inside move_ptr() keeps them in lockstep, but
-if there's a reason that doesn't work I'd like to know before writing it.
+Tail-padding (skip to offset 0 when a block would straddle) drops the need
+for the first but keeps the second — it'd still want size-aligned VA, just
+not size*2.
 
-Happy to share the full measurements or the kernel-side reasoning if useful.
+What made me want to ask rather than just write it: tracing mode already
+runs this with a single mapping, submitting only vm_ops[0] and leaving the
+second half as a guard region, with wrap_around=false at :1208. So there is
+already a one-mapping configuration and the wrap is already a parameter.
+
+So: is tail-padding a reasonable thing to generalise that into, or is the
+double mapping load-bearing in a way I've missed? If it's reasonable I'm
+happy to write it — it'd drop the 2x VA reservation for panthor too.
+
+The wrinkle I can see is that producer and consumer both advance by
+calc_render_descs_size() independently, so padding has to be accounted
+symmetrically or the ring leaks. Putting the decision inside move_ptr()
+seems to keep them in lockstep, since the consumer retires in creation
+order, but that's the part I'd most like checked before writing it.
 ```
 
 ---
