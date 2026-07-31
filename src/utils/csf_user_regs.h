@@ -9,7 +9,7 @@
  * PAGE ORDER IS [doorbell][input][output], NOT [input][output][doorbell].
  * Measured on-device, 6/6 reproducible, by tests/user_io_probe: writing
  * CS_INSERT at page 1 + 0x00 and kicking makes page 2 + 0x00 advance to
- * the CS size ~50ms later without userspace touching it; doing the same at
+ * the CS size a few ms later without userspace touching it; doing the same at
  * page 0 changes nothing anywhere. Page 0 also survives across processes
  * while pages 1 and 2 come up freshly zeroed, which is what a shared HW
  * doorbell page vs. per-queue I/O blocks look like.

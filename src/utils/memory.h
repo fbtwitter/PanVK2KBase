@@ -23,9 +23,16 @@ struct kbase_bo {
 };
 
 /*
-    Function to create a Buffer Object
+    Function to create a Buffer Object, with extra allocation flags OR'd
+    into the usual CPU/GPU read-write set.
+
+    The only caller that needs this today is tests/event_slot_probe, which
+    passes BASE_MEM_CSF_EVENT to get memory the CSF firmware can signal
+    completion through - see docs/kbase-notes.md's "Finding 2". Pass 0 for
+    the historical behaviour.
 */
-struct kbase_bo *kbase_bo_create(int fd, size_t size) {
+struct kbase_bo *kbase_bo_create_flags(int fd, size_t size,
+                                       base_mem_alloc_flags extra_flags) {
   // initialize the allocation metadata object
   union kbase_ioctl_mem_alloc alloc = {0};
 
@@ -40,7 +47,8 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
   // set the allocation metadata input flags
   alloc.in.flags =
       BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | BASE_MEM_PROT_GPU_RD |
-      BASE_MEM_PROT_GPU_WR /*| BASE_MEM_COHERENT_SYSTEM | BASE_MEM_SAME_VA*/;
+      BASE_MEM_PROT_GPU_WR /*| BASE_MEM_COHERENT_SYSTEM | BASE_MEM_SAME_VA*/
+      | extra_flags;
 
   int ret = ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &alloc);
 
@@ -99,6 +107,13 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
 
   // return the constructed buffer object
   return bo;
+}
+
+/*
+    Function to create a Buffer Object
+*/
+struct kbase_bo *kbase_bo_create(int fd, size_t size) {
+  return kbase_bo_create_flags(fd, size, 0);
 }
 
 /*

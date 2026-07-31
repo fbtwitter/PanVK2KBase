@@ -143,6 +143,15 @@ user_io_probe: ./src/tests/user_io_probe/user_io_probe.c $(MESA_PACK_H)
 	  -o ./build/user_io_probe $< \
 	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
 
+# Gets a real completion signal out of the GPU: BASE_MEM_CSF_EVENT memory
+# plus a SYNC_SET64 emitted into the command stream. This is the mechanism
+# a non-DRM vk_sync has to be built on - see "Finding 2" in
+# docs/kbase-notes.md.
+event_slot_probe: ./src/tests/event_slot_probe/event_slot_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/event_slot_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
 # --- Phase 2: pan_kmod_kbase Mesa backend (see src/mesa/README.md) ---
 # The Mesa checkout is gitignored, so the backend source lives in this repo
 # and is synced into it. MESA_DIR/PAN_ARCH/KBASE_VERSION are shared with the

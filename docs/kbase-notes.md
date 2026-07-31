@@ -358,6 +358,14 @@ empirically not to block. Not yet tried against this device.
 
 ## poll()/read() on the kbase fd: mechanism untested, kick likely inert
 
+> **RETIRED — this section's conclusion is superseded.** `poll()` on the
+> kbase fd works fine and delivers a real `base_csf_notification`
+> (type 0, `BASE_CSF_NOTIFICATION_EVENT`); see "Finding 2" near the end of
+> this file. Two separate bugs made it look inert here: `CS_INSERT` was
+> being written to the wrong page, and the command stream never signalled
+> an event slot, so firmware had no reason to notify anyone. Kept for the
+> method, not the conclusion.
+
 `tests/event_probe/event_probe.c` follows up on the redirect above:
 `poll(fd, POLLIN, timeout)` at three points (before any group/queue
 setup, bound but not kicked, and after `CS_QUEUE_KICK`), reading a
@@ -681,7 +689,7 @@ candidate page in turn, each with a fresh group/queue, and diffs the whole
 | CS_INSERT written at | what changed in the 12KB mapping |
 |---|---|
 | page 0 (this repo's layout) | nothing, anywhere. 0 words. |
-| page 1 (Panfork's layout) | our own write, **plus page 2 + 0x00 advancing `0 -> 8` (= the CS size) ~50ms later, which userspace never wrote** |
+| page 1 (Panfork's layout) | our own write, **plus page 2 + 0x00 advancing `0 -> 8` (= the CS size) a few ms later, which userspace never wrote** |
 
 Two independent corroborations from the same probe:
 
@@ -718,6 +726,11 @@ With the two-line page-offset fix, and **nothing else changed**:
   *** CS_EXTRACT advanced to 8 after ~50ms - GPU CONSUMED the instruction ***
 ```
 
+(The "~50ms" there is `live_kick_probe`'s own 50ms poll interval, not a
+latency measurement. Measured at 1ms granularity by
+`tests/event_slot_probe`, the real figure is **2-4ms** from `KICK` to
+`CS_EXTRACT` advancing. Don't quote the 50ms as a performance number.)
+
 All three configs — nr 58 group create, `_1_6` (nr 42), and compute-only.
 So the following are now **withdrawn**, not merely unproven:
 
@@ -737,7 +750,7 @@ this repo's own userspace.
 answer, twice, because its 2s poll loop broke early: it tested
 `value >= cs_size` on every non-insert page, and page 0's stale value from
 a previous trial satisfied that immediately, so the snapshot diff ran at
-~0ms — before firmware's ~50ms response. Comparing against the post-BIND
+~0ms — before firmware had responded. Comparing against the post-BIND
 baseline instead of an absolute threshold fixed it. A negative result from
 a polling probe is worth re-checking against its own exit condition before
 being believed.
@@ -748,8 +761,8 @@ being believed.
 with the stream having finished by the time it is sampled, but not
 confirmed. No CSF notification arrives within 300ms of a consumed
 instruction either, which is expected: a bare `MOVE32` signals nothing.
-Getting a notification needs a CS that writes an event slot — see
-Finding 2.
+Getting a notification needs a CS that writes an event slot — which is
+now done, see the next section.
 
 ### Finding 2: the completion mechanism, which is not a fence at all
 
@@ -778,6 +791,60 @@ object in kbase to translate; you build one.
 Note this also means `live_kick_probe`'s single `MOVE32` could never
 signal anything even if it executed. A real submission needs a sync
 instruction targeting event memory.
+
+#### Confirmed end-to-end on-device: `tests/event_slot_probe`
+
+Both halves work, 8/8 reproducible runs, unprivileged `shell` user, no
+root. The probe allocates event memory, seeds a slot, encodes a CS that
+signals it, kicks, and watches both channels:
+
+```
+=== event memory (BASE_MEM_CSF_EVENT) ===
+flags=0x8340f   CPU_RD CPU_WR GPU_RD GPU_WR SAME_VA CACHED_CPU COHERENT_SYSTEM
+  event slot at gpu_va=0x7266e3e000 seeded: value=1 error=0
+
+=== encoding the CS ===
+  encoded 24 bytes (MOVE64 addr, MOVE64 val, SYNC_SET64 system)
+    [0] 0x0100007266e3e000
+    [1] 0x0102000000000002
+    [2] 0x3400000200000000
+
+=== channel 1: event memory ===
+  CS_EXTRACT: advanced within 2-3ms (=24, cs_size=24)
+  event slot: seeded 1, now 2 (error word 0)
+  *** GPU SIGNALLED THE EVENT SLOT within 2-3ms ***
+
+=== channel 2: base_csf_notification on the kbase fd ===
+  *** NOTIFICATION: type=0 (EVENT) ***
+```
+
+Points worth keeping:
+
+- **`BASE_MEM_CSF_EVENT` is accepted and changes the mapping.** Output
+  flags come back `0x8340f` — the kernel adds `CACHED_CPU` and
+  `COHERENT_SYSTEM` on top of what was asked for. That system coherence is
+  presumably why the CPU sees firmware's write without any explicit cache
+  maintenance; don't assume a plain BO would behave the same way.
+- **`SYNC_SET64` with `MALI_CS_SYNC_SCOPE_SYSTEM` is the right
+  instruction.** Address and value both have to be loaded into CS
+  registers first (`cs_move64_to`) — `SYNC_SET64` takes register indices,
+  not immediates. Panfork does the same with its `0x48`/`0x4a` pair
+  (`pan_cmdstream.c:3094`). Encoded via Mesa's `cs_builder.h`, so this is
+  not hand-rolled bytes.
+- **`poll()` on the kbase fd now fires**, returning
+  `base_csf_notification` type 0 (`BASE_CSF_NOTIFICATION_EVENT`). This
+  retires the "poll()/read() on the kbase fd: mechanism untested" section
+  above — the channel was always fine; nothing had ever given firmware a
+  reason to notify. So a `vk_sync` can **block** rather than spin.
+- **Latency is 2-4ms** from `KICK` to both the slot write and
+  `CS_EXTRACT` advancing, measured at 1ms polling granularity.
+
+What this does *not* yet cover: multiple slots in one event page (Panfork
+packs them at `PAN_EVENT_SIZE` = 16 bytes, value word + error word, and
+tracks a per-slot seqnum); the "Higher" wait condition and `SYNC_WAIT` for
+GPU-side waits; and error propagation through the error word. Those are
+implementation detail for the real `vk_sync`, not open questions about the
+mechanism.
 
 ## Where to ask
 

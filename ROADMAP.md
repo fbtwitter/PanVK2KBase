@@ -160,12 +160,24 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       backend does. Needs a `vk_sync` type backed by whatever kbase
       offers — which loops back to the unsolved completion-mechanism
       question in `docs/kbase-notes.md`.
-      **Design answer found in Panfork:** there is no kbase fence object
-      to translate. Panfork builds its own syncobj over GPU-visible event
-      memory allocated with `BASE_MEM_CSF_EVENT` (a flag this repo has
-      never set), signalled by the command stream itself and waited on via
-      `base_csf_notification` reads off the kbase fd. Same answer serves
-      Phase 4's fence-shim item. See "Finding 2" in `docs/kbase-notes.md`.
+      **Mechanism found in Panfork and now demonstrated on-device.** There
+      is no kbase fence object to translate — you build one over
+      GPU-visible event memory allocated with `BASE_MEM_CSF_EVENT` (a flag
+      this repo had never set), signalled by the command stream itself.
+      `tests/event_slot_probe` does the whole loop, 8/8 reproducible, no
+      root: alloc + seed a slot, encode `MOVE64`/`MOVE64`/`SYNC_SET64`
+      (system scope) with Mesa's `cs_builder.h`, `KICK`, and observe
+      **both** the slot going `1 -> 2` and a real
+      `base_csf_notification` type 0 (`BASE_CSF_NOTIFICATION_EVENT`)
+      arriving on `poll()`. 2-4ms end to end. So `vk_sync` can block
+      rather than spin. See "Finding 2" in `docs/kbase-notes.md` for the
+      encoding details and the flags kbase adds
+      (`CACHED_CPU`/`COHERENT_SYSTEM`).
+      What remains for this checkbox is writing the actual `vk_sync` type
+      against that mechanism and wiring it into
+      `get_device_sync_types()` in place of
+      `vk_drm_syncobj_get_type(dev->fd)` — the mechanism question is
+      closed, the Mesa-side implementation is not.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),
@@ -204,15 +216,26 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       mapped (commented out in the source) or read back. Still open:
       confirming actual GPU-side completion.
       **Update:** the doorbell/ring-buffer mmap is now wired up (3 pages
-      — `BASEP_QUEUE_NR_MMAP_USER_PAGES`: input/output/HW-doorbell — per
-      `csf/mali_base_csf_kernel.h`) and confirmed mapping successfully
+      — `BASEP_QUEUE_NR_MMAP_USER_PAGES`, ordered
+      HW-doorbell/input/output, measured — see `utils/csf_user_regs.h`)
+      and confirmed mapping successfully
       on-device. Full teardown (`CS_QUEUE_TERMINATE` →
       `CS_QUEUE_GROUP_TERMINATE` → `kbase_bo_free`) also confirmed clean,
       no failed ioctls. Still doesn't prove GPU execution completed —
       just that the whole submit/bind/kick/teardown lifecycle round-trips
       without kernel-side rejection.
-- [ ] Confirm the completion/fence signaling mechanism kbase exposes for
-      a submitted queue — r49p1 (MediaTek fork) adds
+- [x] Confirm the completion/fence signaling mechanism kbase exposes for
+      a submitted queue.
+      **ANSWERED — it is GPU-visible event memory, not a fence.** Allocate
+      with `BASE_MEM_CSF_EVENT`, seed a slot, have the command stream
+      write it with `SYNC_SET64` at system scope. Userspace either polls
+      the slot or blocks on `poll()` for a `base_csf_notification`. Both
+      confirmed working on-device by `tests/event_slot_probe`, 8/8 runs,
+      no root, 2-4ms end to end. The rest of this item is the trail of
+      dead ends that got there — kept because two of them are things not
+      to retry. See "Finding 2" in `docs/kbase-notes.md` for the working
+      version.
+      Original note: r49p1 (MediaTek fork) adds
       `KBASE_IOCTL_INTERNAL_FENCE_WAIT` under `CONFIG_MALI_MTK_DEBUG_DUMP`/
       `CONFIG_MALI_MTK_FENCE_DEBUG` that r44p0 doesn't have; worth
       checking whether that's usable before designing a generic shim
@@ -294,13 +317,13 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `tests/user_io_probe` writes `CS_INSERT` at each candidate page with
       a fresh group each time and diffs the whole 12KB mapping. 6/6 runs:
       page 0 changes nothing anywhere; page 1 makes page 2 + 0x00 advance
-      to the CS size ~50ms later, unwritten by userspace. Corroborated by
+      to the CS size a few ms later, unwritten by userspace. Corroborated by
       page 0 persisting across processes while pages 1 and 2 come up
       freshly zeroed.
       After the two-line offset fix and nothing else,
       `live_kick_probe` reports **3 of 3 configs actually executed on the
       GPU** (nr 58, `_1_6`/nr 42, and compute-only), `CS_EXTRACT`
-      advancing to 8 after ~50ms in each.
+      advancing to 8 in each.
       **Withdrawn as a result:** the CSG-slot theory, the
       `kbase_csf_mcu_shared_group_bind_csg_reg()` MCU-shared-region
       hypothesis, and the claim that this was blocked on root. None of the
