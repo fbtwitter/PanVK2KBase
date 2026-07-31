@@ -10,7 +10,13 @@ before writing (see Phase 9 in `ROADMAP.md`).
 The fallback is to stop relying on the mapping to wrap and skip the tail
 instead, which changes behaviour for panthor too.
 
-Status: **drafted, not yet sent.**
+Status: **sent** (2026-08-01, as a Mesa GitLab issue). This line said
+"drafted, not yet sent" for a while after it no longer was — caught during
+the 2026-08-01 docs audit; see `ROADMAP.md` Phase 9 for the actual
+send date. Two companion questions exist:
+`docs/upstream-import-question.md` (a smaller, related technical ask) and
+`docs/upstream-project-status-question.md` (the broader "is kbase support
+wanted upstream at all" question this one deliberately doesn't ask).
 
 Re-checked 2026-08-01 against the actual tree in `/opt/mesa-src`
 (**26.3.0-devel**), because sending stale line numbers upstream would be

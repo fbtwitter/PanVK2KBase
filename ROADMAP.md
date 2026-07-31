@@ -1063,6 +1063,10 @@ Tools worth knowing about before touching any of this:
       neither question makes on its own and which is the thing that would
       actually answer "is kbase wanted upstream at all" rather than
       settling one design question at a time.
+      **That framing is now drafted:** `docs/upstream-project-status-
+      question.md`. Sent after the other two, deliberately — it reads as
+      a status report with two live questions attached rather than a cold
+      introduction.
 - [ ] If accepted, land behind an env var gate (precedent:
       `PAN_USE_KRAID=1` for the new shader compiler), small reviewable
       MRs per phase, not one large dump.

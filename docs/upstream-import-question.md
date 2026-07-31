@@ -11,6 +11,10 @@ backend can never be reached — even though kbase itself can import dma-bufs
 perfectly well.
 
 Status: **drafted, not sent.** Scoped 2026-08-01 against Mesa 26.3.0-devel.
+A third, broader question also exists —
+`docs/upstream-project-status-question.md`, asking whether kbase support
+is wanted upstream at all — intended to be sent after both technical
+questions, not before.
 
 Unlike the ringbuf question this one has an obvious shape of answer, so it is
 phrased as a proposal with a fallback rather than an open question. It is
