@@ -1,8 +1,15 @@
 # Roadmap
 
-Checkboxes are for tracking your own progress — nothing past Phase 1 is
-done yet. Phases are ordered by dependency, not by how interesting they
-are; resist the urge to jump to Phase 3.
+Checkboxes are for tracking your own progress. **This line used to say
+"nothing past Phase 1 is done yet" — stale since well before this update;
+Phases 2–3 are done and Phase 4 (compute, semaphores, tiler heap) works
+end to end on real hardware.** See "Where this actually is" below Phase 4
+for the honest current line, and Phase 9 for what has already gone
+upstream. Phases are ordered by dependency, not by how interesting they
+are; resist the urge to jump to Phase 3 — though at this point the risk
+runs the other way: check the code before assuming an item marked open
+still is. Three were found stale in one afternoon (2026-08-01): the tiler
+heap, the kbase queue integration decision, and `vm_bind`.
 
 Adapted from a companion scaffold repo's roadmap to match this repo's
 actual progress: this project already has a real vendored kbase UAPI
@@ -537,27 +544,21 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `vkCreateDevice` succeed on kbase requires a working
       submit-and-wait path, not just object creation — the whole of Phase
       4, in a 1511-line file with ~13 panthor/libdrm call sites.
-      **Groundwork landed:** `pan_kmod_kbase_group_create`/`_destroy` and
-      `_tiler_heap_create`/`_destroy` are now in the backend
-      (`src/mesa/pan_kmod_kbase.{c,h}`), wrapping the exact ioctl
-      sequences `tests/queue_group` and `tests/live_kick_probe` already
-      run on hardware. They compile into the driver but **nothing calls
-      them yet**, so they are unproven in this form.
-      **Three ways to integrate, and the choice matters:**
-      (a) a sibling `panvk_vX_kbase_queue.c` selected at queue-creation
-      time — cleanest to read and closest to how a `tu_knl_kgsl.cc`-style
-      backend is structured, but duplicates a lot of non-ioctl logic that
-      would then drift from upstream;
-      (b) patch the ~13 call sites in `panvk_vX_gpu_queue.c` to dispatch
-      on `dev->ops == &kbase_kmod_ops` — smallest diff, keeps one copy of
-      the logic, but the patch script becomes large and fragile against
-      upstream movement;
-      (c) push submission into `pan_kmod_ops` as new vtable entries so
-      panthor and kbase are peers — the only option with an upstreaming
-      story (Phase 9), and the only one that needs agreement from
-      Panfrost maintainers before it is worth writing.
-      All the kbase-side primitives are proven; this is an integration
-      decision, not a hardware unknown.
+      **Decided and built — this entry was stale.** Re-checked
+      2026-08-01: the three integration options below were weighed while
+      `pan_kmod_kbase_group_create`/`_destroy` and `_tiler_heap_create`/
+      `_destroy` sat uncalled, which was true when this was written and
+      has not been true for a while. Option (a) was chosen —
+      `src/mesa/panvk_vX_kbase_queue.c`, 1294 lines, 7
+      `panvk_per_arch(...)` entry points including
+      `create_kbase_queue`/`kbase_create_tiler_heap` — and
+      `patch-panvk-kbase-subqueue-init.py` dispatches to it from
+      `panvk_vX_gpu_queue.c` on `is_kbase` at every site that mattered
+      (group create, tiler init, per-subqueue init, teardown). Kept below
+      for the reasoning, since (b) and (c) are still the right shape of
+      argument for *future* integration points — the render ringbuf fix
+      and the dma-buf import hook are exactly the "needs Panfrost
+      agreement" case (c) describes.
 - [ ] ~~Real VA management is required~~ — superseded by the two items
       above. Kept for the reasoning: kbase supports it: the vendored headers
       define `BASE_MEM_FIXED` (`csf/mali_base_csf_kernel.h:34`) and
@@ -587,12 +588,14 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       (3) `ENOMEM` means "address unavailable" (outside the zone, or
       already allocated) while `EINVAL` means "wrong mode" — do not read
       `EINVAL` as unsupported.
-- [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
-      (dma-buf, Phase 3 — and blocked above the backend too, since the
-      common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),
-      `vm_create`/`vm_destroy`/`vm_bind` (kbase has no explicit VM
-      object — needs a design decision, see `src/mesa/README.md`), and
-      `bo_wait` (blocked on the unsolved fence mechanism).
+- [x] / [ ] The three ops left stubbed when this phase was written have
+      each been resolved since — this entry was stale, duplicating (and
+      predating) Phase 3's accurate version below. `vm_create` /
+      `vm_destroy` / `vm_bind` are **done** — see `src/mesa/README.md` for
+      the `AUTO_VA` design. `bo_import` / `bo_export` are **scoped, not
+      done** — import needs a shared-code change, export is not possible on
+      kbase at all — see Phase 3 and `docs/upstream-import-question.md`.
+      `bo_wait` remains genuinely blocked on the unsolved fence mechanism.
 
 ## Phase 3 — Memory management
 - [x] BO create through kbase's mem-alloc ioctl —
@@ -1048,10 +1051,18 @@ Tools worth knowing about before touching any of this:
       Panfork doing the identical thing. Not PanVK, but it establishes the
       pattern for how these should be argued: evidence attached, claim
       narrow.
-- [ ] Raise the project on #panfrost (Matrix/IRC) or mesa-dev BEFORE
-      you're deep into Phase 4. Kbase is not currently a stated upstream
-      priority (Panthor/Tyr are) — find out early whether this would be
-      accepted upstream or needs to live as a maintained fork.
+- [ ] **The "BEFORE you're deep into Phase 4" condition is moot — that
+      already happened, the other way round.** Re-checked 2026-08-01: two
+      concrete technical questions went out instead of a general
+      project heads-up (the ringbuf, `docs/upstream-ringbuf-question.md`;
+      the import hook, `docs/upstream-import-question.md`), after Phase 4
+      compute was already working. That was not a considered choice to
+      skip this step — it is what "ask about the specific thing you're
+      stuck on" naturally produced. Still outstanding: a broader "here is
+      what this project is and here is what's blocking it" framing, which
+      neither question makes on its own and which is the thing that would
+      actually answer "is kbase wanted upstream at all" rather than
+      settling one design question at a time.
 - [ ] If accepted, land behind an env var gate (precedent:
       `PAN_USE_KRAID=1` for the new shader compiler), small reviewable
       MRs per phase, not one large dump.
