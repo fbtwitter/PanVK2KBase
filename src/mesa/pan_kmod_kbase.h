@@ -217,8 +217,7 @@ void pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
  * ------------------------------------------------------------------ */
 
 /**
- * pan_kmod_kbase_queue_kick() - Publish work on a bound queue and ring it.
- * @dev: kbase device.
+ * pan_kmod_kbase_queue_publish_insert() - Make written bytes visible.
  * @cs: A queue from pan_kmod_kbase_queue_create().
  * @insert: New value for CS_INSERT.
  *
@@ -229,6 +228,25 @@ void pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
  * bytes into @cs->ringbuf_cpu before calling; this publishes them with a
  * barrier, matching the dmb(osh) the kernel does before ringing doorbells.
  *
+ * Separate from the kick because on this hardware the two are genuinely
+ * separate operations, and which one is needed depends on what the CS is
+ * doing. A CS that is still executing re-reads CS_INSERT on its own when it
+ * reaches the end of what it knew about, so publishing is sufficient and a
+ * kick is not needed at all. A CS that has caught up has stopped looking,
+ * and only a kick will restart it. tests/kick_pipeline_probe measures both
+ * halves of that.
+ */
+void pan_kmod_kbase_queue_publish_insert(const struct pan_kmod_kbase_cs *cs,
+                                         uint64_t insert);
+
+/**
+ * pan_kmod_kbase_queue_kick() - Ask the kernel to restart a stopped queue.
+ * @dev: kbase device.
+ * @cs: A queue from pan_kmod_kbase_queue_create().
+ *
+ * Only meaningful after pan_kmod_kbase_queue_publish_insert(); this rings
+ * the queue, it does not publish anything.
+ *
  * Returning 0 means the kernel accepted the kick, which is *not* the same
  * as the GPU having run anything - the KICK handler only flags the queue
  * and wakes the scheduler kthread, which rings the real hardware doorbell
@@ -237,11 +255,15 @@ void pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
  * phantom (see docs/kbase-notes.md). Use pan_kmod_kbase_queue_extract() or
  * an event slot to find out what actually happened.
  *
+ * That asynchrony has a measured cost: a kick on a queue whose CS is not
+ * idle takes effect on the scheduler's next tick, ~10ms away, rather than
+ * promptly. Kicking only when there is no alternative is therefore worth
+ * real throughput, which is what the split above is for.
+ *
  * Return: 0 on success, -1 on failure.
  */
 int pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
-                              const struct pan_kmod_kbase_cs *cs,
-                              uint64_t insert);
+                              const struct pan_kmod_kbase_cs *cs);
 
 /**
  * pan_kmod_kbase_queue_extract() - How much of the stream the GPU consumed.

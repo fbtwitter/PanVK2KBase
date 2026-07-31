@@ -838,12 +838,25 @@ submits, and a timeline reaches exactly the value a submit asked for
 The wait itself is still on the CPU: the submitting thread blocks until the
 slot reaches its value, rather than a `SYNC_WAIT64` blocking the GPU. That
 satisfies the feature's contract and is deliberately as far as it goes — see
-`docs/kbase-notes.md`. A stream parked in `SYNC_WAIT64` would hold
-`CS_ACTIVE`, and submission here kicks anyway 100ms after giving up on an
-idle CS, so a real GPU-side wait would let the next submit overwrite a ring
-the GPU is still running. **Serialisation has to be fixed first** — tracking
-consumption via `CS_EXTRACT` instead of requiring idleness — and it is now
-load-bearing for correctness, not just throughput.
+`docs/kbase-notes.md`.
+
+**Submission no longer kicks unconditionally.** A CS that is still executing
+re-reads `CS_INSERT` on its own, so work appended to a busy queue runs with
+no kick at all; only a queue that has caught up needs one. Back-to-back
+submits went from 0.39 to 0.36 ms each. The much larger number underneath it
+is that a submit arriving at an *idle* GPU costs ~12ms, because the kick has
+to wait for `CS_ACTIVE` to clear, and that is wake-up latency no submit-path
+change removes — `driver_compute_probe --fill --loop=300` is unchanged at
+~22ms per submit. An application that waits for a fence between every submit
+pays that every time; one that keeps work in flight never pays it.
+
+Two things fell out of measuring this, both in `docs/kbase-notes.md`:
+`CS_EXTRACT` is a completion signal on this device rather than a progress
+one, so ring occupancy is only knowable at stream granularity; and removing
+the pre-kick wait entirely still breaks the driver — reproducibly losing the
+compute subqueue's stream — even though a standalone probe cannot reproduce
+the rule that wait is built on. That disagreement is unexplained and is the
+open question in this area.
 
 **Compute works. Rendering does not, and the one thing blocking it is the
 render descriptor ringbuf** — `init_render_desc_ringbuf()` maps one BO at

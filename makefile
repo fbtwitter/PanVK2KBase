@@ -106,6 +106,11 @@ driver_compute_probe: ./src/tests/driver_compute_probe/driver_compute_probe.c
 # constants, vkCmdDispatch. driver_compute_probe --fill only reaches PanVK's
 # own precompiled shaders, so this is the first thing to drive SPIR-V through
 # the driver's own compiler.
+#
+# --burst=N additionally submits N times back to back with a single fence at
+# the end. That is the only workload here that can show whether submits
+# overlap - every other probe waits per submit, which serialises the queue
+# from the application side and hides what the driver does.
 driver_pipeline_probe: ./src/tests/driver_pipeline_probe/driver_pipeline_probe.c
 	$(CC) $(CFLAGS) -I./src/tests/driver_pipeline_probe -o ./build/driver_pipeline_probe $<
 
@@ -204,6 +209,15 @@ cs_encode_probe: ./src/tests/cs_encode_probe/cs_encode_probe.c $(MESA_PACK_H)
 live_kick_probe: ./src/tests/live_kick_probe/live_kick_probe.c $(MESA_PACK_H)
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
 	  -o ./build/live_kick_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
+# Can a CS pick up ring appends made while it is still executing? The rule
+# that a kick only lands on an idle CS was measured in a state where the
+# stream had already finished; this separates that from a CS genuinely
+# mid-execution, which is what decides whether submissions can overlap.
+kick_pipeline_probe: ./src/tests/kick_pipeline_probe/kick_pipeline_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/kick_pipeline_probe $< \
 	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
 
 # Determines empirically which of CS_QUEUE_BIND's 3 mmap'd pages is

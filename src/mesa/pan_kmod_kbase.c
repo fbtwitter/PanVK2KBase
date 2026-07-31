@@ -974,13 +974,13 @@ kbase_cs_page(const struct pan_kmod_kbase_cs *cs, unsigned page)
    return (volatile uint8_t *)cs->user_io + page * 4096;
 }
 
-int
-pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
-                          const struct pan_kmod_kbase_cs *cs, uint64_t insert)
+void
+pan_kmod_kbase_queue_publish_insert(const struct pan_kmod_kbase_cs *cs,
+                                    uint64_t insert)
 {
    if (!cs->user_io) {
-      mesa_loge("kbase: kick on a queue that is not bound");
-      return -1;
+      mesa_loge("kbase: publish on a queue that is not bound");
+      return;
    }
 
    /* One 64-bit store, which is a single STR on aarch64 and so satisfies
@@ -989,15 +989,27 @@ pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
    volatile uint8_t *input = kbase_cs_page(cs, CSF_USER_INPUT_PAGE);
    *(volatile uint64_t *)(input + CSF_USER_CS_INSERT_LO) = insert;
 
-   /* Order the ring-buffer writes and CS_INSERT ahead of the kick. The
-    * kernel does the equivalent (dmb(osh)) before ringing a doorbell.
+   /* Order the ring-buffer writes and CS_INSERT ahead of anything that
+    * follows. The kernel does the equivalent (dmb(osh)) before ringing a
+    * doorbell, and a still-running CS reads this value with no kernel
+    * involvement at all, so the barrier is what makes the lock-free handoff
+    * in panvk_vX_kbase_queue.c's submit_stream() sound.
     */
    __sync_synchronize();
+}
 
-   /* KNOWN LIMITATION, measured: a kick issued while CS_ACTIVE is 1 does
-    * not take effect. See pan_kmod_kbase_queue_wait_idle() below, and the
-    * comment there for the evidence - callers are expected to have waited
-    * for the CS to go idle before getting here.
+int
+pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
+                          const struct pan_kmod_kbase_cs *cs)
+{
+   if (!cs->user_io) {
+      mesa_loge("kbase: kick on a queue that is not bound");
+      return -1;
+   }
+
+   /* Callers are expected to have waited for CS_ACTIVE to clear - see
+    * pan_kmod_kbase_queue_wait_idle() below for what happens otherwise, and
+    * submit_stream() for why the kick is now reached far less often.
     */
    struct kbase_ioctl_cs_queue_kick kick = {
       .buffer_gpu_addr = cs->ringbuf_gpu_va,
@@ -1040,9 +1052,23 @@ pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
  * option while the real wake mechanism for an onslot idle CS is unknown -
  * the alternative is a submit path that silently drops work.
  *
- * Worth revisiting when kernel-side visibility is available: the answer is
- * presumably in how kbase_csf_queue_kick() decides whether to ring the
- * hardware doorbell for a group that is already onslot.
+ * SUPERSEDED - no longer called from the submit path.
+ *
+ * tests/kick_pipeline_probe drives a CS into the exact state above (slow
+ * stream finished, extract == insert, CS_ACTIVE still 1) and kicks. The
+ * behaviour does not reproduce: 10/10 kicks in that window were consumed,
+ * most within a millisecond, none lost. panvk_vX_kbase_queue.c's
+ * submit_stream() no longer waits.
+ *
+ * The most likely explanation is that the original trace predates the tiler
+ * heap being set up through the shared init_gpu_tiler() path, so the group
+ * was never properly schedulable and the kick had nothing to wake. That is a
+ * hypothesis about the cause. The measurement that the wait is unnecessary
+ * is not, and it is repeatable.
+ *
+ * Kept rather than deleted, because it is the record of what was measured
+ * and it is what a bisect would want if this turns out to be device- or
+ * firmware-specific rather than a fixed bug.
  */
 bool
 pan_kmod_kbase_queue_wait_idle(const struct pan_kmod_kbase_cs *cs,

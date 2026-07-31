@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <vulkan/vulkan.h>
 
@@ -96,9 +97,23 @@ check(bool ok, const char *what)
 int
 main(int argc, char **argv)
 {
-   if (argc != 2) {
-      fprintf(stderr, "usage: %s <path-to-libvulkan_panfrost.so>\n", argv[0]);
+   if (argc < 2 || argc > 3) {
+      fprintf(stderr,
+              "usage: %s <path-to-libvulkan_panfrost.so> [--burst=N]\n",
+              argv[0]);
       return 2;
+   }
+
+   /* Optional: after the correctness check, submit N times back to back and
+    * wait once. Off by default because it measures rather than verifies.
+    */
+   uint32_t burst_count = 0;
+   if (argc == 3) {
+      if (strncmp(argv[2], "--burst=", 8)) {
+         fprintf(stderr, "unknown option: %s\n", argv[2]);
+         return 2;
+      }
+      burst_count = (uint32_t)strtoul(argv[2] + 8, NULL, 0);
    }
 
    /* Unbuffered - a submit path that hangs is a failure mode worth
@@ -466,6 +481,91 @@ main(int argc, char **argv)
          printf("  all %u elements hold i * %u\n", ELEM_COUNT, MULTIPLIER);
       }
       check(bad == 0, "dispatch wrote i * multiplier everywhere");
+   }
+
+   /* ------------------------------------------------------------- burst */
+   /* Submissions back to back, with no wait in between, which is the only
+    * shape that can show whether submits overlap. Every other probe here
+    * waits for a fence per submit, so the CS is always idle by the next one
+    * and the queue is serialised by the application rather than the driver.
+    *
+    * N separate vkQueueSubmit calls, not one call with N batches. Batches
+    * within a single call get merged by the runtime into one driver submit,
+    * which is a different thing entirely - it produces one ring stream with
+    * N CALLs in it and a single kick, and it silently blows past
+    * PANVK_KBASE_MAX_CALLS_PER_SUBQUEUE once N > 32.
+    */
+   if (r == VK_SUCCESS && burst_count > 0) {
+      printf("\n=== burst of %u submits, one wait at the end ===\n",
+             burst_count);
+
+      /* A second command buffer, recorded *without* ONE_TIME_SUBMIT so it
+       * can legally be submitted repeatedly.
+       */
+      VkCommandBuffer burst_cmdbuf = VK_NULL_HANDLE;
+      VkCommandBufferAllocateInfo bcbai = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool = pool,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = 1,
+      };
+      r = alloc_cmdbufs(device, &bcbai, &burst_cmdbuf);
+      check(r == VK_SUCCESS, "vkAllocateCommandBuffers (burst)");
+
+      /* SIMULTANEOUS_USE, because the same command buffer is deliberately in
+       * flight several times at once - that is the point of the burst.
+       */
+      VkCommandBufferBeginInfo bcbbi = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
+      };
+      begin_cmdbuf(burst_cmdbuf, &bcbbi);
+      cmd_bind_pipeline(burst_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        pipeline);
+      cmd_bind_dsets(burst_cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
+                     1, &dset, 0, NULL);
+      cmd_push(burst_cmdbuf, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+               sizeof(multiplier), &multiplier);
+      cmd_dispatch(burst_cmdbuf, WORKGROUPS, 1, 1);
+      r = end_cmdbuf(burst_cmdbuf);
+      check(r == VK_SUCCESS, "vkEndCommandBuffer (burst)");
+
+      VkSubmitInfo bsi = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .commandBufferCount = 1,
+         .pCommandBuffers = &burst_cmdbuf,
+      };
+
+      VkFence bfence = VK_NULL_HANDLE;
+      create_fence(device, &fci, NULL, &bfence);
+
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+
+      /* Fence only on the last one, so nothing waits in between. */
+      for (uint32_t i = 0; i < burst_count && r == VK_SUCCESS; i++)
+         r = queue_submit(queue, 1, &bsi,
+                          i + 1 == burst_count ? bfence : VK_NULL_HANDLE);
+
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      double submit_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                         (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+      check(r == VK_SUCCESS, "burst submitted");
+
+      if (r == VK_SUCCESS) {
+         r = wait_fences(device, 1, &bfence, VK_TRUE, 60000000000ull);
+         clock_gettime(CLOCK_MONOTONIC, &t1);
+
+         double total_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                           (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+         printf("  %u submits issued in %.1f ms (%.2f ms each)\n",
+                burst_count, submit_ms, submit_ms / burst_count);
+         printf("  all complete after %.1f ms (%.2f ms each)\n", total_ms,
+                total_ms / burst_count);
+         check(r == VK_SUCCESS, "burst completed");
+      }
+
+      destroy_fence(device, bfence, NULL);
    }
 
    destroy_fence(device, fence, NULL);

@@ -85,11 +85,33 @@
  *   wait loop in kbase_queue_submit() explains why it stops there, and what
  *   would have to change first.
  *
- *   KNOWN LIMITATION: submissions are serialised. A kick only lands on an
- *   idle CS, so every submit waits for CS_ACTIVE to clear first - see
- *   pan_kmod_kbase_queue_wait_idle() for the measurements behind that. This
- *   is now load-bearing for more than throughput: it is also what rules out
- *   GPU-side waits.
+ *   PARTLY FIXED: submissions are no longer unconditionally serialised.
+ *   Every submit used to wait for CS_ACTIVE to clear and then kick. It now
+ *   publishes CS_INSERT first and kicks only when the GPU may already have
+ *   caught up, because a CS that is still executing re-reads CS_INSERT by
+ *   itself - see submit_stream() for the rule and the measurements.
+ *
+ *   What that is worth, measured on the Poco X8 Pro:
+ *
+ *     back-to-back submits (tests/driver_pipeline_probe --burst=100):
+ *       0.36 ms per submit, against 0.39 ms for the old always-kick path.
+ *
+ *     one submit per fence wait (driver_compute_probe --fill --loop=300):
+ *       unchanged, ~22 ms per submit.
+ *
+ *   The second number is the honest limit here. When a submit arrives at an
+ *   idle GPU there is no alternative to kicking, and a kick costs a ~12ms
+ *   wait for CS_ACTIVE to clear. That is wake-up latency, not queueing, and
+ *   removing the wait does not remove it - it loses work instead. What was
+ *   tried and ruled out is recorded in docs/kbase-notes.md rather than
+ *   guessed at again.
+ *
+ *   Also learned, and load-bearing for anything built on top: CS_EXTRACT is
+ *   a completion signal on this device, not a progress one. It jumps from
+ *   the start of a stream to its end rather than advancing through it, so
+ *   ring occupancy is only known at stream granularity. Sound - it
+ *   over-estimates how full the ring is, never under-estimates - but "how
+ *   far through is the GPU" cannot be answered here.
  */
 
 #include "genxml/gen_macros.h"
@@ -378,6 +400,67 @@ submit_cs_overflow(void *cookie)
    return (struct cs_buffer){ 0 };
 }
 
+/* Override for how submit_stream() decides to kick, via
+ * PANVK_KBASE_KICK_MODE. The default is the measured behaviour; the others
+ * exist to make regressions in this area diagnosable on a shipped binary,
+ * because every failure here looks identical from the outside - a fence that
+ * never signals.
+ *
+ *   auto (default) - publish, then kick only if the GPU may have caught up.
+ *   always         - kick on every submit, waiting for idle first. The old
+ *                    behaviour. Correct but costs ~12ms per submit.
+ *   nowait         - kick when `auto` would, but skip the idle wait. Loses
+ *                    work; kept because it is the sharpest way to show that
+ *                    the wait is doing something.
+ *
+ * Two other strategies were tried and are recorded in docs/kbase-notes.md
+ * rather than here, because neither works and neither is worth carrying:
+ * re-kicking a stream that was not picked up (an immediate second kick is a
+ * no-op, which is what points at the kernel coalescing kicks per queue), and
+ * pacing kicks apart by a fixed delay (needs ~8ms to work, i.e. it is just a
+ * worse spelling of waiting).
+ */
+enum kbase_kick_mode {
+   KBASE_KICK_AUTO,
+   KBASE_KICK_ALWAYS,
+   KBASE_KICK_NOWAIT,
+};
+
+static enum kbase_kick_mode
+kbase_kick_mode(void)
+{
+   static int mode = -1;
+
+   if (mode < 0) {
+      const char *v = getenv("PANVK_KBASE_KICK_MODE");
+
+      if (v && !strcmp(v, "always"))
+         mode = KBASE_KICK_ALWAYS;
+      else if (v && !strcmp(v, "nowait"))
+         mode = KBASE_KICK_NOWAIT;
+      else
+         mode = KBASE_KICK_AUTO;
+   }
+
+   return mode;
+}
+
+/* PANVK_KBASE_KICK_LOG=1: log ring state either side of every kick. Costs a
+ * 2ms sleep per kick, so it is a diagnostic, not something to leave on.
+ */
+static bool
+kbase_kick_log_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0) {
+      const char *v = getenv("PANVK_KBASE_KICK_LOG");
+      enabled = v && *v && *v != '0';
+   }
+
+   return enabled;
+}
+
 /* Wait for the GPU to consume enough of the ring that `size` more bytes
  * fit. CS_EXTRACT is written by firmware, so this is a load, not an ioctl.
  *
@@ -402,13 +485,36 @@ wait_for_ring_space(struct panvk_device *dev,
 
    /* 2s, the same budget tests/live_kick_probe uses to decide a stream is
     * never going to run.
+    *
+    * This is also the one place a dropped kick could deadlock rather than
+    * merely delay. Everywhere else, work left sitting in the ring gets
+    * flushed by the next submit's kick - that is what the original
+    * kick-on-idle trace showed happening, where kick 3 ran kick 2's bytes.
+    * Here there is no next submit: this loop is what the next submit is
+    * waiting on. So if extract stops moving while the ring is full, re-kick
+    * before giving up.
+    *
+    * A redundant kick is harmless. CS_INSERT has not changed, so it tells
+    * firmware to look at a range it has already been told about.
     */
+   uint64_t last_extract = pan_kmod_kbase_queue_extract(cs);
+   unsigned stalled_ms = 0;
+
    for (unsigned i = 0; i < 2000; i++) {
       uint64_t extract = pan_kmod_kbase_queue_extract(cs);
 
       assert(queue->insert[subqueue] >= extract);
       if (cs->ringbuf_size - (queue->insert[subqueue] - extract) >= size)
          return VK_SUCCESS;
+
+      if (extract != last_extract) {
+         last_extract = extract;
+         stalled_ms = 0;
+      } else if (++stalled_ms >= 100) {
+         stalled_ms = 0;
+         /* CS_INSERT is already published; this only rings the queue. */
+         pan_kmod_kbase_queue_kick(dev->kmod.dev, cs);
+      }
 
       os_time_sleep(1000);
    }
@@ -457,22 +563,93 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
     * Timing out is not fatal - kick anyway and let the caller's own wait
     * report a stuck queue, which produces a better error than failing here
     * would.
+    *
+    * PANVK_KBASE_NO_KICK_WAIT=1 skips it. That exists because
+    * tests/kick_pipeline_probe cannot reproduce the rule this wait is built
+    * on - 10/10 kicks in the exact state the original trace captured were
+    * consumed - and yet removing the wait here still breaks the driver, with
+    * the fence simply never signalling. The probe and the driver disagree,
+    * so the switch is what lets them be compared on one binary rather than
+    * by rebuilding. Default stays on, because the driver's answer is the one
+    * that decides whether work runs.
     */
-   if (!pan_kmod_kbase_queue_wait_idle(cs, 100)) {
-      mesa_logw("kbase: subqueue %u still active before kick; "
-                "the submit may not take effect", subqueue);
+   /* Publish first, decide whether to kick second. That order is what makes
+    * this safe, and it is the whole fix.
+    *
+    * A CS that is still executing re-reads CS_INSERT when it reaches the end
+    * of what it already knew about, so work appended to a busy CS runs with
+    * no kick at all. A CS that has caught up has stopped looking, and only a
+    * kick restarts it - and that kick is expensive, because it takes effect
+    * on the kernel scheduler's next tick, ~10ms away, unless CS_ACTIVE has
+    * already cleared. tests/kick_pipeline_probe measures both halves: two
+    * 11.4ms streams complete in 19.0ms when the second is merely published,
+    * and an idle CS never picks up an unkicked append at all.
+    *
+    * So the kick is needed only when the GPU may already have caught up.
+    * With CS_INSERT published *before* extract is sampled, that test has no
+    * race in the direction that matters:
+    *
+    *   extract < old_insert - firmware has not yet reached the point where
+    *     it re-reads CS_INSERT. When it gets there it will read the value
+    *     already stored, which includes this stream. No kick needed, and
+    *     nothing can change that afterwards.
+    *
+    *   extract >= old_insert - firmware may have run out and stopped before
+    *     the store landed. Indistinguishable from "still running, just
+    *     further along", so kick. A redundant kick is a no-op.
+    *
+    * The failure mode this avoids is silent: a stream that is never kicked
+    * and never picked up sits in the ring, and the only symptom is a fence
+    * that does not signal.
+    */
+   const uint64_t old_insert = queue->insert[subqueue];
+
+   pan_kmod_kbase_queue_publish_insert(cs, old_insert + size);
+
+   const uint64_t extract = pan_kmod_kbase_queue_extract(cs);
+   const bool needs_kick =
+      kbase_kick_mode() == KBASE_KICK_ALWAYS || extract >= old_insert;
+
+   uint64_t wait_start = os_time_get_nano();
+
+   if (needs_kick) {
+      /* Only now is the idle wait worth paying for, and only on the CS being
+       * restarted. Under sustained load this branch is not taken at all.
+       */
+      if (kbase_kick_mode() != KBASE_KICK_NOWAIT &&
+          !pan_kmod_kbase_queue_wait_idle(cs, 100)) {
+         mesa_logw("kbase: subqueue %u still active before kick; "
+                   "the submit may not take effect", subqueue);
+      }
+
+      if (pan_kmod_kbase_queue_kick(dev->kmod.dev, cs)) {
+         return panvk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                             "kbase: failed to kick subqueue %u", subqueue);
+      }
    }
 
-   /* pan_kmod_kbase_queue_kick() barriers between these writes and the
-    * kick, so no explicit ordering is needed here.
-    */
-   if (pan_kmod_kbase_queue_kick(dev->kmod.dev, cs,
-                                 queue->insert[subqueue] + size)) {
-      return panvk_errorf(dev, VK_ERROR_DEVICE_LOST,
-                          "kbase: failed to kick subqueue %u", subqueue);
+   if (kbase_kick_log_enabled()) {
+      mesa_logi("kbase kick: sq=%u size=%u insert=%" PRIu64 " -> %" PRIu64
+                " extract=%" PRIu64 " active=%u kicked=%d waited=%" PRIu64
+                "us", subqueue, size, old_insert, old_insert + size, extract,
+                pan_kmod_kbase_queue_active(cs), needs_kick,
+                (os_time_get_nano() - wait_start) / 1000);
    }
 
    queue->insert[subqueue] += size;
+
+   /* Whether the kick actually took effect, sampled a moment later. A kick
+    * that returns 0 and does nothing is the failure mode this whole area
+    * exists around, and it is invisible without looking. The 2ms sleep makes
+    * this useless for timing, so it is behind its own switch.
+    */
+   if (getenv("PANVK_KBASE_KICK_LOG_AFTER")) {
+      os_time_sleep(2000);
+      mesa_logi("kbase kick: sq=%u after 2ms extract=%" PRIu64 " active=%u "
+                "(want extract %" PRIu64 ")",
+                subqueue, pan_kmod_kbase_queue_extract(cs),
+                pan_kmod_kbase_queue_active(cs), queue->insert[subqueue]);
+   }
 
    return VK_SUCCESS;
 }
@@ -970,15 +1147,18 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
     * advertised - see the SCOPE note in panvk_kbase_sync.c.
     *
     * The obvious better thing is a SYNC_WAIT64 in the ring stream, letting
-    * the GPU block instead of a thread. Not done, and not merely unfinished:
-    * it is unsafe against the serialisation below it. A kick only lands on
-    * an idle CS, so every submit first waits for CS_ACTIVE to clear, and
-    * gives up after 100ms and kicks anyway. A stream parked in SYNC_WAIT64
-    * holds CS_ACTIVE for as long as the wait lasts, so the next submit would
-    * time out and then write into a ring the GPU is still executing. Doing
-    * GPU-side waits properly means fixing that first - tracking ring
-    * consumption via CS_EXTRACT instead of requiring idleness - and until
-    * then the CPU wait is strictly the safer of the two.
+    * the GPU block instead of a thread. Still not done, but the reason has
+    * changed. It used to be unsafe: submits waited for CS_ACTIVE to clear
+    * and then kicked anyway after 100ms, so a stream parked in SYNC_WAIT64
+    * would have had the next submit write into a ring the GPU was still
+    * reading. That wait is gone (see submit_stream()), so the hazard is too.
+    *
+    * What remains is that a parked stream still occupies the ring, and
+    * CS_EXTRACT only moves when a stream completes - so a stream waiting on
+    * a sync that has not been signalled holds its bytes indefinitely, and
+    * wait_for_ring_space() would eventually fail a later submit that had
+    * nothing wrong with it. Making GPU-side waits worthwhile means bounding
+    * that, which is a real design question rather than a missing call.
     *
     * Bounded, not UINT64_MAX. An unbounded wait on a slot the GPU will never
     * write - a faulted group, a stream that never ran - hangs the
@@ -1026,6 +1206,7 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
       if (result != VK_SUCCESS)
          return result;
    }
+
 
    return VK_SUCCESS;
 }

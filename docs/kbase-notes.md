@@ -1309,3 +1309,105 @@ Not checked, deliberately: that the second submit's work happens after the
 first's. Submission is serialised anyway, so that would hold with the
 semaphore removed entirely, and a test that passes for the wrong reason is
 worse than no test.
+
+## Kicks, CS_INSERT and the cost of waking an idle GPU
+
+Revisits "A kick only lands on an idle CS" above, which was the basis for
+waiting on `CS_ACTIVE` before every kick and therefore for serialising every
+submission. That rule is roughly right about *when* a kick is needed and
+badly wrong about *why*, and the difference is worth about 50x on
+back-to-back submits.
+
+All of this is `tests/kick_pipeline_probe` unless stated. It drives one bound
+queue with a deliberately slow stream - a long run of synchronous
+`FLUSH_CACHE2`, chosen because it is slow for a reason the hardware cannot
+optimise away and because it always terminates, so nothing here can park a CS.
+
+### CS_EXTRACT reports completion, not progress
+
+Sample `CS_EXTRACT` every 200us through an 11.4ms stream and you see **one**
+distinct value: it jumps from the start of the stream to its end. It does not
+advance through it.
+
+This matters beyond the kick question. Ring occupancy is only knowable at
+stream granularity, so `wait_for_ring_space()` over-estimates how full the
+ring is - safe, but it cannot be made precise. It also means "is the GPU
+mid-stream" cannot be answered by watching `CS_EXTRACT`, which is why the
+experiments below are timed rather than sampled.
+
+### A running CS re-reads CS_INSERT; an idle one does not
+
+The decisive pair of measurements.
+
+| what | result |
+|---|---|
+| publish a second stream while the first is running, **no kick** | both done in **19.0 ms** (one stream = 11.4 ms) |
+| publish a stream to an **idle** CS, **no kick** | never consumed, 3s timeout |
+
+So firmware re-reads `CS_INSERT` when it reaches the end of what it already
+knew about. Appending to a busy CS needs no kick at all - and 19.0ms for two
+11.4ms streams means it did not even pay a round trip in between. An idle CS
+has stopped looking, and only a kick restarts it.
+
+That is the rule the submit path now implements: publish first, then kick
+only if `CS_EXTRACT >= ` the pre-append `CS_INSERT`. Publishing before
+sampling is what makes it race-free in the direction that matters - if
+firmware has not yet reached the old insert point, the new value is already
+stored and it will read it.
+
+### The linger rule does not reproduce, but removing the wait still breaks it
+
+Driving a CS into the exact state the original trace captured - stream
+finished, `extract == insert`, `CS_ACTIVE` still 1 - and kicking: **10/10
+consumed, most within 1.5ms.** The rule as written does not reproduce.
+
+And yet removing the wait from the driver reproducibly breaks it, with three
+subqueues publishing cleanly and the **compute** one - the one carrying the
+`SYNC_SET64`s - silently not running, so the fence never signals. The probe
+uses one CS; the driver uses three in one group. That difference is not
+explained, and is the honest open question here.
+
+Ruled out, with `PANVK_KBASE_KICK_MODE` on a shipped binary:
+
+- **Re-kicking a stream that was not picked up.** An immediate second kick is
+  a no-op. This is the strongest hint at the mechanism: `kbase_csf_queue_kick()`
+  only queues the queue for the scheduler worker `if
+  (list_empty(&queue->pending_kick_link))`, so a kick that is already pending
+  swallows the next one.
+- **Pacing kicks apart by a fixed delay.** Needs ~8ms to work; fails at 2ms.
+  So it is not a rapid-fire race between the three CSs - it is just a worse
+  spelling of waiting.
+
+The ~8ms threshold and the ~12ms `CS_ACTIVE` linger both sit right around the
+kbase CSF scheduler's tick period, which is the most plausible reading: a
+kick on a queue whose CS is not idle takes effect on the next tick.
+
+### What the fix is worth
+
+Measured on the Poco X8 Pro, `auto` (publish, kick only when caught up)
+against `always` (the old wait-then-kick):
+
+| workload | auto | always |
+|---|---|---|
+| `driver_pipeline_probe --burst=100` (back to back, one fence at the end) | **0.36 ms/submit** | 0.39 ms/submit |
+| `driver_compute_probe --fill --loop=300` (one fence wait per submit) | 21.8 ms/submit | 22.6 ms/submit |
+
+The gap between those two rows is the real finding, and it is not queueing.
+When a submit arrives at an idle GPU, a kick is unavoidable and costs a ~12ms
+wait; when submits arrive back to back, the CS is still running and no kick
+happens at all. So this device rewards keeping work in flight far more than
+it rewards anything the submit path can do, and an application that waits for
+a fence between every submit pays wake-up latency no driver change here will
+remove.
+
+The old path was not slow because it serialised. It was slow because it woke
+the GPU every time, and so is anything else that kicks unconditionally.
+
+### Diagnosing this again
+
+`PANVK_KBASE_KICK_MODE=always|nowait` and `PANVK_KBASE_KICK_LOG=1`, which logs
+`insert`/`extract`/`active`/`kicked`/`waited` around every kick. Every failure
+in this area looks identical from outside - a fence that never signals - so
+the log is the only thing that distinguishes "not kicked" from "kicked and
+ignored" from "still running". `PANVK_KBASE_KICK_LOG_AFTER=1` adds a sample
+2ms later, which is what shows a kick returning 0 and doing nothing.
