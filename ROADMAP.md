@@ -408,19 +408,55 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       reaching the end of the stream and fails device creation if it does
       not within 2s — so `vkCreateDevice` returning 0 *is* the proof the
       stream ran. `driver_sync_probe` still passes all checks.
-- [ ] **The render subqueues, then command buffers.** `init_gpu_queue()`
-      only loops over `PANVK_SUBQUEUE_COMPUTE` on kbase.
-      `PANVK_SUBQUEUE_VERTEX_TILER` and `_FRAGMENT` additionally need the
-      tiler heap descriptor and its geometry buffer, the scratch FBD for
-      the tiler-OOM handler, and the render descriptor ringbuf — the last
-      of which is backed by a syncobj and so needs its own kbase answer.
-      `init_tiler()` is the natural next piece: everything in it is shared
-      except the heap-create ioctl, and this path already has the heap's
-      GPU VA and first chunk from `CS_TILER_HEAP_INIT` at queue creation.
-      Note the chunk size must then come from `phys_dev->csf.tiler`, not
-      the local constants this file currently creates its heap with.
-      `kbase_queue_submit()` keeps refusing submits carrying command
-      buffers until those contexts exist.
+- [x] **`init_tiler()` is shared too.** The tiler heap descriptor, its
+      geometry buffer and the scratch FBD the tiler-OOM handler writes into
+      are all allocated by panthor's own `init_tiler()`, now exported as
+      `panvk_per_arch(init_gpu_tiler)`. Only the heap-create ioctl differs,
+      through `panvk_per_arch(kbase_create_tiler_heap)` —
+      `CS_TILER_HEAP_INIT` needs no VM id and hands back both addresses
+      directly, where panthor's returns a handle as well, so
+      `context.handle` is unused on kbase and teardown goes by address.
+      **This also fixed a latent mismatch**: the kbase path used to create
+      its heap with local constants while the shared code writes the
+      `TILER_HEAP` descriptor from `phys_dev->csf.tiler`, so the descriptor
+      could have described a heap with a different chunk size than the one
+      kbase actually allocated. Geometry now comes from one place.
+      The `kbase_init_cs` scratch allocation added in the previous pass is
+      gone: with a real tiler heap descriptor the init stream is built in
+      the geometry buffer, exactly like panthor, removing a divergence
+      point rather than adding one.
+      Verified on hardware: `vkCreateDevice` still returns 0 and
+      `driver_sync_probe` still passes every check.
+- [ ] **The render subqueues, blocked on BO aliasing — now unblocked in
+      principle.** `init_gpu_queue()` still loops over
+      `PANVK_SUBQUEUE_COMPUTE` only. What stops the other two is
+      `init_render_desc_ringbuf()`, and the reason is more interesting than
+      it first looked: its syncobj is a `panvk_cs_sync32` in device memory,
+      not a DRM syncobj, so that part is fine — but it maps one BO at *two*
+      adjacent GPU VAs so a read running off the end of the ring wraps into
+      the copy. `kbase_kmod_vm_bind()` cannot do that at all: an allocation
+      lives where `MEM_ALLOC_EX` put it, so both `MAP` ops fail the
+      caller-chosen-VA check.
+      **`tests/alias_probe` settles whether kbase can express it: yes.**
+      `KBASE_IOCTL_MEM_ALIAS` (nr 21) aliases one 4-page allocation twice
+      with `stride = 4` pages and reports `va_pages = 8`, the full 2x span.
+      Panfork never calls it, so there was no prior art.
+      **The non-obvious part**: the handle is the *real GPU VA*, not the
+      `gpu_va` the allocation reported — under `SAME_VA` that value is an
+      mmap cookie and the real address is the CPU pointer. The cookie fails
+      `ENOMEM`, which reads like a resource limit but means "no such
+      allocation at that address".
+      **Caveat, not yet closed**: the alias is not CPU-mappable (`mmap` →
+      `EPERM`), so the probe cannot confirm from the CPU that both windows
+      are the same pages. The ioctl composing the region as asked is good
+      evidence, not proof — a command stream writing through one window and
+      reading through the other should confirm it before the ringbuf is
+      relied on. Not a problem for PanVK itself, which allocates the
+      ringbuf `PAN_KMOD_BO_FLAG_NO_MMAP`.
+      Remaining work: an alias operation in the kbase backend, a way for
+      `init_render_desc_ringbuf()`'s two `MAP` ops to reach it, then
+      dropping the compute-only restriction. `kbase_queue_submit()` keeps
+      refusing submits carrying command buffers until then.
       Still not done either: **GPU-side waits**. `vk_submit->waits` are
       satisfied on the CPU before anything is published, so
       `VK_SYNC_FEATURE_GPU_WAIT` stays unadvertised and semaphores still

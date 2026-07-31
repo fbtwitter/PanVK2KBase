@@ -85,6 +85,13 @@ driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 
 # Settles what a SAME_VA kbase BO can be re-mmap-ed with (cookie vs resolved
 # address). Decides kbase_kmod_bo_get_mmap_offset()'s implementation.
+# Can kbase map one allocation at two adjacent GPU VAs (KBASE_IOCTL_MEM_ALIAS)?
+# Decides whether PanVK's render descriptor ringbuf - which relies on that
+# double mapping to wrap - is expressible on kbase at all, and so whether the
+# VERTEX_TILER/FRAGMENT subqueues can be initialised.
+alias_probe: ./src/tests/alias_probe/alias_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/alias_probe $<
+
 remap_probe: ./src/tests/remap_probe/remap_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/remap_probe $<
 

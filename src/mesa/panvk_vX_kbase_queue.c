@@ -97,12 +97,12 @@
  */
 #define PANVK_KBASE_RINGBUF_SIZE (64 * 1024)
 
-/* Tiler heap geometry. Same values tests/live_kick_probe uses, which the
- * kernel accepts and which produce a real first chunk on this hardware.
+/* Tiler heap geometry is no longer chosen here. It comes from
+ * phys_dev->csf.tiler via the shared init_gpu_tiler(), which is what writes
+ * the TILER_HEAP descriptor - picking it locally meant the descriptor could
+ * describe a heap with a different chunk size than the one kbase actually
+ * allocated.
  */
-#define PANVK_KBASE_TILER_CHUNK_SIZE (2 * 1024 * 1024)
-#define PANVK_KBASE_TILER_INITIAL_CHUNKS 1
-#define PANVK_KBASE_TILER_MAX_CHUNKS 8
 
 /* Upper bound on a submit's command stream. Each signalled sync costs a
  * MOVE64 for the address, a MOVE64 for the value and a SYNC_SET64, all
@@ -110,12 +110,6 @@
  * that would exceed this is rejected rather than silently truncated.
  */
 #define PANVK_KBASE_MAX_SUBMIT_CS_SIZE 4096
-
-/* Size of the buffer the per-subqueue init stream is built into. panthor
- * uses the tiler heap's 64KB geometry buffer for this; the streams are a few
- * hundred bytes at most, and this path has no tiler descriptor to borrow.
- */
-#define PANVK_KBASE_INIT_CS_SIZE 4096
 
 /* Embeds panvk_gpu_queue rather than vk_queue directly, because the
  * per-subqueue GPU context setup is shared with panthor - see
@@ -163,10 +157,49 @@ destroy_queue_resources(struct panvk_device *dev,
       queue->group_created = false;
    }
 
-   if (queue->tiler_heap_va) {
-      pan_kmod_kbase_tiler_heap_destroy(dev->kmod.dev, queue->tiler_heap_va);
-      queue->tiler_heap_va = 0;
-   }
+   /* The tiler heap is not freed here - it belongs to the shared tiler
+    * setup, and cleanup_gpu_tiler() terminates it via
+    * panvk_per_arch(kbase_destroy_tiler_heap) along with the descriptor and
+    * scratch FBD it allocated.
+    */
+}
+
+int
+panvk_per_arch(kbase_create_tiler_heap)(struct panvk_gpu_queue *gpu_queue,
+                                        uint32_t chunk_size,
+                                        uint32_t initial_chunks,
+                                        uint32_t max_chunks,
+                                        uint64_t *heap_ctx_va,
+                                        uint64_t *first_chunk_va)
+{
+   struct panvk_kbase_queue *queue =
+      container_of(gpu_queue, struct panvk_kbase_queue, gpu);
+   struct panvk_device *dev = to_panvk_device(gpu_queue->vk.base.device);
+
+   if (pan_kmod_kbase_tiler_heap_create(dev->kmod.dev, chunk_size,
+                                        initial_chunks, max_chunks,
+                                        &queue->tiler_heap_va,
+                                        &queue->tiler_first_chunk_va))
+      return -1;
+
+   *heap_ctx_va = queue->tiler_heap_va;
+   *first_chunk_va = queue->tiler_first_chunk_va;
+
+   return 0;
+}
+
+void
+panvk_per_arch(kbase_destroy_tiler_heap)(struct panvk_gpu_queue *gpu_queue)
+{
+   struct panvk_kbase_queue *queue =
+      container_of(gpu_queue, struct panvk_kbase_queue, gpu);
+   struct panvk_device *dev = to_panvk_device(gpu_queue->vk.base.device);
+
+   if (!queue->tiler_heap_va)
+      return;
+
+   pan_kmod_kbase_tiler_heap_destroy(dev->kmod.dev, queue->tiler_heap_va);
+   queue->tiler_heap_va = 0;
 }
 
 VkResult
@@ -188,15 +221,17 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
 
    /* Tiler heap first: the panthor path does the same, and a group with no
     * heap behind it is not useful for anything that tiles.
+    *
+    * Shared with panthor, which also allocates the heap descriptor, the
+    * geometry buffer that follows it and the scratch FBD the tiler-OOM
+    * handler writes into. Only CS_TILER_HEAP_INIT itself is ours, through
+    * kbase_create_tiler_heap() below - which is also what makes the heap's
+    * geometry agree with phys_dev->csf.tiler, rather than with constants
+    * this file used to pick on its own.
     */
-   if (pan_kmod_kbase_tiler_heap_create(
-          dev->kmod.dev, PANVK_KBASE_TILER_CHUNK_SIZE,
-          PANVK_KBASE_TILER_INITIAL_CHUNKS, PANVK_KBASE_TILER_MAX_CHUNKS,
-          &queue->tiler_heap_va, &queue->tiler_first_chunk_va)) {
-      result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
-                            "kbase: failed to create the tiler heap");
+   result = panvk_per_arch(init_gpu_tiler)(&queue->gpu);
+   if (result != VK_SUCCESS)
       goto err_finish_queue;
-   }
 
    /* Priority 0 is BASE_QUEUE_GROUP_PRIORITY_HIGH in kbase's numbering,
     * but what actually matters is that it is the value every group this
@@ -228,42 +263,22 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
 
    queue->gpu.vk.driver_submit = panvk_per_arch(kbase_queue_submit);
 
-   /* Scratch for the init streams init_gpu_queue() is about to build. It
-    * has to exist before that call, since the shared code reads it rather
-    * than allocating it - see patch-panvk-kbase-subqueue-init.py.
-    */
-   struct panvk_pool_alloc_info alloc_info = {
-      .size = PANVK_KBASE_INIT_CS_SIZE,
-      .alignment = 64,
-   };
-
-   queue->gpu.kbase_init_cs =
-      panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
-   if (!panvk_priv_mem_check_alloc(queue->gpu.kbase_init_cs)) {
-      result = panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "kbase: failed to allocate the init CS buffer");
-      goto err_destroy_resources;
-   }
-
    /* Sets up the GPU-side context each subqueue needs before it can run
     * anything: the shared syncobj array, a panvk_cs_subqueue_context, and
     * an init stream that loads the context register and initialises the
     * scoreboard slots. Shared with panthor - only the submit at the end of
     * it is ours, via panvk_per_arch(kbase_submit_and_wait) below.
     *
-    * Compute only for now; the render subqueues need a tiler heap
-    * descriptor, geometry buffer and descriptor ringbuf that this path does
-    * not build yet.
+    * Compute only for now; the render subqueues additionally need the
+    * descriptor ringbuf, which is blocked on BO aliasing - see the comment
+    * on that step in patch-panvk-kbase-subqueue-init.py.
     */
    result = panvk_per_arch(init_gpu_queue)(&queue->gpu);
    if (result != VK_SUCCESS)
-      goto err_free_init_cs;
+      goto err_destroy_resources;
 
    *out_queue = &queue->gpu.vk;
    return VK_SUCCESS;
-
-err_free_init_cs:
-   panvk_pool_free_mem(&queue->gpu.kbase_init_cs);
 
 err_destroy_resources:
    destroy_queue_resources(dev, queue);
@@ -287,7 +302,7 @@ panvk_per_arch(destroy_kbase_queue)(struct vk_queue *vk_queue)
     * it is guarded.
     */
    panvk_per_arch(cleanup_gpu_queue)(&queue->gpu);
-   panvk_pool_free_mem(&queue->gpu.kbase_init_cs);
+   panvk_per_arch(cleanup_gpu_tiler)(&queue->gpu);
 
    destroy_queue_resources(dev, queue);
    vk_queue_finish(&queue->gpu.vk);
@@ -410,7 +425,7 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
 }
 
 /* Publish an init stream that panvk_per_arch(init_gpu_queue) already built
- * into queue->gpu.kbase_init_cs, and block until the GPU has run it.
+ * into the tiler heap's geometry buffer, and block until the GPU has run it.
  *
  * Blocking is the point: the stream sets up context registers that
  * everything submitted afterwards depends on, so returning before it has
@@ -425,8 +440,7 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
 VkResult
 panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *gpu_queue,
                                       enum panvk_subqueue_id subqueue,
-                                      uint64_t stream_addr,
-                                      uint32_t stream_size)
+                                      const void *stream, uint32_t stream_size)
 {
    struct panvk_kbase_queue *queue =
       container_of(gpu_queue, struct panvk_kbase_queue, gpu);
@@ -436,16 +450,8 @@ panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *gpu_queue,
    if (!stream_size)
       return VK_SUCCESS;
 
-   /* The shared code hands back the GPU address it built at; the bytes to
-    * copy are the CPU view of the same allocation. Nothing else is ever
-    * built there, so the offset is zero and the two must correspond.
-    */
-   assert(stream_addr == panvk_priv_mem_dev_addr(gpu_queue->kbase_init_cs));
-
    VkResult result =
-      submit_stream(dev, queue, subqueue,
-                    panvk_priv_mem_host_addr(gpu_queue->kbase_init_cs),
-                    stream_size);
+      submit_stream(dev, queue, subqueue, stream, stream_size);
    if (result != VK_SUCCESS)
       return result;
 

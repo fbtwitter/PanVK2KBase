@@ -951,6 +951,45 @@ root — see the debugfs/dmesg section above): the answer is presumably in how
 `kbase_csf_queue_kick()` decides whether to ring the hardware doorbell for a
 group that is already onslot.
 
+## MEM_ALIAS works, but the handle is the GPU VA and not the cookie
+
+PanVK's render descriptor ringbuf maps one BO at `dev_addr` and again at
+`dev_addr + size`, so a descriptor read running off the end of the ring wraps
+into the copy and the wraparound can be done with 32-bit arithmetic. Both the
+VERTEX_TILER and FRAGMENT subqueue contexts point at it, so without it neither
+can be initialised.
+
+`kbase_kmod_vm_bind()` cannot express that at all: an allocation lives where
+`MEM_ALLOC_EX` put it, so both `MAP` ops fail the caller-chosen-VA check.
+`KBASE_IOCTL_MEM_ALIAS` (nr 21) is the mechanism that can — `stride` plus
+`nents` entries, each naming an existing allocation with an offset and length,
+so two entries naming the same allocation give the double mapping. Panfork
+never calls it, so there was no prior art to copy.
+
+`tests/alias_probe` settles it. Aliasing one 4-page allocation twice with
+`stride = 4` pages succeeds and reports `va_pages = 8`, the full 2x span.
+
+**The non-obvious part: which u64 is "the handle".** Passing the `gpu_va` the
+allocation reported fails `ENOMEM`; passing the CPU pointer succeeds. That is
+not a contradiction — under `BASE_MEM_SAME_VA` the reported `gpu_va` is an
+mmap cookie and the *real* GPU address is the CPU pointer (see the SAME_VA
+cookie section above). `MEM_ALIAS` wants the real address. `ENOMEM` here means
+"no such allocation at that address", the same way it means "address
+unavailable" for `MEM_ALLOC_EX`, and is easy to misread as a resource limit.
+
+```
+cookie handle, SAME_VA alias      -> Out of memory
+real GPU VA handle, SAME_VA alias -> OK   (gpu_va=0x41000, va_pages=8)
+```
+
+**The alias is not CPU-mappable**: `mmap()` on it returns `EPERM`. Not a
+problem for the ringbuf, which is allocated `PAN_KMOD_BO_FLAG_NO_MMAP` and is
+GPU-only whenever tracing is off — but it does mean the probe cannot confirm
+from the CPU that the two windows are genuinely the same pages. The ioctl
+composing the region as asked is good evidence, not proof; proving it needs a
+command stream that writes through one window and reads through the other.
+Worth doing before the ringbuf is relied on.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

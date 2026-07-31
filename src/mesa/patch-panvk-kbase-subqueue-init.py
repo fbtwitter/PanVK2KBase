@@ -45,23 +45,9 @@ QUEUE_C = os.path.join(mesa, "src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c")
 # ------------------------------------------------------------------ header
 src = open(QUEUE_H).read()
 
-if "kbase_init_cs" in src:
+if "init_gpu_queue" in src:
     print("    panvk_queue.h: already patched")
 else:
-    anchor = """   struct panvk_subqueue subqueues[PANVK_SUBQUEUE_COUNT];
-};"""
-    assert anchor in src, "panvk_gpu_queue subqueues member not found"
-
-    src = src.replace(anchor, """   struct panvk_subqueue subqueues[PANVK_SUBQUEUE_COUNT];
-
-   /* kbase only, unused on panthor. Scratch for building the per-subqueue
-    * init command stream. panthor builds it in the tiler heap's geometry
-    * buffer, which the kbase path does not have yet - it creates its heap
-    * through CS_TILER_HEAP_INIT and has no descriptor for it.
-    */
-   struct panvk_priv_mem kbase_init_cs;
-};""", 1)
-
     anchor = "VkResult panvk_per_arch(gpu_queue_check_status)(struct vk_queue *vk_queue);"
     assert anchor in src, "gpu_queue_check_status declaration not found"
 
@@ -80,14 +66,36 @@ VkResult panvk_per_arch(init_gpu_queue)(struct panvk_gpu_queue *queue);
  */
 void panvk_per_arch(cleanup_gpu_queue)(struct panvk_gpu_queue *queue);
 
+/* The tiler heap descriptor, geometry buffer and scratch FBD. Everything in
+ * it is shared; only the heap-create ioctl differs, which goes through
+ * panvk_per_arch(kbase_create_tiler_heap) below.
+ */
+VkResult panvk_per_arch(init_gpu_tiler)(struct panvk_gpu_queue *queue);
+void panvk_per_arch(cleanup_gpu_tiler)(struct panvk_gpu_queue *queue);
+
 /* Implemented by the kbase queue. Publishes an already-built init stream to
  * the subqueue's ring and blocks until the GPU has run it. The panthor
  * equivalent is GROUP_SUBMIT + drmSyncobjWait, which needs a DRM fd.
+ *
+ * Takes the stream's CPU address because the kbase path copies it into a
+ * ring buffer rather than pointing the GPU at it in place.
  */
 VkResult panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *queue,
                                                enum panvk_subqueue_id subqueue,
-                                               uint64_t stream_addr,
-                                               uint32_t stream_size);""", 1)
+                                               const void *stream,
+                                               uint32_t stream_size);
+
+/* Implemented by the kbase queue. CS_TILER_HEAP_INIT, which unlike
+ * panthor's TILER_HEAP_CREATE needs no VM id and hands back both addresses
+ * directly. Also records the heap VA so teardown can terminate it.
+ */
+int panvk_per_arch(kbase_create_tiler_heap)(struct panvk_gpu_queue *queue,
+                                            uint32_t chunk_size,
+                                            uint32_t initial_chunks,
+                                            uint32_t max_chunks,
+                                            uint64_t *heap_ctx_va,
+                                            uint64_t *first_chunk_va);
+void panvk_per_arch(kbase_destroy_tiler_heap)(struct panvk_gpu_queue *queue);""", 1)
 
     open(QUEUE_H, "w").write(src)
     print("    patched csf/panvk_queue.h")
@@ -98,42 +106,133 @@ src = open(QUEUE_C).read()
 if "kbase_submit_and_wait" in src:
     print("    panvk_vX_gpu_queue.c: already patched")
 else:
-    # --- 1. the init stream's scratch buffer -------------------------------
+    # --- 1. the tiler heap ------------------------------------------------
     #
-    # panthor puts it in the tiler heap descriptor's geometry buffer, at
-    # +4096. On kbase that allocation does not exist, so point the builder at
-    # the dedicated one instead. Same shape, different memory.
-    old = """   /* We use the geometry buffer for our temporary CS buffer. */
-   root_cs = (struct cs_buffer){
-      .cpu = panvk_priv_mem_host_addr(queue->tiler_heap.desc) + 4096,
-      .gpu = panvk_priv_mem_dev_addr(queue->tiler_heap.desc) + 4096,
-      .capacity = 64 * 1024 / sizeof(uint64_t),
-   };"""
-    assert old in src, "init_subqueue root_cs setup not found"
+    # The descriptor, geometry buffer and scratch FBD allocations are all
+    # shared. Only the heap-create ioctl differs: kbase's CS_TILER_HEAP_INIT
+    # needs no VM id and returns both addresses directly, where panthor's
+    # returns a handle as well.
+    old = """   struct drm_panthor_tiler_heap_create thc = {
+      .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
+      .chunk_size = tiler_heap->chunk_size,
+      .initial_chunk_count = phys_dev->csf.tiler.initial_chunks,
+      .max_chunks = phys_dev->csf.tiler.max_chunks,
+      .target_in_flight = 65535,
+   };
 
-    new = """   /* We use the geometry buffer for our temporary CS buffer - except on
-    * kbase, which has no tiler heap descriptor to carve it out of and uses
-    * a dedicated allocation instead. */
-   const bool is_kbase =
-      to_panvk_physical_device(dev->vk.physical)->is_kbase;
-   struct panvk_priv_mem *init_cs_mem =
-      is_kbase ? &queue->kbase_init_cs : &queue->tiler_heap.desc;
-   const uint32_t init_cs_offset = is_kbase ? 0 : 4096;
+   int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE,
+                            &thc);
+   if (ret) {
+      result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                            "Failed to create a tiler heap context");
+      goto err_free_desc;
+   }
 
-   root_cs = (struct cs_buffer){
-      .cpu = panvk_priv_mem_host_addr(*init_cs_mem) + init_cs_offset,
-      .gpu = panvk_priv_mem_dev_addr(*init_cs_mem) + init_cs_offset,
-      .capacity = 64 * 1024 / sizeof(uint64_t),
-   };"""
+   tiler_heap->context.handle = thc.handle;
+   tiler_heap->context.dev_addr = thc.tiler_heap_ctx_gpu_va;
+
+   panvk_priv_mem_write_desc(tiler_heap->desc, 0, TILER_HEAP, cfg) {
+      cfg.size = tiler_heap->chunk_size;
+      cfg.base = thc.first_heap_chunk_gpu_va;
+      cfg.bottom = cfg.base + 64;
+      cfg.top = cfg.base + cfg.size;
+   }"""
+    assert old in src, "init_tiler heap-create block not found"
+
+    new = """   uint64_t heap_ctx_va, first_chunk_va;
+
+   if (to_panvk_physical_device(dev->vk.physical)->is_kbase) {
+      /* CS_TILER_HEAP_INIT. No VM id - kbase has no VM object - and no
+       * handle either: the heap is identified by its GPU address, which is
+       * also what cs_heap_set() wants. */
+      if (panvk_per_arch(kbase_create_tiler_heap)(
+             queue, tiler_heap->chunk_size, phys_dev->csf.tiler.initial_chunks,
+             phys_dev->csf.tiler.max_chunks, &heap_ctx_va, &first_chunk_va)) {
+         result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                               "Failed to create a tiler heap context");
+         goto err_free_desc;
+      }
+
+      tiler_heap->context.handle = 0;
+   } else {
+      struct drm_panthor_tiler_heap_create thc = {
+         .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
+         .chunk_size = tiler_heap->chunk_size,
+         .initial_chunk_count = phys_dev->csf.tiler.initial_chunks,
+         .max_chunks = phys_dev->csf.tiler.max_chunks,
+         .target_in_flight = 65535,
+      };
+
+      int ret = pan_kmod_ioctl(dev->drm_fd,
+                               DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE, &thc);
+      if (ret) {
+         result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                               "Failed to create a tiler heap context");
+         goto err_free_desc;
+      }
+
+      tiler_heap->context.handle = thc.handle;
+      heap_ctx_va = thc.tiler_heap_ctx_gpu_va;
+      first_chunk_va = thc.first_heap_chunk_gpu_va;
+   }
+
+   tiler_heap->context.dev_addr = heap_ctx_va;
+
+   panvk_priv_mem_write_desc(tiler_heap->desc, 0, TILER_HEAP, cfg) {
+      cfg.size = tiler_heap->chunk_size;
+      cfg.base = first_chunk_va;
+      cfg.bottom = cfg.base + 64;
+      cfg.top = cfg.base + cfg.size;
+   }"""
     src = src.replace(old, new, 1)
 
-    # The matching flush has to follow the same buffer.
-    old = "   panvk_priv_mem_flush(queue->tiler_heap.desc, 4096, cs_root_chunk_size(&b));"
-    assert old in src, "init_subqueue tiler_heap.desc flush not found"
-    src = src.replace(
-        old,
-        "   panvk_priv_mem_flush(*init_cs_mem, init_cs_offset,\n"
-        "                        cs_root_chunk_size(&b));", 1)
+    # Teardown: kbase terminates the heap by address, and has no handle.
+    old = """   struct drm_panthor_tiler_heap_destroy thd = {
+      .handle = tiler_heap->context.handle,
+   };
+   ASSERTED int ret =
+      pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+   assert(!ret);"""
+    assert old in src, "cleanup_tiler heap-destroy block not found"
+
+    new = """   if (to_panvk_physical_device(dev->vk.physical)->is_kbase) {
+      /* Terminated through the backend, by address - see
+       * panvk_per_arch(kbase_create_tiler_heap)'s implementation. */
+      panvk_per_arch(kbase_destroy_tiler_heap)(queue);
+   } else {
+      struct drm_panthor_tiler_heap_destroy thd = {
+         .handle = tiler_heap->context.handle,
+      };
+      ASSERTED int ret = pan_kmod_ioctl(
+         dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+      assert(!ret);
+   }"""
+    src = src.replace(old, new, 1)
+
+    # Export init_tiler/cleanup_tiler so the kbase queue can call them.
+    old = """static VkResult
+init_tiler(struct panvk_gpu_queue *queue)
+{"""
+    assert old in src, "init_tiler definition not found"
+    src = src.replace(old, """VkResult
+panvk_per_arch(init_gpu_tiler)(struct panvk_gpu_queue *queue)
+{""", 1)
+
+    old = "   result = init_tiler(queue);"
+    assert old in src, "init_tiler call not found"
+    src = src.replace(old, "   result = panvk_per_arch(init_gpu_tiler)(queue);", 1)
+
+    old = """static void
+cleanup_tiler(struct panvk_gpu_queue *queue)
+{"""
+    assert old in src, "cleanup_tiler definition not found"
+    src = src.replace(old, """void
+panvk_per_arch(cleanup_gpu_tiler)(struct panvk_gpu_queue *queue)
+{""", 1)
+
+    assert "cleanup_tiler(queue);" in src, "cleanup_tiler calls not found"
+    src = src.replace("cleanup_tiler(queue);",
+                      "panvk_per_arch(cleanup_gpu_tiler)(queue);")
 
     # --- 2. submit and wait ------------------------------------------------
     #
@@ -142,24 +241,40 @@ else:
     old = """   struct drm_panthor_sync_op syncop = {"""
     assert old in src, "init_subqueue syncop not found"
 
-    new = """   if (is_kbase) {
+    new = """   if (to_panvk_physical_device(dev->vk.physical)->is_kbase) {
+      /* The stream was built in the geometry buffer, same as panthor; the
+       * kbase path copies it into the subqueue's ring rather than pointing
+       * the GPU at it in place, so it needs the CPU address. */
+      const void *stream =
+         (uint8_t *)panvk_priv_mem_host_addr(queue->tiler_heap.desc) + 4096;
+      uint32_t stream_size = cs_root_chunk_size(&b);
+
       cs_builder_fini(&b);
 
       pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
-      return panvk_per_arch(kbase_submit_and_wait)(
-         queue, subqueue, cs_root_chunk_gpu_addr(&b), cs_root_chunk_size(&b));
+      return panvk_per_arch(kbase_submit_and_wait)(queue, subqueue, stream,
+                                                   stream_size);
    }
 
    struct drm_panthor_sync_op syncop = {"""
     src = src.replace(old, new, 1)
 
-    # --- 3. init_queue: skip the panthor-only steps ------------------------
+    # --- 3. init_queue: skip the steps kbase cannot do yet -----------------
     #
-    # init_render_desc_ringbuf() allocates a syncobj-backed ringbuf and
-    # init_utrace() asserts on vk_sync_type_is_drm_syncobj(); neither can
-    # work without a DRM fd. Both are only needed by the render subqueues,
-    # which this pass does not initialise.
+    # init_utrace() asserts vk_sync_type_is_drm_syncobj(), which kbase has no
+    # fd to hang one off.
+    #
+    # init_render_desc_ringbuf() is blocked for a different and less obvious
+    # reason. Its syncobj is a panvk_cs_sync32 in device memory, not a DRM
+    # syncobj, so that part is fine - but it maps one BO at *two* adjacent
+    # GPU VAs so a read running off the end wraps into the copy. kbase's
+    # vm_bind cannot do that: an allocation lives where MEM_ALLOC_EX put it
+    # and cannot be mapped elsewhere or twice, so both MAP ops fail the
+    # caller-chosen-VA check. KBASE_IOCTL_MEM_ALIAS (nr 21) is the
+    # mechanism that could express it - stride plus N entries referencing
+    # the same handle - but it is unproven on this device, so the render
+    # subqueues wait on that.
     old = """   result = init_render_desc_ringbuf(queue);
    if (result != VK_SUCCESS)
       goto err_cleanup_queue;
