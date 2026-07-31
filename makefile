@@ -77,6 +77,12 @@ driver_load_probe: ./src/tests/driver_load_probe/driver_load_probe.c
 driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_enum_probe $<
 
+# Drives the kbase event-memory vk_sync through the real Vulkan API:
+# timeline semaphore signal/get/wait and binary fence status/reset. Proves
+# the sync type works, not merely that it registered.
+driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_sync_probe $<
+
 # Establishes that KBASE_IOCTL_VERSION_CHECK is once-per-fd.
 double_handshake_probe: ./src/tests/double_handshake_probe/double_handshake_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/double_handshake_probe $<
@@ -163,12 +169,15 @@ MESA_KMOD_DIR := $(MESA_DIR)/src/panfrost/lib/kmod
 mesa-backend-sync:
 	@test -d "$(MESA_KMOD_DIR)" || { echo "error: $(MESA_KMOD_DIR) not found - see docs/mesa-cs-builder.md for the Mesa clone command"; exit 1; }
 	cp src/mesa/pan_kmod_kbase.c src/mesa/pan_kmod_kbase.h $(MESA_KMOD_DIR)/
+	cp src/mesa/panvk_kbase_sync.c src/mesa/panvk_kbase_sync.h $(MESA_DIR)/src/panfrost/vulkan/
 	@echo ""
 	@echo "Copied pan_kmod_kbase.{c,h} into $(MESA_KMOD_DIR)/"
+	@echo "Copied panvk_kbase_sync.{c,h} into $(MESA_DIR)/src/panfrost/vulkan/"
 	@echo "Still to apply (kept as readable patches since upstream moves):"
 	@echo "  - src/mesa/pan_kmod.c.kbase.patch      -> $(MESA_KMOD_DIR)/pan_kmod.c"
 	@echo "  - src/mesa/meson.build.kbase.patch     -> $(MESA_KMOD_DIR)/meson.build"
 	@echo "  - src/mesa/patch-panvk-kbase-enumeration.py <mesa-dir>  (PanVK enumeration)"
+	@echo "  - src/mesa/patch-panvk-kbase-sync.py        <mesa-dir>  (PanVK vk_sync)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
 # <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to

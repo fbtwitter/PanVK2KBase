@@ -79,11 +79,21 @@ struct kbase_kmod_bo {
 struct kbase_kmod_dev {
    struct pan_kmod_dev base;
 
-   /* CSF UK interface version reported by KBASE_IOCTL_VERSION_CHECK. */
+   /* CSF UK interface version reported by KBASE_IOCTL_VERSION_CHECK.
+    * Zero when this device was created on an fd whose kbase context was
+    * already handshaked (see already_initialized), because the version
+    * cannot be re-queried on such an fd.
+    */
    struct {
       uint16_t major;
       uint16_t minor;
    } uk_version;
+
+   /* Set when this pan_kmod_dev wraps an fd that already went through
+    * VERSION_CHECK/SET_FLAGS - i.e. a dup() of one that did. vkCreateDevice
+    * makes exactly one of these per logical device.
+    */
+   bool already_initialized;
 };
 
 static struct kbase_kmod_dev *
@@ -293,8 +303,38 @@ pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor)
 {
    struct kbase_ioctl_version_check ver = { .major = 0, .minor = 0 };
 
-   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0)
+   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0) {
+      /* EPERM means the handshake already happened on this open file
+       * description. kbase allows VERSION_CHECK exactly once, and dup()
+       * shares the description, so this is not "not a kbase device" - it is
+       * "a kbase device this process already greeted".
+       *
+       * That case is reached on every vkCreateDevice: panvk_vX_device.c
+       * calls pan_kmod_dev_create(os_dupfd_cloexec(phys_dev->kmod.dev->fd))
+       * to build a second pan_kmod_dev for the logical device. Returning
+       * false here made that fall through to drmGetVersion(), which fails
+       * on a misc device, so vkCreateDevice returned
+       * VK_ERROR_OUT_OF_HOST_MEMORY.
+       *
+       * A driver that does not implement this ioctl number answers ENOTTY,
+       * so EPERM is specific enough to identify kbase on its own.
+       *
+       * The version cannot be re-queried, so report 0.0 and let
+       * kbase_kmod_dev_create() recognise that as "already set up" and skip
+       * the equally once-per-context SET_FLAGS.
+       *
+       * See tests/double_handshake_probe/ for the probe that established
+       * the once-per-fd rule.
+       */
+      if (errno == EPERM) {
+         if (uk_major)
+            *uk_major = 0;
+         if (uk_minor)
+            *uk_minor = 0;
+         return true;
+      }
       return false;
+   }
 
    if (uk_major)
       *uk_major = ver.major;
@@ -334,10 +374,20 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    kbase_dev->uk_version.major = drv_info->version.major;
    kbase_dev->uk_version.minor = drv_info->version.minor;
 
-   struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
-   if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags) < 0) {
-      mesa_loge("kbase: SET_FLAGS failed: %s", strerror(errno));
-      goto err_cleanup;
+   /* A 0.0 UK version means pan_kmod_fd_is_kbase() identified this fd by the
+    * EPERM-from-VERSION_CHECK path, i.e. the context behind it is already
+    * set up (see the comment there). SET_FLAGS is once-per-context too, so
+    * re-issuing it would fail. Skip it rather than tolerating an error
+    * code, so a genuine SET_FLAGS failure on a fresh fd is still fatal.
+    */
+   if (drv_info->version.major == 0 && drv_info->version.minor == 0) {
+      kbase_dev->already_initialized = true;
+   } else {
+      struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
+      if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags) < 0) {
+         mesa_loge("kbase: SET_FLAGS failed: %s", strerror(errno));
+         goto err_cleanup;
+      }
    }
 
    if (kbase_dev_query_props(kbase_dev))
@@ -415,6 +465,66 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, aligned, flags, handle);
 
    return &bo->base;
+}
+
+/* CSF event memory.
+ *
+ * Kept here rather than in the Vulkan layer because this is the only
+ * translation unit built with the kbase UAPI headers and -DMALI_USE_CSF=1
+ * (see meson.build.kbase.patch); panvk_kbase_sync.c needs the memory, not
+ * the ioctl surface.
+ *
+ * BASE_MEM_CSF_EVENT is the load-bearing flag: the kernel gives the region
+ * a permanent kernel mapping and, on this device, adds CACHED_CPU and
+ * COHERENT_SYSTEM to the granted flags, which is what lets the CPU observe
+ * a firmware write without explicit cache maintenance. A plain BO must not
+ * be assumed to behave the same way. Confirmed on hardware by
+ * tests/event_slot_probe - see docs/kbase-notes.md "Finding 2".
+ */
+void *
+pan_kmod_kbase_alloc_event_mem(int fd, size_t size, uint64_t *gpu_va)
+{
+   uint64_t aligned = ALIGN_POT(size, 4096);
+
+   union kbase_ioctl_mem_alloc alloc = { 0 };
+   alloc.in.va_pages = aligned / 4096;
+   alloc.in.commit_pages = aligned / 4096;
+   alloc.in.extension = 0;
+   alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                    BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                    BASE_MEM_CSF_EVENT;
+
+   if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &alloc) < 0) {
+      mesa_loge("kbase: MEM_ALLOC for event memory failed");
+      return NULL;
+   }
+
+   void *cpu = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                    alloc.out.gpu_va);
+   if (cpu == MAP_FAILED) {
+      mesa_loge("kbase: mmap of event memory failed");
+      return NULL;
+   }
+
+   memset(cpu, 0, aligned);
+
+   /* SAME_VA: the mapping address is the GPU virtual address. */
+   if (gpu_va)
+      *gpu_va = (uint64_t)(uintptr_t)cpu;
+
+   return cpu;
+}
+
+void
+pan_kmod_kbase_free_event_mem(int fd, void *cpu, size_t size)
+{
+   /* SAME_VA regions are torn down by the kernel on vm_close, so munmap()
+    * alone is the free; a following MEM_FREE fails EINVAL because the
+    * region is already gone. See docs/kbase-notes.md.
+    */
+   (void)fd;
+   if (cpu)
+      munmap(cpu, ALIGN_POT(size, 4096));
 }
 
 static void

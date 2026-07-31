@@ -153,8 +153,47 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       fails at `vk_drm_syncobj_get_type(dev->fd)`, which needs a real
       DRM fd — `-3 VK_ERROR_INITIALIZATION_FAILED`. Exactly what
       `docs/architecture.md` predicted.
-- [ ] Give PanVK a non-DRM `vk_sync` implementation. This is the new
-      blocker: `get_device_sync_types()` calls
+- [x] Give PanVK a non-DRM `vk_sync` implementation. **DONE — physical
+      device creation now succeeds on kbase.** `src/mesa/panvk_kbase_sync.c`
+      implements a `vk_sync_type` over a page of `BASE_MEM_CSF_EVENT`
+      memory: 256 slots of 16 bytes (value word + error word), one per
+      sync, allocated through the new
+      `pan_kmod_kbase_alloc_event_mem()`. The type itself owns the pool, so
+      a `vk_sync` reaches it by `container_of()` on its own `->type` and
+      nothing has to be added to `panvk_device`. Wired in by
+      `src/mesa/patch-panvk-kbase-sync.py`, which routes kbase devices past
+      `vk_drm_syncobj_get_type()` and marks them with a new `is_kbase` flag.
+      Verified on the Poco X8 Pro via `tests/driver_enum_probe`:
+      `vkEnumeratePhysicalDevices -> 0, count=1`, `Mali-G720 MC8`,
+      apiVersion 1.4.354. The `-3 VK_ERROR_INITIALIZATION_FAILED` recorded
+      above is gone.
+      **Scope, honestly:** CPU signal/reset/wait/get_value are implemented;
+      `VK_SYNC_FEATURE_GPU_WAIT` is deliberately *not* advertised, because
+      nothing submits GPU work that would signal a slot yet. The CPU wait
+      therefore polls rather than blocking on the kbase fd's notification —
+      the notification mechanism is proven (see Phase 4) but has no
+      producer until submission lands. Note a future blocking
+      implementation needs a single owner of the fd's event stream, since
+      `read()` consumes a notification.
+      **Not yet exercised through the Vulkan API.** `tests/driver_sync_probe`
+      drives a timeline semaphore and a binary fence through the real
+      entrypoints, but cannot run yet because `vkCreateDevice` still fails —
+      see the `vm_create` item below. The sync type is registered and its
+      event page is allocated during physical device creation; the
+      signal/wait paths have not run on hardware.
+      **Bug found and fixed along the way:** `vkCreateDevice` calls
+      `pan_kmod_dev_create(os_dupfd_cloexec(phys_dev->kmod.dev->fd))`
+      (`panvk_vX_device.c:395`). A `dup()` shares the open file
+      description, so `KBASE_IOCTL_VERSION_CHECK` returned `-EPERM` under
+      the once-per-fd rule, `pan_kmod_fd_is_kbase()` concluded "not kbase",
+      and the whole thing fell through to `drmGetVersion()`. Now `EPERM` is
+      treated as a *positive* identification ("already greeted"), reporting
+      version 0.0, which `kbase_kmod_dev_create()` recognises as
+      "already set up" and so skips the equally once-per-context
+      `SET_FLAGS`. Confirmed by logcat: device creation now gets past the
+      dup and reaches `vm_create`.
+      Original description of the blocker follows.
+      `get_device_sync_types()` calls
       `vk_drm_syncobj_get_type(dev->fd)` unconditionally, so physical
       device creation cannot succeed on a misc device no matter what the
       backend does. Needs a `vk_sync` type backed by whatever kbase
@@ -178,6 +217,24 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `get_device_sync_types()` in place of
       `vk_drm_syncobj_get_type(dev->fd)` — the mechanism question is
       closed, the Mesa-side implementation is not.
+- [ ] **`vm_create` is now the blocker for `vkCreateDevice`.** With sync
+      and the dup-fd probe fixed, logical device creation reaches
+      `pan_kmod_vm_create()` (`panvk_vX_device.c:419`) and fails there:
+      `-1 VK_ERROR_OUT_OF_HOST_MEMORY`, with
+      `E MESA: kbase: vm_create not implemented yet` in logcat. This is the
+      design decision noted below, not a bug — kbase has no explicit VM
+      object: a context owns exactly one address space, and `MEM_ALLOC`
+      maps into it directly rather than through a separate bind step.
+      Two ways to model it, and they are genuinely different:
+      (a) emulate a single implicit VM per device — `vm_create` returns a
+      bookkeeping object, `vm_bind` is a no-op for the SAME_VA allocations
+      this backend makes; simple, but leaves PanVK's VA management
+      believing it controls placement when it does not;
+      (b) push real VA management down into the backend and stop using
+      SAME_VA, so `vm_bind` maps at PanVK's chosen addresses; more faithful
+      to `pan_kmod`'s contract and probably required eventually, but a much
+      larger change that touches every allocation path already verified
+      on hardware.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),
