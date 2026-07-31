@@ -76,6 +76,7 @@
 
 #include "genxml/cs_builder.h"
 
+#include "panvk_cmd_buffer.h" /* struct panvk_cs_subqueue_context */
 #include "panvk_device.h"
 #include "panvk_kbase_sync.h"
 #include "panvk_mempool.h"
@@ -591,11 +592,81 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
 VkResult
 panvk_per_arch(kbase_queue_check_status)(struct vk_queue *vk_queue)
 {
-   /* panthor answers this with DRM_IOCTL_PANTHOR_GROUP_GET_STATE, which
-    * reports whether the group was killed by a fault. kbase's equivalent
-    * signal is a GPU_QUEUE_GROUP_ERROR notification read off the device fd
-    * (tests/live_kick_probe decodes those). Nothing submits work yet, so
-    * there is no state to report; wiring this up belongs with submission.
+   struct panvk_kbase_queue *queue = to_kbase_queue(vk_queue);
+   struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
+
+   /* The CS-side fault check is driver-agnostic: last_error is written into
+    * the subqueue context by the command stream itself, so it reads the
+    * same on kbase as on panthor.
+    *
+    * Only the subqueues that were actually initialised, though. An
+    * uninitialised context is a zeroed pool allocation, so it would report
+    * last_error == 0 - a clean status it has no business reporting, since
+    * nothing ever ran there. Checking it would turn "never initialised"
+    * into "definitely fine", which is exactly the kind of false clean this
+    * driver should not manufacture.
     */
+   for (unsigned i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (i != PANVK_SUBQUEUE_COMPUTE)
+         continue;
+
+      if (!panvk_priv_mem_check_alloc(queue->gpu.subqueues[i].context))
+         continue;
+
+      panvk_priv_mem_readback(queue->gpu.subqueues[i].context, 0,
+                              struct panvk_cs_subqueue_context, subq_ctx) {
+         if (subq_ctx->last_error != 0) {
+            return vk_queue_set_lost(&queue->gpu.vk,
+                                     "kbase: CS fault on subqueue %u "
+                                     "(last_error=0x%x)",
+                                     i, subq_ctx->last_error);
+         }
+      }
+   }
+
+   /* kbase has no GROUP_GET_STATE. A group killed by a fault reports
+    * through a GPU_QUEUE_GROUP_ERROR notification on the device fd
+    * instead, so drain what is pending. Timeout 0: this is a status poll,
+    * not a wait, and it is called on paths that must not block.
+    *
+    * THIS MAKES check_status THE SINGLE OWNER of the notification stream -
+    * read() consumes a notification, so whoever reads it first is the only
+    * one who sees it (see pan_kmod_kbase_read_event's header). That works
+    * today because nothing else reads the fd: panvk_kbase_sync waits by
+    * polling event-slot memory. If that ever changes to blocking on the
+    * fd, the two have to be reconciled rather than both reading.
+    *
+    * The same caveat applies across queues on one device: a notification
+    * for another group is consumed here and that queue never sees it.
+    * There is one queue per device today, but this is the thing that
+    * breaks first if that changes.
+    */
+   struct pan_kmod_kbase_event ev;
+   int ret;
+
+   while ((ret = pan_kmod_kbase_read_event(dev->kmod.dev, 0, &ev)) == 1) {
+      if (ev.type != PAN_KMOD_KBASE_EVENT_GROUP_ERROR)
+         continue;
+
+      if (ev.group_handle != queue->group_handle) {
+         mesa_logw("kbase: consumed a group-error notification for group %u "
+                   "while checking group %u",
+                   ev.group_handle, queue->group_handle);
+         continue;
+      }
+
+      return vk_queue_set_lost(&queue->gpu.vk,
+                               "kbase: GPU_QUEUE_GROUP_ERROR on group %u "
+                               "(error_type=%u)",
+                               ev.group_handle, ev.error_type);
+   }
+
+   /* A failed read is not itself a lost queue - it says the status could
+    * not be determined, which is different from a fault. Log and report
+    * clean rather than killing a device that may be fine.
+    */
+   if (ret < 0)
+      mesa_logw("kbase: could not read device notifications for status");
+
    return VK_SUCCESS;
 }
