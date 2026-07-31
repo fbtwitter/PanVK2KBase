@@ -81,3 +81,71 @@ struct drm_panthor_csif_info;
  */
 const struct drm_panthor_csif_info *
 pan_kmod_kbase_get_csif_props(const struct pan_kmod_dev *dev);
+
+/* ------------------------------------------------------------------ *
+ * CSF queue-group lifecycle.
+ *
+ * PanVK's GPU queue (csf/panvk_vX_gpu_queue.c) is written against
+ * panthor: DRM_IOCTL_PANTHOR_GROUP_CREATE / _DESTROY,
+ * _TILER_HEAP_CREATE / _DESTROY, _GROUP_SUBMIT, plus libdrm syncobjs on
+ * dev->drm_fd. None of that exists on a misc device.
+ *
+ * These are the kbase equivalents, in the order PanVK needs them. Each
+ * wraps an ioctl sequence already exercised on real hardware by this
+ * repo's standalone probes - tests/queue_group and tests/live_kick_probe
+ * create a group, register and bind a queue, kick it and watch the GPU
+ * consume the instruction. See docs/kbase-notes.md.
+ * ------------------------------------------------------------------ */
+
+/**
+ * pan_kmod_kbase_group_create() - Create a CSF queue group.
+ * @dev: kbase device.
+ * @shader_present: Shader-core mask to expose to the group; the endpoint
+ *                  masks are all set to this. Pass 0 to use the device's
+ *                  full mask.
+ * @priority: kbase queue-group priority (BASE_QUEUE_GROUP_PRIORITY_*).
+ * @group_handle: Where to store the created group's handle.
+ *
+ * Uses KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6 (nr 42), which is what the
+ * vendor blob uses exclusively - the modern nr 58 does not appear in
+ * libGLES_mali.so at all (see the ioctl survey in docs/kbase-notes.md).
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int pan_kmod_kbase_group_create(struct pan_kmod_dev *dev,
+                                uint64_t shader_present, uint8_t priority,
+                                uint8_t *group_handle);
+
+/**
+ * pan_kmod_kbase_group_destroy() - Terminate a CSF queue group.
+ * @dev: kbase device.
+ * @group_handle: Handle from pan_kmod_kbase_group_create().
+ */
+void pan_kmod_kbase_group_destroy(struct pan_kmod_dev *dev,
+                                  uint8_t group_handle);
+
+/**
+ * pan_kmod_kbase_tiler_heap_create() - Create a tiler heap.
+ * @dev: kbase device.
+ * @chunk_size: Bytes per chunk; must be 4KB-aligned.
+ * @initial_chunks: Chunks to commit up front, >= 1.
+ * @max_chunks: Growth limit, >= @initial_chunks.
+ * @gpu_heap_va: Where to store the heap's GPU address.
+ * @first_chunk_va: Where to store the first chunk's GPU address.
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int pan_kmod_kbase_tiler_heap_create(struct pan_kmod_dev *dev,
+                                     uint32_t chunk_size,
+                                     uint32_t initial_chunks,
+                                     uint32_t max_chunks,
+                                     uint64_t *gpu_heap_va,
+                                     uint64_t *first_chunk_va);
+
+/**
+ * pan_kmod_kbase_tiler_heap_destroy() - Tear down a tiler heap.
+ * @dev: kbase device.
+ * @gpu_heap_va: Address from pan_kmod_kbase_tiler_heap_create().
+ */
+void pan_kmod_kbase_tiler_heap_destroy(struct pan_kmod_dev *dev,
+                                       uint64_t gpu_heap_va);

@@ -298,13 +298,42 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       same ioctl for the same reason (see the `libGLES_mali.so` survey in
       `docs/kbase-notes.md`).
 - [ ] **`vkCreateDevice` now fails `-3` at the GPU queue — the expected
-      Phase 4 wall.** `panvk_vX_gpu_queue.c:685` issues
-      `DRM_IOCTL_PANTHOR_GROUP_CREATE` on the kbase fd. This is not a new
-      bug: the whole GPU queue is panthor-specific, and replacing it with
-      kbase's `CS_QUEUE_GROUP_CREATE`/`_REGISTER`/`_BIND`/`_KICK` is the
-      "Map VkQueueSubmit onto kbase" item in Phase 4 below, already
-      prototyped end-to-end in `tests/queue_group` and
-      `tests/live_kick_probe`.
+      Phase 4 wall, and it is bigger than it looks.**
+      `panvk_vX_gpu_queue.c:685` issues `DRM_IOCTL_PANTHOR_GROUP_CREATE`
+      on the kbase fd. Not a new bug: the whole GPU queue is
+      panthor-specific.
+      **Scope, measured rather than guessed.** It is not enough to swap
+      the group-create ioctl. `create_gpu_queue()` (`:1401`) does, in
+      order: `drmSyncobjCreate`, `init_tiler` →
+      `DRM_IOCTL_PANTHOR_TILER_HEAP_CREATE`, `create_group` →
+      `_GROUP_CREATE`, then `init_queue` → `init_subqueue` (`:363`) **per
+      subqueue**, and each of those *builds a real init command stream,
+      submits it with `DRM_IOCTL_PANTHOR_GROUP_SUBMIT`, and blocks on
+      `drmSyncobjWait` for it to complete* (`:556-568`). So making
+      `vkCreateDevice` succeed on kbase requires a working
+      submit-and-wait path, not just object creation — the whole of Phase
+      4, in a 1511-line file with ~13 panthor/libdrm call sites.
+      **Groundwork landed:** `pan_kmod_kbase_group_create`/`_destroy` and
+      `_tiler_heap_create`/`_destroy` are now in the backend
+      (`src/mesa/pan_kmod_kbase.{c,h}`), wrapping the exact ioctl
+      sequences `tests/queue_group` and `tests/live_kick_probe` already
+      run on hardware. They compile into the driver but **nothing calls
+      them yet**, so they are unproven in this form.
+      **Three ways to integrate, and the choice matters:**
+      (a) a sibling `panvk_vX_kbase_queue.c` selected at queue-creation
+      time — cleanest to read and closest to how a `tu_knl_kgsl.cc`-style
+      backend is structured, but duplicates a lot of non-ioctl logic that
+      would then drift from upstream;
+      (b) patch the ~13 call sites in `panvk_vX_gpu_queue.c` to dispatch
+      on `dev->ops == &kbase_kmod_ops` — smallest diff, keeps one copy of
+      the logic, but the patch script becomes large and fragile against
+      upstream movement;
+      (c) push submission into `pan_kmod_ops` as new vtable entries so
+      panthor and kbase are peers — the only option with an upstreaming
+      story (Phase 9), and the only one that needs agreement from
+      Panfrost maintainers before it is worth writing.
+      All the kbase-side primitives are proven; this is an integration
+      decision, not a hardware unknown.
 - [ ] ~~Real VA management is required~~ — superseded by the two items
       above. Kept for the reasoning: kbase supports it: the vendored headers
       define `BASE_MEM_FIXED` (`csf/mali_base_csf_kernel.h:34`) and

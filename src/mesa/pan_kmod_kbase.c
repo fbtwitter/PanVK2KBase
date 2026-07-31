@@ -681,6 +681,93 @@ kbase_query_allowed_priorities(struct kbase_kmod_dev *dev)
    dev->base.props.allowed_group_priorities_mask = mask;
 }
 
+/* ---------------------------------------------------------------- *
+ * CSF queue-group lifecycle. See pan_kmod_kbase.h for why these exist.
+ * ---------------------------------------------------------------- */
+
+int
+pan_kmod_kbase_group_create(struct pan_kmod_dev *dev, uint64_t shader_present,
+                            uint8_t priority, uint8_t *group_handle)
+{
+   if (!shader_present)
+      shader_present = dev->props.shader_present;
+
+   /* The endpoint masks go straight to firmware as
+    * CSG_ALLOW_COMPUTE/FRAGMENT/TILER. An earlier probe passed ~0ULL and
+    * the kernel accepted it - it only validates *_max <= hweight64(*_mask)
+    * - but asking for 64 cores on an 8-core GPU is not something to hand
+    * firmware. Use the real mask.
+    */
+   union kbase_ioctl_cs_queue_group_create_1_6 create = { 0 };
+   create.in.tiler_mask = shader_present;
+   create.in.fragment_mask = shader_present;
+   create.in.compute_mask = shader_present;
+   create.in.cs_min = 1;
+   create.in.priority = priority;
+   create.in.tiler_max = 1;
+   create.in.fragment_max = 1;
+   create.in.compute_max = 1;
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &create) < 0) {
+      mesa_loge("kbase: CS_QUEUE_GROUP_CREATE_1_6 failed: %s",
+                strerror(errno));
+      return -1;
+   }
+
+   *group_handle = create.out.group_handle;
+   return 0;
+}
+
+void
+pan_kmod_kbase_group_destroy(struct pan_kmod_dev *dev, uint8_t group_handle)
+{
+   struct kbase_ioctl_cs_queue_group_term term = {
+      .group_handle = group_handle,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &term) < 0)
+      mesa_loge("kbase: CS_QUEUE_GROUP_TERMINATE failed: %s", strerror(errno));
+}
+
+int
+pan_kmod_kbase_tiler_heap_create(struct pan_kmod_dev *dev, uint32_t chunk_size,
+                                 uint32_t initial_chunks, uint32_t max_chunks,
+                                 uint64_t *gpu_heap_va,
+                                 uint64_t *first_chunk_va)
+{
+   union kbase_ioctl_cs_tiler_heap_init heap = { 0 };
+   heap.in.chunk_size = chunk_size;
+   heap.in.initial_chunks = initial_chunks;
+   heap.in.max_chunks = max_chunks;
+   heap.in.target_in_flight = 1;
+   heap.in.group_id = 0;
+   heap.in.buf_desc_va = 0;
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &heap) < 0) {
+      mesa_loge("kbase: CS_TILER_HEAP_INIT failed: %s", strerror(errno));
+      return -1;
+   }
+
+   if (gpu_heap_va)
+      *gpu_heap_va = heap.out.gpu_heap_va;
+   if (first_chunk_va)
+      *first_chunk_va = heap.out.first_chunk_va;
+
+   return 0;
+}
+
+void
+pan_kmod_kbase_tiler_heap_destroy(struct pan_kmod_dev *dev,
+                                  uint64_t gpu_heap_va)
+{
+   struct kbase_ioctl_cs_tiler_heap_term term = {
+      .gpu_heap_va = gpu_heap_va,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &term) < 0)
+      mesa_loge("kbase: CS_TILER_HEAP_TERM failed: %s", strerror(errno));
+}
+
 const struct drm_panthor_csif_info *
 pan_kmod_kbase_get_csif_props(const struct pan_kmod_dev *dev)
 {
