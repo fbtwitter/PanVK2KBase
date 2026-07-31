@@ -108,6 +108,13 @@ driver_load_probe: ./src/tests/driver_load_probe/driver_load_probe.c
 driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_enum_probe $<
 
+# Asks the built driver whether it still claims dma-buf import/export, which
+# it cannot do on kbase. Exits non-zero if it does. This is what verifies
+# patch-panvk-kbase-external-memory.py actually took effect - the patch
+# compiling proves nothing about what the driver reports.
+driver_extmem_probe: ./src/tests/driver_extmem_probe/driver_extmem_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_extmem_probe $<
+
 # Drives the kbase event-memory vk_sync through the real Vulkan API:
 # timeline semaphore signal/get/wait and binary fence status/reset. Proves
 # the sync type works, not merely that it registered.
