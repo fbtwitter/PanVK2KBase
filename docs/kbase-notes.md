@@ -901,6 +901,56 @@ Consequence for the backend: `bo_alloc` should stop using SAME_VA, and
 `vm_bind` should do the real mapping at `op->va.start` with
 `MEM_ALLOC_EX` + `BASE_MEM_FIXED`. See ROADMAP.md Phase 2.
 
+## A kick only lands on an idle CS (`CS_ACTIVE` must be 0)
+
+Found while wiring `VkQueueSubmit`: the first submit on a queue worked and
+every one after it silently did nothing. Not an error — `CS_QUEUE_KICK`
+returned 0 every time, and the bytes were still in the ring; they just sat
+there until some later kick flushed them. The symptom is a `vkWaitForFences`
+that times out, not a failure you can catch at submit time.
+
+Logging `CS_INSERT` / `CS_EXTRACT` / `CS_ACTIVE` at each kick, three in a
+row on one queue (Mali-G720, r49p1, `tests/driver_sync_probe`):
+
+```
+kick 1: insert=24 extract=0  CS_ACTIVE=0  -> ran, extract reached 24
+kick 2: insert=48 extract=24 CS_ACTIVE=1  -> DID NOT RUN
+kick 3: insert=72 extract=48 CS_ACTIVE=0  -> ran, extract reached 72
+```
+
+The failing kick is exactly the one issued while `CS_ACTIVE` was still 1.
+That flag lingers ~30-40ms after a stream finishes, which is well inside the
+turnaround of a tight submit/wait loop — so in practice *every* submit after
+the first landed in the bad window. Inserting a 200ms delay before each kick
+made 4/4 submits run within 10ms of their kick; removing it made every
+submit after the first time out. That delay was the only difference.
+
+Reading of it: the kick handler flags the queue and wakes the scheduler,
+which is what gets an *offslot* group scheduled. A CS that is already onslot
+and has caught up (`extract == insert`) is not waiting on the scheduler, and
+nothing in that path tells it to re-read `CS_INSERT`.
+
+**Ruled out — do not retry: ringing the user-IO doorbell page.** Panfork's
+`kbase_cs_submit()` (`pan_vX_base.c:1470`) has exactly this branch — read
+`CS_ACTIVE`, and if set, write 1 to `user_io + 0` instead of calling the
+ioctl — but its condition is hardcoded false so it always takes the ioctl
+path. Tried here anyway, unconditionally: the failing kick still did not
+run. That page also reads back whatever was last written to it (wrote 1,
+read 1 at the next kick), so on this device it behaves as ordinary memory,
+not as an MMIO doorbell register. Panfork disabling that branch looks
+deliberate rather than accidental.
+
+Fix in use: `pan_kmod_kbase_queue_wait_idle()`, called before every kick.
+It works — 5/5 runs of `driver_sync_probe`, three submits each — but it
+serialises submissions, which defeats much of the point of a ring buffer.
+It is correct-but-slow, and it is the honest option while the real wake
+mechanism for an onslot idle CS is unknown.
+
+Worth revisiting if kernel-side visibility ever becomes available (it needs
+root — see the debugfs/dmesg section above): the answer is presumably in how
+`kbase_csf_queue_kick()` decides whether to ring the hardware doorbell for a
+group that is already onslot.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

@@ -56,3 +56,21 @@ VkResult panvk_kbase_sync_type_init(struct panvk_kbase_sync_type *type,
  * @type: Type previously initialised by panvk_kbase_sync_type_init().
  */
 void panvk_kbase_sync_type_finish(struct panvk_kbase_sync_type *type);
+
+/**
+ * panvk_kbase_sync_slot_gpu_va() - GPU address of a sync's value word.
+ * @sync: A vk_sync belonging to a panvk_kbase_sync_type.
+ *
+ * The address a command stream writes with SYNC_SET64 at system scope to
+ * signal this sync from the GPU, which is the same word the CPU-side
+ * signal/reset/wait paths in panvk_kbase_sync.c touch. That aliasing is
+ * the whole point: it is what makes a GPU-signalled fence observable by
+ * vkWaitForFences without a second mechanism.
+ *
+ * The caller must know @sync is one of ours - compare sync->type against
+ * &phys_dev->kbase_sync_type.base. There is no runtime check here because
+ * a mismatch would be a driver bug, not a recoverable condition.
+ *
+ * Return: GPU virtual address of the 64-bit value word.
+ */
+uint64_t panvk_kbase_sync_slot_gpu_va(const struct vk_sync *sync);

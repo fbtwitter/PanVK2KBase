@@ -12,9 +12,14 @@
 // BASE_MEM_CSF_EVENT allocation - see src/mesa/panvk_kbase_sync.c and
 // docs/kbase-notes.md "Finding 2".
 //
-// Scope: CPU-side operations only. Nothing here submits GPU work, because
-// VkQueueSubmit on kbase is not wired up (Phase 4). A passing run means the
-// sync object is correct, not that the GPU can signal it.
+// It then submits: an empty vkQueueSubmit (no command buffers) whose whole
+// command stream is a SYNC_SET64 against a fence's event slot, and waits
+// for the fence. Nothing in the driver's submit path writes that slot from
+// the CPU, so a fence that comes back signalled was signalled by the GPU.
+//
+// Scope: no command buffers are submitted - those need the per-subqueue
+// context init that does not exist yet. A passing run means the sync
+// object is correct and the GPU can signal it, not that real work runs.
 //
 // Usage: driver_sync_probe /data/local/tmp/libvulkan_panfrost.so
 #include <dlfcn.h>
@@ -88,6 +93,13 @@ main(int argc, char **argv)
       fprintf(stderr, "usage: %s <path-to-libvulkan_panfrost.so>\n", argv[0]);
       return 2;
    }
+
+   /* Unbuffered: this probe now submits GPU work, and a submit path that
+    * hangs is a failure mode worth diagnosing. With the default block
+    * buffering on a pipe, killing a hung run discards everything printed
+    * so far and the log says nothing about how far it got.
+    */
+   setvbuf(stdout, NULL, _IONBF, 0);
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -170,13 +182,11 @@ main(int argc, char **argv)
              "   the sync type is broken - physical device creation, which\n"
              "   is what registers it, succeeds (see driver_enum_probe).\n"
              "\n"
-             "   Expected as of now: -3 VK_ERROR_INITIALIZATION_FAILED from\n"
-             "   panvk_vX_gpu_queue.c's DRM_IOCTL_PANTHOR_GROUP_CREATE,\n"
-             "   issued on the kbase fd. The GPU queue is still entirely\n"
-             "   panthor-specific; swapping it for kbase's\n"
-             "   CS_QUEUE_GROUP_CREATE/REGISTER/BIND/KICK is Phase 4 (and is\n"
-             "   already prototyped in tests/queue_group).\n"
-             "   Anything else, check `adb logcat -d | grep MESA`.\n",
+             "   This used to be an expected -3 from the panthor-specific\n"
+             "   GPU queue, but panvk_vX_kbase_queue.c now creates the tiler\n"
+             "   heap, queue group and per-subqueue CS rings on kbase, so\n"
+             "   success is the expected outcome. A failure here is a real\n"
+             "   regression - check `adb logcat -d | grep MESA`.\n",
              r);
       return 1;
    }
@@ -308,25 +318,110 @@ main(int argc, char **argv)
       }
    }
 
-   /* vkDeviceWaitIdle goes through the queue, which is not wired for kbase.
-    * Report it rather than asserting - it is expected to be unhappy until
-    * Phase 4 lands.
+   /* ------------------------------------------- GPU-signalled fence */
+   /* The one thing every check above cannot show: that the GPU, not the
+    * CPU, can signal a sync. An empty submit - no command buffers - builds
+    * a command stream whose entire content is a SYNC_SET64 against the
+    * fence's event slot, publishes it to the ring and kicks. Nothing in
+    * the driver's submit path writes that slot from the CPU, so a fence
+    * that comes back signalled was signalled by the GPU.
+    *
+    * This is the first time anything in this repo signals a vk_sync from
+    * the GPU through the Vulkan API rather than through a standalone probe.
     */
-   printf("\n=== vkDeviceWaitIdle (expected to be incomplete pre-Phase 4) ===\n");
+   printf("\n=== GPU-signalled fence (empty vkQueueSubmit) ===\n");
+   PFN_vkGetDeviceQueue get_queue = GDPA(vkGetDeviceQueue);
+   PFN_vkQueueSubmit queue_submit = GDPA(vkQueueSubmit);
+   PFN_vkWaitForFences wait_fences = GDPA(vkWaitForFences);
+
+   if (!get_queue || !queue_submit || !wait_fences || !create_fence) {
+      printf("  submit entrypoints missing\n");
+      failures++;
+   } else {
+      VkQueue queue = VK_NULL_HANDLE;
+      get_queue(device, 0, 0, &queue);
+
+      /* Repeated deliberately. A ring buffer only exercises its bookkeeping
+       * on the second and later submits: the first one always writes at
+       * offset 0 with an empty ring, so a broken insert/extract accounting
+       * or a stream that only runs once would still pass a single-shot
+       * test. Three is enough to catch "only the first one runs".
+       */
+      for (int iter = 0; iter < 3; iter++) {
+         VkFenceCreateInfo fci = {
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+         };
+         VkFence fence = VK_NULL_HANDLE;
+         r = create_fence(device, &fci, NULL, &fence);
+         if (r != VK_SUCCESS) {
+            check(false, "vkCreateFence(unsignalled)");
+            break;
+         }
+
+         if (iter == 0)
+            check(fence_status(device, fence) == VK_NOT_READY,
+                  "fence starts unsignalled");
+
+         /* submitCount=1 with zero command buffers, rather than a
+          * fence-only submitCount=0, so the runtime definitely builds a
+          * vk_queue_submit carrying the fence as a signal.
+          */
+         VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         };
+         r = queue_submit(queue, 1, &si, fence);
+         printf("    [%d] vkQueueSubmit -> %d\n", iter, r);
+
+         char label[64];
+         snprintf(label, sizeof(label), "submit %d accepted", iter);
+         check(r == VK_SUCCESS, label);
+
+         if (r == VK_SUCCESS) {
+            /* 2s, the same budget the standalone probes give a stream
+             * before calling it never-going-to-run.
+             */
+            r = wait_fences(device, 1, &fence, VK_TRUE,
+                            2ull * 1000 * 1000 * 1000);
+            printf("    [%d] vkWaitForFences -> %d\n", iter, r);
+
+            snprintf(label, sizeof(label),
+                     "*** GPU SIGNALLED THE FENCE (submit %d) ***", iter);
+            check(r == VK_SUCCESS, label);
+
+            if (r != VK_SUCCESS) {
+               printf("      Submit %d was accepted but its slot was never\n"
+                      "      written. If submit 0 passed and this did not,\n"
+                      "      the stream only runs once per queue - look at\n"
+                      "      ring insert/extract accounting, not at the\n"
+                      "      SYNC_SET64 encoding.\n", iter);
+               destroy_fence(device, fence, NULL);
+               break;
+            }
+         }
+
+         destroy_fence(device, fence, NULL);
+      }
+   }
+
+   /* vkDeviceWaitIdle drains the queue, which now has a real submit path.
+    */
+   printf("\n=== vkDeviceWaitIdle ===\n");
    if (wait_idle) {
       r = wait_idle(device);
       printf("  vkDeviceWaitIdle -> %d%s\n", r,
-             r == VK_SUCCESS ? " (OK)" : " (not fatal here)");
+             r == VK_SUCCESS ? " (OK)" : "");
+      check(r == VK_SUCCESS, "vkDeviceWaitIdle");
    }
 
    destroy_device(device, NULL);
 
    printf("\n================================================================\n");
    if (failures == 0)
-      printf("RESULT: %d checks passed. The kbase event-memory vk_sync works\n"
-             "        for every CPU-side operation Vulkan exposes.\n"
-             "        GPU-side signalling is still unwired - see Phase 4.\n",
-             0);
+      printf("RESULT: all checks passed. The kbase event-memory vk_sync works\n"
+             "        for every CPU-side operation Vulkan exposes, AND the\n"
+             "        GPU can signal one through vkQueueSubmit.\n"
+             "        Command buffers are still unsubmittable - they need the\n"
+             "        per-subqueue context init.\n");
    else
       printf("RESULT: %d check(s) FAILED - see above.\n", failures);
    printf("================================================================\n");

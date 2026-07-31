@@ -274,6 +274,26 @@ uint64_t pan_kmod_kbase_queue_extract(const struct pan_kmod_kbase_cs *cs);
 bool pan_kmod_kbase_queue_active(const struct pan_kmod_kbase_cs *cs);
 
 /**
+ * pan_kmod_kbase_queue_wait_idle() - Wait for CS_ACTIVE to clear.
+ * @cs: A queue from pan_kmod_kbase_queue_create().
+ * @timeout_ms: Milliseconds to wait before giving up.
+ *
+ * REQUIRED BEFORE EVERY KICK, not an optimisation. A kick issued while
+ * CS_ACTIVE is 1 is accepted, returns 0, and does not run: the bytes stay
+ * in the ring until some later kick happens to flush them. Measured on
+ * hardware - the evidence is in the comment on the implementation.
+ *
+ * This serialises submissions, which is a real cost and a known
+ * limitation, not a design choice. It is here because the alternative is
+ * a submit path that silently loses work.
+ *
+ * Return: true if the CS is idle, false if it was still active at timeout
+ * (in which case kicking anyway will probably not take effect).
+ */
+bool pan_kmod_kbase_queue_wait_idle(const struct pan_kmod_kbase_cs *cs,
+                                    unsigned timeout_ms);
+
+/**
  * enum pan_kmod_kbase_event_type - What a kbase notification reported.
  * @PAN_KMOD_KBASE_EVENT_KERNEL: Ordinary kernel event; something the
  *                               context is waiting on may have moved.

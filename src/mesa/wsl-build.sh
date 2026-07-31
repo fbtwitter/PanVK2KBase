@@ -20,6 +20,15 @@ cp "$REPO/src/mesa/pan_kmod_kbase.h" src/panfrost/lib/kmod/
 # ioctl uapi), so it travels next to the backend rather than via -I.
 cp "$REPO/src/utils/csf_user_regs.h" src/panfrost/lib/kmod/
 
+# The driver-side files too. These are not needed to build libpankmod_lib,
+# which is all this script's native target links, but wsl-build-android.sh
+# delegates its sync here and *does* build them into the driver. Leaving
+# them out meant an Android build could silently compile a stale copy and
+# report success - which it did, once.
+cp "$REPO/src/mesa/panvk_kbase_sync.c" src/panfrost/vulkan/
+cp "$REPO/src/mesa/panvk_kbase_sync.h" src/panfrost/vulkan/
+cp "$REPO/src/mesa/panvk_vX_kbase_queue.c" src/panfrost/vulkan/csf/
+
 echo "=== 2. apply dispatch change to pan_kmod.c ==="
 if grep -q kbase_kmod_ops src/panfrost/lib/kmod/pan_kmod.c; then
   echo "    already applied"

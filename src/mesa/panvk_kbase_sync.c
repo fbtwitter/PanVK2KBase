@@ -98,6 +98,21 @@ free_slot(struct panvk_kbase_sync_type *type, uint32_t slot)
    simple_mtx_unlock(&type->lock);
 }
 
+uint64_t
+panvk_kbase_sync_slot_gpu_va(const struct vk_sync *sync)
+{
+   const struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
+   const struct panvk_kbase_sync *s =
+      container_of(sync, const struct panvk_kbase_sync, base);
+
+   /* The event memory is BASE_MEM_SAME_VA, so type->gpu_va and type->slots
+    * are the same address; going through gpu_va rather than casting the CPU
+    * pointer keeps that an implementation detail of the allocation rather
+    * than something this arithmetic depends on.
+    */
+   return type->gpu_va + (uint64_t)s->slot * PANVK_KBASE_EVENT_SLOT_SIZE;
+}
+
 static VkResult
 panvk_kbase_sync_init(struct vk_device *device, struct vk_sync *sync,
                       uint64_t initial_value)

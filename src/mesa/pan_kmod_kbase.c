@@ -990,6 +990,11 @@ pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
     */
    __sync_synchronize();
 
+   /* KNOWN LIMITATION, measured: a kick issued while CS_ACTIVE is 1 does
+    * not take effect. See pan_kmod_kbase_queue_wait_idle() below, and the
+    * comment there for the evidence - callers are expected to have waited
+    * for the CS to go idle before getting here.
+    */
    struct kbase_ioctl_cs_queue_kick kick = {
       .buffer_gpu_addr = cs->ringbuf_gpu_va,
    };
@@ -1000,6 +1005,53 @@ pan_kmod_kbase_queue_kick(struct pan_kmod_dev *dev,
    }
 
    return 0;
+}
+
+/* Why this exists, measured on a Mali-G720 / kbase r49p1:
+ *
+ * Kicking a queue three times in a row, logging state at each kick:
+ *
+ *   kick 1: insert=24 extract=0  CS_ACTIVE=0  -> ran, extract reached 24
+ *   kick 2: insert=48 extract=24 CS_ACTIVE=1  -> DID NOT RUN
+ *   kick 3: insert=72 extract=48 CS_ACTIVE=0  -> ran, extract reached 72
+ *
+ * The failing kick is exactly the one issued while CS_ACTIVE was 1, which
+ * lingers ~30-40ms after a stream finishes. Its bytes were not lost - they
+ * sat in the ring until kick 3 flushed them, which is why the symptom is a
+ * submit that never completes rather than one that errors. Adding a 200ms
+ * delay before every kick made 4/4 submits run within 10ms; removing it
+ * made every submit after the first time out.
+ *
+ * Ruled out - do not retry: ringing the user-IO doorbell page (page 0,
+ * offset 0, value 1) the way Panfork's kbase_cs_submit() would if its
+ * doorbell branch were not hardcoded off. Tried unconditionally, and the
+ * failing kick still did not run. That page also reads back whatever was
+ * last written to it (wrote 1, read 1 at the next kick), so on this device
+ * it behaves as ordinary memory, not as an MMIO doorbell register. Panfork
+ * disabling that branch looks deliberate.
+ *
+ * What this costs: serialisation. A caller that waits for idle before
+ * every kick cannot keep two streams in flight, which defeats much of the
+ * point of a ring buffer. It is correct but slow, and it is the honest
+ * option while the real wake mechanism for an onslot idle CS is unknown -
+ * the alternative is a submit path that silently drops work.
+ *
+ * Worth revisiting when kernel-side visibility is available: the answer is
+ * presumably in how kbase_csf_queue_kick() decides whether to ring the
+ * hardware doorbell for a group that is already onslot.
+ */
+bool
+pan_kmod_kbase_queue_wait_idle(const struct pan_kmod_kbase_cs *cs,
+                               unsigned timeout_ms)
+{
+   for (unsigned i = 0; i < timeout_ms; i++) {
+      if (!pan_kmod_kbase_queue_active(cs))
+         return true;
+
+      os_time_sleep(1000);
+   }
+
+   return !pan_kmod_kbase_queue_active(cs);
 }
 
 uint64_t

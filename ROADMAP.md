@@ -352,27 +352,59 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       Also fixed on the way: `make mesa-backend-check` had been failing in
       `util/u_endian.h` before reaching backend code at all — it stands in
       for meson's config header, and was missing `-DHAVE_ENDIAN_H`.
-- [ ] **Submission is what is left.** `panvk_per_arch(kbase_queue_submit)`
-      returns `VK_ERROR_FEATURE_NOT_PRESENT` rather than pretending.
-      With the primitives above in place this is assembly, not discovery:
-      build the command stream into the bound ring buffer, `_queue_kick()`,
-      and wait on a `BASE_MEM_CSF_EVENT` slot signalled by a `SYNC_SET64`
-      in the stream — which is what `panvk_kbase_sync` already polls.
-      Smallest useful first target is an *empty* `vkQueueSubmit`: a stream
-      that does nothing but signal the submit's signal-sync. No command
-      buffers, no tiler, no subqueue context — but it is the first time the
-      GPU rather than the CPU signals a `vk_sync`, and it keeps
-      `vkCreateDevice` working while the machinery is debugged.
-      Also still missing: the per-subqueue init command stream panthor runs
-      at queue-creation time (`init_subqueue()`), which sets up subqueue
-      context registers. It needs submission, so it waits on the above. A
-      queue created today is structurally valid but its GPU-side context
-      has not been initialised.
-      Once submission works, `VK_SYNC_FEATURE_GPU_WAIT` can be advertised
-      and semaphores start working; the CPU wait in `panvk_kbase_sync.c`
-      should also switch from polling to blocking on the kbase fd's
-      notification (noting `read()` consumes one, so it needs a single
-      owner of the event stream).
+- [x] **The GPU signals a `vk_sync` through `vkQueueSubmit`.** An empty
+      submit — no command buffers — builds a stream whose entire content is
+      one `SYNC_SET64` per signalled sync at system scope, publishes it to
+      the compute subqueue's ring and kicks. `tests/driver_sync_probe` now
+      creates a fence, passes it to `vkQueueSubmit`, and gets it back
+      signalled: **5/5 runs, all checks passed**, three submits per run.
+      Nothing on the CPU side of that path writes the slot, so a signalled
+      fence was signalled by the GPU. `vkDeviceWaitIdle` returns 0.
+      No regressions: `driver_enum_probe`, `first_test`, `queue_group`,
+      `live_kick_probe`, `event_slot_probe` and `fixed_va_probe` all still
+      pass.
+      **A kick only lands on an idle CS — measured, and it cost a debugging
+      cycle.** Kicking three times in a row while logging state:
+      `insert=24 extract=0 CS_ACTIVE=0` ran; `insert=48 extract=24
+      CS_ACTIVE=1` **did not run**; `insert=72 extract=48 CS_ACTIVE=0` ran.
+      The failing kick is exactly the one issued while `CS_ACTIVE` was
+      still 1, which lingers ~30-40ms after a stream ends. The bytes are
+      not lost — they sit in the ring until a later kick flushes them, so
+      the symptom is a submit that never completes rather than one that
+      errors, and a 200ms delay before every kick made 4/4 run within 10ms.
+      `pan_kmod_kbase_queue_wait_idle()` is the fix and the submit path
+      calls it before every kick.
+      **Ruled out, do not retry:** ringing the user-IO doorbell page (page
+      0, offset 0, value 1) as Panfork's `kbase_cs_submit()` would if its
+      doorbell branch were not hardcoded off. Tried unconditionally; the
+      failing kick still did not run. That page also reads back whatever
+      was last written to it, so on this device it is ordinary memory, not
+      an MMIO doorbell — which is presumably why Panfork disabled it.
+      **Cost: submissions are serialised**, which defeats much of the point
+      of a ring buffer. Correct but slow, and the honest option while the
+      real wake mechanism for an onslot idle CS is unknown. Revisit if
+      kernel-side visibility ever becomes available — the answer is
+      presumably in how `kbase_csf_queue_kick()` decides whether to ring
+      the hardware doorbell for a group that is already onslot.
+- [ ] **Command buffers are what is left.** `kbase_queue_submit()` refuses
+      any submit carrying them, because they need the per-subqueue init
+      command stream panthor runs at queue-creation time
+      (`init_subqueue()`) to set up subqueue context registers. A queue
+      created today is structurally valid but its GPU-side context has
+      never been initialised, so running real work against it would produce
+      wrong results rather than an error. That init stream is itself just a
+      submit, which now works — so this is the next thing to build.
+      Still not done either: **GPU-side waits**. `vk_submit->waits` are
+      satisfied on the CPU before anything is published, so
+      `VK_SYNC_FEATURE_GPU_WAIT` stays unadvertised and semaphores still
+      cannot be created. Signalling from the GPU works; waiting on the GPU
+      needs `SYNC_WAIT64` in the stream. (The earlier note here said
+      submission working would let semaphores work — that was imprecise:
+      signal and wait are separate features and only signal is done.)
+      The CPU wait in `panvk_kbase_sync.c` should also switch from polling
+      to blocking on the kbase fd's notification via
+      `pan_kmod_kbase_read_event()` (noting `read()` consumes one, so it
+      needs a single owner of the event stream).
 - [x] ~~`vkCreateDevice` fails `-3` at the GPU queue~~ — resolved above.
       Kept for the scope analysis, which is still accurate:
       `panvk_vX_gpu_queue.c:685` issues `DRM_IOCTL_PANTHOR_GROUP_CREATE`
