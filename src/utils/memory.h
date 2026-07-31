@@ -96,7 +96,46 @@ struct kbase_bo *kbase_bo_create(int fd, size_t size) {
   printf("buffer cpu = 0x%016lx\n", bo->cpu);
   printf("buffer size   = %zu\n", bo->size);
 
-  bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
+  /*
+      Why this is an "if" and not just an assignment.
+
+      kbase can report an allocation's GPU address in two different ways,
+      and you can only tell which one you got by looking at out.flags.
+
+      Case 1 - BASE_MEM_SAME_VA (what we get today).
+      MEM_ALLOC does not return an address at all. It returns a small
+      placeholder number, a "cookie", and the memory has no GPU mapping
+      yet. Calling mmap() with that cookie as the offset is what actually
+      creates the mapping, and the CPU address mmap() gives back is then
+      *also* the GPU address - the same number works for both sides. That
+      is why we overwrite gpu_va with the CPU pointer here.
+
+      Case 2 - no SAME_VA (GPU-executable, or BASE_MEM_FIXED/FIXABLE).
+      kbase maps the memory immediately and out.gpu_va is already the real
+      GPU address. The CPU mapping ends up somewhere completely unrelated.
+      Overwriting gpu_va here would throw away a valid address and replace
+      it with a meaningless one.
+
+      Measured on a Mali-G720, three allocations from this same function:
+
+        plain     SAME_VA=YES   out.gpu_va=0x41000         cpu=0x799ae21000
+        GPU_EX    SAME_VA=NO    out.gpu_va=0x800000001000  cpu=0x799ae1d000
+        FIXABLE   SAME_VA=NO    out.gpu_va=0x800200000000  cpu=0x799ae19000
+
+      Only the first should be overwritten. The other two already hold the
+      address the GPU wants.
+
+      Note the flags are read from out.flags, not the in.flags we sent:
+      kbase adds SAME_VA on our behalf, so we ask for 0xf and get 0x200f
+      back. The request cannot tell you which case you are in - only the
+      reply can.
+
+      Right now every allocation here lands in case 1, so both paths agree.
+      The check is what keeps this correct once the flags become a
+      parameter. tests/same_va_probe demonstrates all three rows above.
+  */
+  if (alloc.out.flags & BASE_MEM_SAME_VA)
+    bo->gpu_va = (uint64_t)(uintptr_t)bo->cpu;
 
   // return the constructed buffer object
   return bo;
