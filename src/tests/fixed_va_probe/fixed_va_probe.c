@@ -215,6 +215,57 @@ int main(void) {
   printf("  -> %s\n", packed ? "both honoured; userspace can drive placement"
                              : "placement not fully under our control");
 
+  // --- 7: multi-page fixed allocations, mapped and written in full ------
+  //
+  // Section 5 only proves a single page works. The Mesa backend allocates
+  // multi-page BOs (a 32KB one for the tiler-OOM handlers) and crashed
+  // writing near the end of one, with a fault address ~32KB above the
+  // mapping - the signature of a mapping shorter than asked for. So check
+  // that mmap() of a multi-page fixed region really covers the whole
+  // region, by touching every page.
+  printf("\n=== 7: multi-page fixed allocation, every page written ===\n");
+  const uint64_t sizes[] = {2 * PAGE_SIZE, 8 * PAGE_SIZE, 32768};
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+    uint64_t want = KNOWN_FIXED_VA_ZONE + 0x40000000ull + i * 0x100000ull;
+    uint64_t pages = sizes[i] / PAGE_SIZE;
+
+    union kbase_ioctl_mem_alloc_ex al = {0};
+    al.in.va_pages = pages;
+    al.in.commit_pages = pages;
+    al.in.flags = RW_FLAGS | BASE_MEM_FIXED;
+    al.in.fixed_address = want;
+
+    if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC_EX, &al) < 0) {
+      printf("  %5llu bytes @ 0x%llx -> alloc FAILED (%s)\n",
+             (unsigned long long)sizes[i], (unsigned long long)want,
+             strerror(errno));
+      continue;
+    }
+
+    void *m = mmap(NULL, sizes[i], PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                   (off_t)al.out.gpu_va);
+    if (m == MAP_FAILED) {
+      printf("  %5llu bytes @ 0x%llx -> mmap FAILED (%s)\n",
+             (unsigned long long)sizes[i], (unsigned long long)al.out.gpu_va,
+             strerror(errno));
+      continue;
+    }
+
+    // Touch the first byte of every page. A short mapping faults here
+    // rather than silently corrupting.
+    bool ok = true;
+    for (uint64_t p = 0; p < pages; p++) {
+      volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)m + p * PAGE_SIZE);
+      *slot = 0xA5A50000ull + p;
+      if (*slot != 0xA5A50000ull + p)
+        ok = false;
+    }
+    printf("  %5llu bytes @ 0x%llx -> mapped at %p, all %llu pages %s\n",
+           (unsigned long long)sizes[i], (unsigned long long)al.out.gpu_va, m,
+           (unsigned long long)pages, ok ? "readable+writable" : "MISMATCH");
+    munmap(m, sizes[i]);
+  }
+
   printf("\n================================================================\n");
   printf("RESULT: BASE_MEM_FIXED works. A backend can allocate at a\n");
   printf("        caller-chosen GPU VA via KBASE_IOCTL_MEM_ALLOC_EX, which\n");

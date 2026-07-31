@@ -239,9 +239,50 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `vm_bind` therefore now **fails** on a caller-chosen VA it cannot
       honour, so `vkCreateDevice` returns an error instead of crashing.
       That is the honest state.
-- [ ] **Real VA management is required, not optional — this is the
-      blocker for `vkCreateDevice`.** Option (b) from the earlier writeup,
-      now the only viable path. kbase supports it: the vendored headers
+- [x] **Real VA management — done in the backend.** `bo_alloc` no longer
+      uses `BASE_MEM_SAME_VA`. It allocates a GPU VA from a device-level
+      `util_vma_heap` over the FIXED_VA zone, then `MEM_ALLOC_EX` +
+      `BASE_MEM_FIXED` places the allocation there; `bo_free` does a real
+      `MEM_FREE` and returns the VA to the heap; `bo_get_mmap_offset`
+      returns the GPU VA, so `pan_kmod_bo_mmap()` produces a CPU mapping
+      at an unrelated address. The zone is located at device-init by a
+      one-page `BASE_MEM_FIXED` probe (never `FIXABLE`, which would poison
+      the context — see `docs/kbase-notes.md`), overridable with
+      `PANVK_KBASE_FIXED_VA_BASE`.
+      **The key move is in `vm_create`: it forces
+      `PAN_KMOD_VM_FLAG_AUTO_VA` on.** PanVK's `util_vma_heap` allocates
+      from a range kbase rejects (it asked for `0xfffff000`; the zone is at
+      `0x800200000000`). Rather than rewrite PanVK's VA setup, use the
+      inversion `pan_kmod` already supports: with AUTO_VA,
+      `panvk_priv_bo.c:62` leaves `op.va.start = PAN_KMOD_VM_MAP_AUTO_VA`
+      and adopts whatever `vm_bind` writes back. So the backend picks from
+      the zone the kernel accepts and PanVK follows. Same path panfrost
+      (arch < 10) already uses, so it is a supported configuration.
+      Confirmed working: BOs are allocated at real fixed addresses and
+      `vm_bind` reports them with no mismatch warnings, and
+      `driver_enum_probe` is unaffected (`count=1`, Mali-G720 MC8).
+      Standalone probes were deliberately left on SAME_VA — they are the
+      hardware evidence for Phases 3-4 and all still pass.
+- [ ] **`vkCreateDevice` still fails: segfault in
+      `generate_tiler_oom_handler`.** Not root-caused. Device creation now
+      gets much further — past the VM, past mempool setup — and crashes
+      inside `csf/panvk_vX_exception_handler.c` while generating the
+      tiler-OOM handlers, after exactly two BO allocations (4KB, then the
+      32KB `handlers_bo`). No kbase error is logged; the VA path is
+      working.
+      Ruled out so far: short CPU mappings. The obvious theory was that
+      `pan_kmod_bo_mmap()` of a multi-page fixed region covers less than
+      it claims — the fault address sits roughly 32KB above a mapping —
+      but `tests/fixed_va_probe` section 7 allocates 2-, 8- and 8-page
+      fixed regions, maps them, writes every page, and all succeed. So the
+      mapping is fine and the cause is elsewhere.
+      Next things to try: log `handlers_bo->addr.host` and the
+      `cs_builder` capacity at the crash site; check whether
+      `conf.alloc_buffer` is being invoked (i.e. the generated stream
+      overflows `TILER_OOM_HANDLER_MAX_SIZE`) and what it returns; and
+      confirm the arch-specific library selected (v12) matches the device.
+- [ ] ~~Real VA management is required~~ — superseded by the two items
+      above. Kept for the reasoning: kbase supports it: the vendored headers
       define `BASE_MEM_FIXED` (`csf/mali_base_csf_kernel.h:34`) and
       `BASE_MEM_FIXABLE` (`:58`), which is the mechanism for allocating at
       a caller-chosen GPU VA instead of letting the kernel pick via

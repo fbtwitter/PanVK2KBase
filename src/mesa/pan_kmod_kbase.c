@@ -44,7 +44,10 @@
 #include <unistd.h>
 
 #include "util/macros.h"
+#include "util/os_misc.h"
+#include "util/simple_mtx.h"
 #include "util/u_memory.h"
+#include "util/vma.h"
 
 #include "pan_kmod.h"
 #include "pan_kmod_backend.h"
@@ -70,11 +73,49 @@
  * every allocation), not a usable address. Verified on hardware; see
  * docs/kbase-notes.md's SAME_VA section.
  */
+/* Base of the kbase FIXED_VA zone, and how much of it this backend is
+ * willing to hand out.
+ *
+ * Measured on a Poco X8 Pro / Mali-G720 / r49p1 by tests/fixed_va_probe: a
+ * BASE_MEM_FIXED allocation is honoured exactly at 0x800200000000 and
+ * above, and rejected with ENOMEM outside the zone. The zone's *size* was
+ * not established - allocations were verified up to base + 0x30001000
+ * (768MB). The range below is therefore deliberately larger than what has
+ * been proven: running off the end shows up as MEM_ALLOC_EX failing
+ * ENOMEM, which bo_alloc handles by returning the VA to the heap and
+ * failing cleanly, so over-estimating costs a failed allocation rather
+ * than corruption.
+ *
+ * Overridable so a device with a different zone can be pointed at without
+ * a rebuild - the base is a kernel constant and may well differ across
+ * kbase versions or vendors.
+ */
+#define KBASE_FIXED_VA_ZONE_START 0x800200000000ull
+#define KBASE_FIXED_VA_ZONE_SIZE (8ull << 30)
+
+/* Alternative bases tried at device-init if the default is rejected.
+ * Deliberately probed with BASE_MEM_FIXED rather than BASE_MEM_FIXABLE:
+ * the two are mutually exclusive per context, so a FIXABLE probe would
+ * poison every subsequent FIXED allocation with EINVAL. That is not
+ * hypothetical - it is exactly what happened while writing
+ * tests/fixed_va_probe. See docs/kbase-notes.md.
+ */
+static const uint64_t kbase_fixed_va_candidates[] = {
+   KBASE_FIXED_VA_ZONE_START,
+   0x800000000000ull,
+   0x800100000000ull,
+   0x800400000000ull,
+};
+
 struct kbase_kmod_bo {
    struct pan_kmod_bo base;
 
-   /* CPU mapping, which doubles as the GPU VA under SAME_VA. */
-   void *cpu;
+   /* GPU virtual address, chosen by this backend's VA allocator and made
+    * real by MEM_ALLOC_EX + BASE_MEM_FIXED. Unlike the old SAME_VA model,
+    * this is NOT the CPU address: pan_kmod_bo_mmap() maps it separately
+    * and lands wherever the kernel puts it.
+    */
+   uint64_t gpu_va;
 };
 
 struct kbase_kmod_dev {
@@ -95,6 +136,20 @@ struct kbase_kmod_dev {
     * makes exactly one of these per logical device.
     */
    bool already_initialized;
+
+   /* GPU VA allocator over the FIXED_VA zone.
+    *
+    * On the device rather than on the VM because kbase genuinely has one
+    * address space per context - there is nothing per-VM to allocate from,
+    * and BOs can be created with exclusive_vm == NULL.
+    */
+   struct {
+      simple_mtx_t lock;
+      struct util_vma_heap heap;
+      uint64_t start;
+      uint64_t size;
+      bool ready;
+   } va;
 };
 
 /* The implicit-VM shim's state. See kbase_kmod_vm_create() for what this
@@ -362,6 +417,8 @@ pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor)
    return true;
 }
 
+static int kbase_init_va_heap(struct kbase_kmod_dev *dev);
+
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
                       const struct pan_kmod_driver *drv_info,
@@ -411,6 +468,9 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    if (kbase_dev_query_props(kbase_dev))
       goto err_cleanup;
 
+   if (kbase_init_va_heap(kbase_dev))
+      goto err_cleanup;
+
    return &kbase_dev->base;
 
 err_cleanup:
@@ -419,10 +479,78 @@ err_cleanup:
    return NULL;
 }
 
+/* Find the FIXED_VA zone and set up the GPU VA allocator over it.
+ *
+ * Probes with a real one-page BASE_MEM_FIXED allocation and frees it again.
+ * Deliberately not BASE_MEM_FIXABLE, which would also reveal the zone: the
+ * two flags are mutually exclusive per context, so a FIXABLE probe would
+ * make every subsequent FIXED allocation fail EINVAL and break the whole
+ * backend. That mistake is documented in docs/kbase-notes.md because it
+ * cost a debugging cycle in tests/fixed_va_probe.
+ *
+ * Returns 0 on success.
+ */
+static int
+kbase_init_va_heap(struct kbase_kmod_dev *dev)
+{
+   const char *override = os_get_option("PANVK_KBASE_FIXED_VA_BASE");
+   uint64_t forced = 0;
+
+   if (override)
+      forced = strtoull(override, NULL, 0);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(kbase_fixed_va_candidates); i++) {
+      uint64_t base = forced ? forced : kbase_fixed_va_candidates[i];
+
+      union kbase_ioctl_mem_alloc_ex probe = { 0 };
+      probe.in.va_pages = 1;
+      probe.in.commit_pages = 1;
+      probe.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                       BASE_MEM_FIXED;
+      probe.in.fixed_address = base;
+
+      if (ioctl(dev->base.fd, KBASE_IOCTL_MEM_ALLOC_EX, &probe) < 0) {
+         if (forced)
+            break;
+         continue;
+      }
+
+      bool exact = probe.out.gpu_va == base;
+
+      struct kbase_ioctl_mem_free f = { .gpu_addr = probe.out.gpu_va };
+      if (ioctl(dev->base.fd, KBASE_IOCTL_MEM_FREE, &f) < 0)
+         mesa_logw("kbase: could not free the FIXED_VA probe allocation");
+
+      if (!exact) {
+         if (forced)
+            break;
+         continue;
+      }
+
+      dev->va.start = base;
+      dev->va.size = KBASE_FIXED_VA_ZONE_SIZE;
+      simple_mtx_init(&dev->va.lock, mtx_plain);
+      util_vma_heap_init(&dev->va.heap, dev->va.start, dev->va.size);
+      dev->va.ready = true;
+      return 0;
+   }
+
+   mesa_loge("kbase: no usable FIXED_VA zone found - GPU allocation will "
+             "not work. Set PANVK_KBASE_FIXED_VA_BASE if this device puts "
+             "the zone somewhere unexpected.");
+   return -1;
+}
+
 static void
 kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
+
+   if (kbase_dev->va.ready) {
+      util_vma_heap_finish(&kbase_dev->va.heap);
+      simple_mtx_destroy(&kbase_dev->va.lock);
+   }
 
    pan_kmod_dev_cleanup(dev);
    pan_kmod_free(dev->allocator, kbase_dev);
@@ -441,44 +569,88 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       return NULL;
    }
 
+   struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
+
+   if (!kbase_dev->va.ready) {
+      mesa_loge("kbase: no usable FIXED_VA zone, cannot allocate");
+      return NULL;
+   }
+
    struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
    if (!bo)
       return NULL;
 
    uint64_t aligned = ALIGN_POT(size, 4096);
 
-   union kbase_ioctl_mem_alloc alloc = { 0 };
+   /* Pick the GPU address ourselves, from the FIXED_VA zone.
+    *
+    * This is the core of the non-SAME_VA model: previously the kernel
+    * chose the address and it doubled as the CPU pointer, which meant
+    * vm_bind could never honour a caller-chosen VA. Now the address comes
+    * from this allocator and MEM_ALLOC_EX is told to use it, so vm_bind
+    * has a real answer to give. See docs/kbase-notes.md.
+    */
+   simple_mtx_lock(&kbase_dev->va.lock);
+   uint64_t va = util_vma_heap_alloc(&kbase_dev->va.heap, aligned, 4096);
+   simple_mtx_unlock(&kbase_dev->va.lock);
+
+   if (!va) {
+      mesa_loge("kbase: FIXED_VA zone exhausted (%" PRIu64 " bytes requested)",
+                aligned);
+      pan_kmod_dev_free(dev, bo);
+      return NULL;
+   }
+
+   union kbase_ioctl_mem_alloc_ex alloc = { 0 };
    alloc.in.va_pages = aligned / 4096;
    alloc.in.commit_pages = aligned / 4096;
    alloc.in.extension = 0;
    alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
-                    BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+                    BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                    BASE_MEM_FIXED;
+   alloc.in.fixed_address = va;
 
-   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &alloc) < 0) {
-      mesa_loge("kbase: MEM_ALLOC failed");
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &alloc) < 0) {
+      /* ENOMEM here means the address is unavailable - past the real end of
+       * the zone, or already occupied. Either way the VA is ours again.
+       */
+      mesa_loge("kbase: MEM_ALLOC_EX at 0x%" PRIx64 " failed: %s", va,
+                strerror(errno));
+      simple_mtx_lock(&kbase_dev->va.lock);
+      util_vma_heap_free(&kbase_dev->va.heap, va, aligned);
+      simple_mtx_unlock(&kbase_dev->va.lock);
       pan_kmod_dev_free(dev, bo);
       return NULL;
    }
 
-   /* The offset passed to mmap() is the cookie MEM_ALLOC returned, not a
-    * real address; the mapping it produces is the SAME_VA address usable by
-    * both CPU and GPU.
-    */
-   bo->cpu = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
-                  alloc.out.gpu_va);
-
-   if (bo->cpu == MAP_FAILED) {
-      mesa_loge("kbase: mmap of BO failed");
+   if (alloc.out.gpu_va != va) {
+      /* BASE_MEM_FIXED is documented as exact, and measured exact. If the
+       * kernel ever silently relocates, every GPU address PanVK derives
+       * from this would be wrong, so fail loudly rather than continue.
+       */
+      mesa_loge("kbase: MEM_ALLOC_EX ignored fixed_address (asked 0x%" PRIx64
+                ", got 0x%" PRIx64 ")", va, (uint64_t)alloc.out.gpu_va);
+      simple_mtx_lock(&kbase_dev->va.lock);
+      util_vma_heap_free(&kbase_dev->va.heap, va, aligned);
+      simple_mtx_unlock(&kbase_dev->va.lock);
       pan_kmod_dev_free(dev, bo);
       return NULL;
    }
 
-   /* kbase has no GEM-style handle namespace. pan_kmod's common layer keys
-    * its handle_to_bo sparse array off bo->handle, so a unique per-device
-    * value is required. Reusing the page number of the SAME_VA address
-    * gives a stable, unique key without inventing a parallel allocator.
+   bo->gpu_va = va;
+
+   /* No mmap() here. Under SAME_VA the CPU mapping had to happen at alloc
+    * time because it was what resolved the cookie into an address; with a
+    * fixed address there is nothing to resolve, so the CPU mapping is left
+    * to pan_kmod_bo_mmap() via bo_get_mmap_offset(). BOs that are never
+    * CPU-accessed now cost no address space in this process.
     */
-   uint32_t handle = (uint32_t)(((uintptr_t)bo->cpu) >> 12);
+
+   /* kbase has no GEM-style handle namespace, and pan_kmod's common layer
+    * keys its handle_to_bo sparse array off bo->handle. The GPU VA's page
+    * number is unique per device and stable for the BO's lifetime.
+    */
+   uint32_t handle = (uint32_t)(va >> 12);
 
    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, aligned, flags, handle);
 
@@ -550,13 +722,23 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 {
    struct kbase_kmod_bo *kbase_bo = to_kbase_kmod_bo(bo);
 
-   /* For SAME_VA regions munmap() *is* the free: kbase tears the region
-    * down on vm_close. Issuing KBASE_IOCTL_MEM_FREE afterwards fails with
-    * EINVAL because the region is already gone - confirmed on hardware, see
-    * docs/kbase-notes.md.
+   struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(bo->dev);
+
+   /* Unlike the old SAME_VA path - where munmap() *was* the free, because
+    * kbase tore the region down on vm_close and a following MEM_FREE
+    * returned EINVAL - a fixed-address region is an ordinary named
+    * allocation, so MEM_FREE is the right call. Any CPU mapping
+    * pan_kmod_bo_mmap() made is unmapped by the common layer, not here.
     */
-   if (munmap(kbase_bo->cpu, bo->size))
-      mesa_loge("kbase: munmap of BO failed");
+   struct kbase_ioctl_mem_free free_req = { .gpu_addr = kbase_bo->gpu_va };
+
+   if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &free_req) < 0)
+      mesa_loge("kbase: MEM_FREE of 0x%" PRIx64 " failed: %s",
+                kbase_bo->gpu_va, strerror(errno));
+
+   simple_mtx_lock(&kbase_dev->va.lock);
+   util_vma_heap_free(&kbase_dev->va.heap, kbase_bo->gpu_va, bo->size);
+   simple_mtx_unlock(&kbase_dev->va.lock);
 
    pan_kmod_bo_cleanup(bo);
    pan_kmod_dev_free(bo->dev, kbase_bo);
@@ -565,36 +747,17 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 static off_t
 kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 {
-   /* kbase BOs are mapped at allocation time (see bo_alloc), because the
-    * SAME_VA address only exists once mmap() has resolved the cookie.
-    * pan_kmod_bo_mmap() is a static inline that always calls this and then
-    * os_mmap()s the result, so it needs an offset that works a second time.
+   /* kbase looks a region up by mmap offset >> PAGE_SHIFT, so a region's
+    * own GPU address is its mmap offset. Verified for fixed-address
+    * allocations by tests/fixed_va_probe, which mmap()s a BASE_MEM_FIXED
+    * region at its gpu_va and round-trips a sentinel through it.
     *
-    * kbase looks a region up by mmap offset >> PAGE_SHIFT, and after the
-    * cookie has been resolved the region is addressable by its resolved
-    * address - so handing that back produces a second, aliasing mapping of
-    * the same pages.
-    *
-    * Measured, not assumed (tests/remap_probe, Poco X8 Pro / r49p1):
-    *   - re-using the original MEM_ALLOC cookie fails EINVAL, so kbase
-    *     consumes it on first mmap
-    *   - the resolved SAME_VA address succeeds, and reads back a sentinel
-    *     written through the first mapping
-    *
-    * Caveat that matters: the alias lands at a different CPU address from
-    * the original mapping, and under SAME_VA it is the *original* that is
-    * also the GPU address. So the pointer pan_kmod_bo_mmap() returns is a
-    * valid CPU view but is not the GPU VA. Same caller-VA-vs-real-VA
-    * divergence documented in kbase_kmod_vm_create().
+    * The resulting CPU mapping lands at an unrelated address - that
+    * separation is the entire point of moving off SAME_VA, where the two
+    * were forced to be the same number and vm_bind could therefore never
+    * honour a caller-chosen VA.
     */
-   struct kbase_kmod_bo *kbase_bo = to_kbase_kmod_bo(bo);
-
-   if (!kbase_bo->cpu) {
-      mesa_loge("kbase: bo_get_mmap_offset called on an unmapped BO");
-      return (off_t)-1;
-   }
-
-   return (off_t)(uintptr_t)kbase_bo->cpu;
+   return (off_t)to_kbase_kmod_bo(bo)->gpu_va;
 }
 
 static bool
@@ -646,30 +809,26 @@ kbase_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
                      uint64_t va_start, uint64_t va_range)
 {
    /* kbase has no explicit VM object: a context owns exactly one address
-    * space, and an allocation is mapped into it at MEM_ALLOC time rather
-    * than through a separate bind step.
+    * space, and MEM_ALLOC_EX places an allocation into it directly. So the
+    * VM here is a bookkeeping object with handle 0, which pan_kmod.h
+    * documents as the value for KMDs with one VM per context.
     *
-    * This is the "single implicit VM" model: the VM is a bookkeeping
-    * object, handle 0 (which pan_kmod.h documents as the value for KMDs
-    * with one VM per context), and vm_bind does not move anything because
-    * BASE_MEM_SAME_VA already placed every BO at a fixed address chosen by
-    * the kernel.
+    * PAN_KMOD_VM_FLAG_AUTO_VA is forced on, and that is the load-bearing
+    * decision in this file.
     *
-    * READ THIS BEFORE TRUSTING GPU-VISIBLE ADDRESSES. It is not the
-    * faithful implementation. pan_kmod's contract is that the caller picks
-    * a VA and vm_bind maps the BO there; here the address is whatever the
-    * kernel already gave us, so a caller that computes GPU addresses from
-    * its own VA allocator will disagree with reality. PanVK does exactly
-    * that (panvk_vX_device.c builds util_vma_heaps and hands addresses to
-    * the mempools). vm_bind below therefore checks each mapping and warns
-    * when the requested VA is not the BO's real one, rather than failing
-    * silently - so the divergence shows up in logcat instead of as
-    * corrupted descriptors later.
+    * pan_kmod's normal contract is that the caller picks a VA and vm_bind
+    * maps the BO there. kbase cannot honour arbitrary addresses: fixed
+    * placement only works inside the FIXED_VA zone (0x800200000000 here),
+    * and PanVK's util_vma_heap allocates from a completely different range
+    * - it asked for 0xfffff000, which kbase rejects with ENOMEM. Rather
+    * than fight PanVK's allocator or rewrite its VA setup, use the
+    * inversion pan_kmod already supports: with AUTO_VA set,
+    * panvk_priv_bo.c leaves op.va.start as PAN_KMOD_VM_MAP_AUTO_VA and
+    * takes whatever address vm_bind writes back. So the backend chooses,
+    * from the zone the kernel will actually accept, and PanVK adopts it.
     *
-    * That is survivable right now only because nothing submits GPU work
-    * yet. Making the GPU dereference PanVK-assigned addresses correctly
-    * needs the other design: drop SAME_VA and do real VA management here.
-    * See ROADMAP.md Phase 2 for both options.
+    * This is the same path panfrost (arch < 10) already uses, so it is a
+    * supported configuration rather than a special case invented here.
     */
    struct kbase_kmod_vm *vm = pan_kmod_alloc(dev->allocator, sizeof(*vm));
 
@@ -678,8 +837,7 @@ kbase_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
       return NULL;
    }
 
-   /* handle 0: one address space per context, nothing to allocate. */
-   pan_kmod_vm_init(&vm->base, dev, 0, flags);
+   pan_kmod_vm_init(&vm->base, dev, 0, flags | PAN_KMOD_VM_FLAG_AUTO_VA);
 
    vm->map_count = 0;
    vm->mismatch_count = 0;
@@ -714,43 +872,45 @@ kbase_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
 
       switch (op->type) {
       case PAN_KMOD_VM_OP_TYPE_MAP: {
-         /* SAME_VA: the BO is already mapped, at this address. */
-         uint64_t real_va =
-            (uint64_t)(uintptr_t)to_kbase_kmod_bo(op->map.bo)->cpu +
-            (uint64_t)op->map.bo_offset;
+         /* The BO already lives at the address bo_alloc chose, inside the
+          * FIXED_VA zone, and MEM_ALLOC_EX put it there. There is no
+          * separate map step in kbase, so binding is reporting where the
+          * memory is.
+          */
+         uint64_t real_va = to_kbase_kmod_bo(op->map.bo)->gpu_va +
+                            (uint64_t)op->map.bo_offset;
 
          kbase_vm->map_count++;
 
          if (op->va.start == PAN_KMOD_VM_MAP_AUTO_VA) {
-            /* Caller let us choose - report where it actually is. This is
-             * the one case the shim models correctly.
+            /* The expected path: vm_create forces AUTO_VA precisely so the
+             * caller asks us instead of telling us. panvk_priv_bo.c then
+             * uses this as the BO's device address.
              */
             op->va.start = real_va;
             break;
          }
 
          if (op->va.start != real_va) {
-            kbase_vm->mismatch_count++;
-
-            /* FAIL, do not pretend. An earlier version of this shim logged
-             * a warning and returned success, on the theory that a wrong
-             * VA is harmless until something submits GPU work. That is
-             * false: PanVK dereferences addresses from its own VA
-             * allocator during vkCreateDevice's mempool setup, so
-             * succeeding here turns a clean error into a segfault inside
-             * device creation. Measured - see ROADMAP.md Phase 2.
+            /* A caller-chosen VA that is not where the BO is. Fail rather
+             * than pretend: PanVK dereferences addresses returned from
+             * here during vkCreateDevice's mempool setup, so succeeding
+             * would turn a clean error into a segfault - measured, see
+             * ROADMAP.md Phase 2.
              *
-             * Returning an error makes vkCreateDevice fail cleanly instead,
-             * which is the honest state until BASE_MEM_FIXED-based
-             * allocation lands and this can actually honour the request.
+             * Honouring this properly would mean allocating the BO at the
+             * caller's address in the first place, which only works if the
+             * caller allocates inside the FIXED_VA zone. AUTO_VA avoids
+             * needing that.
              */
+            kbase_vm->mismatch_count++;
             if (!kbase_vm->warned) {
                kbase_vm->warned = true;
-               mesa_loge("kbase: vm_bind cannot honour a caller-chosen VA - "
-                         "requested 0x%" PRIx64 ", BO is at 0x%" PRIx64
-                         " (SAME_VA). Failing rather than returning a "
-                         "mapping the caller would dereference at the wrong "
-                         "address. See kbase_kmod_vm_create()'s comment.",
+               mesa_loge("kbase: vm_bind asked to map at 0x%" PRIx64
+                         " but the BO is at 0x%" PRIx64
+                         ". kbase cannot relocate an existing allocation; "
+                         "the VM should be using AUTO_VA. See "
+                         "kbase_kmod_vm_create()'s comment.",
                          op->va.start, real_va);
             }
             return -1;
