@@ -1211,6 +1211,40 @@ Two consequences worth keeping:
   FIXED_VA heap - the kernel chose it, the heap never owned it, and inserting
   it would corrupt every later allocation. Guarded on the flag.
 
+### A 4 GB constraint on shader BOs, from Panfork — not yet hit here
+
+Flagging this because it is latent rather than observed, and because letting
+the kernel pick the address means nothing here controls it. Panfork strips
+the same two flags for executable BOs, for a reason it states outright
+(`src/panfrost/base/pan_vX_base.c:626`):
+
+```c
+/* Using SAME_VA for executable BOs would make it too likely
+ * for a blend shader to end up on the wrong side of a 4 GB
+ * boundary. */
+flags |= BASE_MEM_PROT_GPU_EX;
+flags &= ~(BASE_MEM_PROT_GPU_WR | BASE_MEM_SAME_VA);
+```
+
+Dropping `GPU_WR` and `SAME_VA` matches what this backend already does, and
+was arrived at here independently for different reasons (`GPU_WR` because
+shader code is not GPU-written; `SAME_VA` because the EXEC_VA zone does not
+grant it). The part this backend does **not** account for is the 4 GB
+boundary: on the old-API path Panfork additionally aligns shader BOs to
+16 MB and over-allocates 4x to force it.
+
+The underlying constraint is that some shader-referencing fields carry only
+a low 32-bit offset, so a shader and what refers to it must sit in the same
+4 GB span. Compute has not tripped this - one shader at a time, no blend
+shaders - which is exactly why it is worth writing down before rendering
+starts allocating more of them.
+
+Not verified on this device. It is Panfork's claim plus a plausible
+mechanism, not a measurement here, and the symptom would be a shader that
+executes garbage rather than a clean failure. If shaders start misbehaving
+once more than one is live, check their addresses share a 4 GB span before
+anything else.
+
 ### Result
 
 `driver_compute_probe --fill` passes 4/4: a `vkCmdFillBuffer` compute shader
@@ -1381,6 +1415,57 @@ Ruled out, with `PANVK_KBASE_KICK_MODE` on a shipped binary:
 The ~8ms threshold and the ~12ms `CS_ACTIVE` linger both sit right around the
 kbase CSF scheduler's tick period, which is the most plausible reading: a
 kick on a queue whose CS is not idle takes effect on the next tick.
+
+### Panfork tried the doorbell for this and disabled it
+
+Worth knowing before anyone reaches for the hardware doorbell as a cheaper
+wake than the `CS_QUEUE_KICK` ioctl. Panfork implemented exactly that and
+then turned it off — `src/panfrost/base/pan_vX_base.c:1468`:
+
+```c
+bool active = CS_READ_REGISTER(cs, CS_ACTIVE);
+
+CS_WRITE_REGISTER(cs, CS_INSERT, insert_offset);
+cs->last_insert = insert_offset;
+
+if (false /*active*/) {
+        memory_barrier();
+        CS_RING_DOORBELL(cs);
+        memory_barrier();
+        active = CS_READ_REGISTER(cs, CS_ACTIVE);
+} else {
+        kbase_cs_kick(k, cs);
+}
+```
+
+The `if (false /*active*/)` is deliberate: the intended design was
+"doorbell if the CS is still running, ioctl kick if it is idle", and the
+doorbell half is dead code. Panfork pays the ioctl on every submit.
+
+Two things follow.
+
+**The doorbell is a dead end, or at least was for the one project that
+tried it.** The `CS_RING_DOORBELL` macro writes `1` to the first word of
+the user_io mapping — the page the table in "Prior art found: Panfork"
+above identifies as the doorbell page. Nothing here needs re-deriving; it
+was built, and abandoned, and the commented-out condition is the only
+record of why.
+
+**This repo's `auto` mode is ahead of that prior art, not behind it.**
+Panfork's abandoned path still kicks a busy CS, just via a cheaper
+mechanism. The measurement in "A running CS re-reads CS_INSERT" says a
+busy CS needs *no* wake at all, so `auto` skips the work rather than
+making it cheaper. That is a different and better answer than the one
+Panfork was reaching for, and it is measured here rather than assumed.
+
+It does not explain the open question above — why removing the wait breaks
+three-subqueue submission when a one-CS probe cannot reproduce it. But it
+does say that the obvious next optimisation has already been tried by
+someone with working hardware, so that is not where the answer is.
+
+Source: Icecream95's Panfork, <https://gitlab.com/panfork/mesa>, verified
+byte-identical against the local `third_party/PANFORK` checkout (`832c3c7`)
+and the ROCKNIX mirror.
 
 ### What the fix is worth
 

@@ -865,10 +865,22 @@ section in `docs/kbase-notes.md` for why, measured and then confirmed
 against the kernel source). The fix is a change to *shared* PanVK code, not
 to this backend, which is why `docs/upstream-ringbuf-question.md` exists.
 
-**That question is drafted and still unsent, and it is the highest-value
-next action.** It is also now a better question than when it was written:
-the ringbuf was assumed to block the render subqueues entirely, and it turns
-out to block only rendering itself.
+**That question is now sent** (2026-08-01), as a Mesa GitLab issue. It was
+re-checked against the tree it describes before going out, which changed it
+twice: `init_render_desc_ringbuf()` had moved to `csf/panvk_vX_gpu_queue.c`,
+and the draft asked whether the double mapping had a reason when the code
+answers that directly — the `size * 2` alignment keeps the window inside one
+4 GB span so `move_ptr()` can wrap `ptr_lo` with 32-bit adds. It also turned
+up the strongest argument for the ask: tracing mode already runs this with a
+single mapping and `wrap_around = false`, so the request is to generalise an
+existing mode rather than add a kbase special case. See
+`docs/upstream-ringbuf-question.md` for both the sent text and that
+re-check.
+
+**Nothing else is blocked on the answer**, which is worth being explicit
+about. Rendering is, and only rendering. The unblocked work below —
+dma-buf import/export, the tiler heap, the stubbed `bo_import`/`bo_export`
+ops — needs no decision from upstream and can proceed while this sits.
 
 Tools worth knowing about before touching any of this:
 
@@ -923,14 +935,24 @@ Tools worth knowing about before touching any of this:
       mostly green. CTS will not catch everything real apps hit.
 
 ## Phase 9 — Upstream conversation
-- [ ] **First concrete question is drafted and waiting to be sent:**
+- [x] **First concrete question sent** (2026-08-01, Mesa GitLab issue):
       `docs/upstream-ringbuf-question.md`. The render descriptor ringbuf's
       double mapping cannot be expressed on kbase, and the fallback
       (tail-padding instead of relying on the mapping to wrap) changes
       shared PanVK code that panthor also runs — so it is the first change
       here that genuinely needs agreement rather than a patch. The doc
-      holds both the short `#panfrost` message and the measurements and
-      kernel-source citations to back it up.
+      holds the chat form, the issue form, the measurements, and the
+      kernel-source citations. **Awaiting a reply; do not write the
+      tail-padding change until there is one** — the whole point of asking
+      was to avoid guessing at shared-code behaviour that cannot be tested
+      on panthor from here.
+- [x] A first upstream contribution landed alongside it, deliberately
+      small: `Joshua-Micheletti/PanVK2KBase#2`, making `kbase_bo_create()`
+      treat the CPU pointer as the GPU address only under `SAME_VA`.
+      Measured on-device, corroborated by the kernel source and by
+      Panfork doing the identical thing. Not PanVK, but it establishes the
+      pattern for how these should be argued: evidence attached, claim
+      narrow.
 - [ ] Raise the project on #panfrost (Matrix/IRC) or mesa-dev BEFORE
       you're deep into Phase 4. Kbase is not currently a stated upstream
       priority (Panthor/Tyr are) — find out early whether this would be
