@@ -297,8 +297,53 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       is allowed iff it survives the round-trip. The vendor blob calls the
       same ioctl for the same reason (see the `libGLES_mali.so` survey in
       `docs/kbase-notes.md`).
-- [ ] **`vkCreateDevice` now fails `-3` at the GPU queue — the expected
-      Phase 4 wall, and it is bigger than it looks.**
+- [x] **`vkCreateDevice` SUCCEEDS on kbase.** A sibling kbase GPU queue
+      (`src/mesa/panvk_vX_kbase_queue.c`, approach (a) below) implements
+      `create_kbase_queue`/`destroy_kbase_queue`/`kbase_queue_submit`/
+      `kbase_queue_check_status`; `patch-panvk-kbase-queue.py` declares
+      them and makes `panvk_vX_device.c` pick between the panthor and
+      kbase versions on `is_kbase`, guarded `#if PAN_ARCH >= 10` since
+      arch < 10 is JM and has no CSF queue at all.
+      Creation does tiler heap → queue group → one bound CS ring buffer
+      per subqueue, all via the ioctl sequences
+      `tests/queue_group`/`tests/live_kick_probe` proved on hardware.
+      **Precondition found on the way:** `CS_TILER_HEAP_INIT` fails
+      `ENOMEM` unless `MEM_JIT_INIT` ran first — a tiler heap's chunks are
+      JIT-backed. The backend now does `MEM_JIT_INIT`/`MEM_EXEC_INIT` at
+      device-create (skipped for the dup'd fd, since both are one-shot per
+      context). `live_kick_probe` only ever got a working heap because it
+      replicated the vendor blob's setup; the Mesa path had not.
+      **This finally validates the vk_sync through the real Vulkan API.**
+      `tests/driver_sync_probe`: `vkCreateFence(SIGNALED)` reads signalled,
+      `vkResetFences` then reads unsignalled, `vkDestroyFence` clean — all
+      backed by 64-bit slots in `BASE_MEM_CSF_EVENT` memory.
+      **Semaphores correctly refuse to be created** (`-1000072003`):
+      `vk_semaphore.c:99` requires `VK_SYNC_FEATURE_GPU_WAIT`, which
+      `panvk_kbase_sync` deliberately does not advertise while nothing can
+      signal a slot from the GPU. That is the intended behaviour —
+      advertising it would hand out semaphores that could never complete.
+      `vkDeviceWaitIdle` returns `-8` from the submit stub, as designed.
+- [ ] **Submission is what is left.** `panvk_per_arch(kbase_queue_submit)`
+      returns `VK_ERROR_FEATURE_NOT_PRESENT` rather than pretending.
+      Mapping `VkQueueSubmit` onto kbase means: write the command stream
+      into the bound ring buffer, publish `CS_INSERT` in the user-IO input
+      page (page 1 — `utils/csf_user_regs.h`), `CS_QUEUE_KICK`, and wait on
+      a `BASE_MEM_CSF_EVENT` slot signalled by a `SYNC_SET64` in the
+      stream. Every one of those steps is individually proven on hardware
+      by `tests/live_kick_probe` and `tests/event_slot_probe`; none is
+      assembled in the driver yet.
+      Also still missing: the per-subqueue init command stream panthor runs
+      at queue-creation time (`init_subqueue()`), which sets up subqueue
+      context registers. It needs submission, so it waits on the above. A
+      queue created today is structurally valid but its GPU-side context
+      has not been initialised.
+      Once submission works, `VK_SYNC_FEATURE_GPU_WAIT` can be advertised
+      and semaphores start working; the CPU wait in `panvk_kbase_sync.c`
+      should also switch from polling to blocking on the kbase fd's
+      notification (noting `read()` consumes one, so it needs a single
+      owner of the event stream).
+- [x] ~~`vkCreateDevice` fails `-3` at the GPU queue~~ — resolved above.
+      Kept for the scope analysis, which is still accurate:
       `panvk_vX_gpu_queue.c:685` issues `DRM_IOCTL_PANTHOR_GROUP_CREATE`
       on the kbase fd. Not a new bug: the whole GPU queue is
       panthor-specific.

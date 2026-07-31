@@ -438,6 +438,7 @@ pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor)
 static int kbase_init_va_heap(struct kbase_kmod_dev *dev);
 static void kbase_query_csif_props(struct kbase_kmod_dev *dev);
 static void kbase_query_allowed_priorities(struct kbase_kmod_dev *dev);
+static void kbase_init_context_zones(struct kbase_kmod_dev *dev);
 
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
@@ -493,6 +494,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
 
    kbase_query_csif_props(kbase_dev);
    kbase_query_allowed_priorities(kbase_dev);
+   kbase_init_context_zones(kbase_dev);
 
    return &kbase_dev->base;
 
@@ -681,6 +683,46 @@ kbase_query_allowed_priorities(struct kbase_kmod_dev *dev)
    dev->base.props.allowed_group_priorities_mask = mask;
 }
 
+/* Initialise the JIT and EXEC_VA context zones.
+ *
+ * CS_TILER_HEAP_INIT fails ENOMEM without this: a tiler heap's chunks are
+ * backed by the JIT allocator, so the pool has to exist before a heap can
+ * be created. The vendor blob calls both of these during context setup
+ * (see the libGLES_mali.so ioctl survey in docs/kbase-notes.md), and
+ * tests/live_kick_probe only gets a working heap because it replicates
+ * that sequence.
+ *
+ * Both are one-shot per kbase context. vkCreateDevice builds a second
+ * pan_kmod_dev on a dup() of the physical device's fd - same context - so
+ * skip when this device wraps an already-initialised one, otherwise the
+ * second call fails and logs noise for no reason.
+ */
+static void
+kbase_init_context_zones(struct kbase_kmod_dev *dev)
+{
+   if (dev->already_initialized)
+      return;
+
+   struct kbase_ioctl_mem_jit_init jit = {
+      .va_pages = 1 << 14,   /* 64MB of 4K pages */
+      .max_allocations = 255,
+      .trim_level = 0,
+      .group_id = 0,
+      .phys_pages = 1 << 14,
+   };
+
+   if (ioctl(dev->base.fd, KBASE_IOCTL_MEM_JIT_INIT, &jit) < 0)
+      mesa_logw("kbase: MEM_JIT_INIT failed (%s) - tiler heaps will not work",
+                strerror(errno));
+
+   struct kbase_ioctl_mem_exec_init exec = {
+      .va_pages = 1 << 16,   /* 256MB of 4K pages */
+   };
+
+   if (ioctl(dev->base.fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec) < 0)
+      mesa_logw("kbase: MEM_EXEC_INIT failed (%s)", strerror(errno));
+}
+
 /* ---------------------------------------------------------------- *
  * CSF queue-group lifecycle. See pan_kmod_kbase.h for why these exist.
  * ---------------------------------------------------------------- */
@@ -766,6 +808,143 @@ pan_kmod_kbase_tiler_heap_destroy(struct pan_kmod_dev *dev,
 
    if (ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_TERM, &term) < 0)
       mesa_loge("kbase: CS_TILER_HEAP_TERM failed: %s", strerror(errno));
+}
+
+int
+pan_kmod_kbase_queue_create(struct pan_kmod_dev *dev, uint8_t group_handle,
+                            uint8_t csi_index, uint64_t ringbuf_size,
+                            struct pan_kmod_kbase_cs *out)
+{
+   struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
+   uint64_t aligned = ALIGN_POT(ringbuf_size, 4096);
+
+   memset(out, 0, sizeof(*out));
+   out->csi_index = csi_index;
+
+   if (!kbase_dev->va.ready) {
+      mesa_loge("kbase: no VA zone, cannot create a CS queue");
+      return -1;
+   }
+
+   simple_mtx_lock(&kbase_dev->va.lock);
+   uint64_t va = util_vma_heap_alloc(&kbase_dev->va.heap, aligned, 4096);
+   simple_mtx_unlock(&kbase_dev->va.lock);
+
+   if (!va) {
+      mesa_loge("kbase: out of GPU VA for a CS ring buffer");
+      return -1;
+   }
+
+   union kbase_ioctl_mem_alloc_ex alloc = { 0 };
+   alloc.in.va_pages = aligned / 4096;
+   alloc.in.commit_pages = aligned / 4096;
+   alloc.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                    BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+                    BASE_MEM_FIXED;
+   alloc.in.fixed_address = va;
+
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &alloc) < 0 ||
+       alloc.out.gpu_va != va) {
+      mesa_loge("kbase: ring buffer allocation at 0x%" PRIx64 " failed: %s",
+                va, strerror(errno));
+      goto err_free_va;
+   }
+
+   out->ringbuf_gpu_va = va;
+   out->ringbuf_size = aligned;
+
+   out->ringbuf_cpu = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           dev->fd, (off_t)va);
+   if (out->ringbuf_cpu == MAP_FAILED) {
+      mesa_loge("kbase: ring buffer mmap failed: %s", strerror(errno));
+      out->ringbuf_cpu = NULL;
+      goto err_free_mem;
+   }
+
+   memset(out->ringbuf_cpu, 0, aligned);
+
+   struct kbase_ioctl_cs_queue_register reg = {
+      .buffer_gpu_addr = va,
+      .buffer_size = aligned,
+      .priority = 0,
+   };
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_REGISTER, &reg) < 0) {
+      mesa_loge("kbase: CS_QUEUE_REGISTER failed: %s", strerror(errno));
+      goto err_unmap_ring;
+   }
+
+   union kbase_ioctl_cs_queue_bind bind = { 0 };
+   bind.in.buffer_gpu_addr = va;
+   bind.in.group_handle = group_handle;
+   bind.in.csi_index = csi_index;
+
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_BIND, &bind) < 0) {
+      mesa_loge("kbase: CS_QUEUE_BIND failed: %s", strerror(errno));
+      goto err_terminate_queue;
+   }
+
+   out->user_io = mmap(NULL, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096,
+                       PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
+                       (off_t)bind.out.mmap_handle);
+   if (out->user_io == MAP_FAILED) {
+      mesa_loge("kbase: user-IO mmap failed: %s", strerror(errno));
+      out->user_io = NULL;
+      goto err_terminate_queue;
+   }
+
+   return 0;
+
+err_terminate_queue: {
+   struct kbase_ioctl_cs_queue_terminate term = { .buffer_gpu_addr = va };
+   ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &term);
+}
+err_unmap_ring:
+   munmap(out->ringbuf_cpu, aligned);
+   out->ringbuf_cpu = NULL;
+err_free_mem: {
+   struct kbase_ioctl_mem_free f = { .gpu_addr = va };
+   ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &f);
+}
+err_free_va:
+   simple_mtx_lock(&kbase_dev->va.lock);
+   util_vma_heap_free(&kbase_dev->va.heap, va, aligned);
+   simple_mtx_unlock(&kbase_dev->va.lock);
+   memset(out, 0, sizeof(*out));
+   return -1;
+}
+
+void
+pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
+                             struct pan_kmod_kbase_cs *cs)
+{
+   struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
+
+   if (!cs->ringbuf_gpu_va)
+      return;
+
+   if (cs->user_io)
+      munmap(cs->user_io, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096);
+
+   struct kbase_ioctl_cs_queue_terminate term = {
+      .buffer_gpu_addr = cs->ringbuf_gpu_va,
+   };
+   if (ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &term) < 0)
+      mesa_loge("kbase: CS_QUEUE_TERMINATE failed: %s", strerror(errno));
+
+   if (cs->ringbuf_cpu)
+      munmap(cs->ringbuf_cpu, cs->ringbuf_size);
+
+   struct kbase_ioctl_mem_free f = { .gpu_addr = cs->ringbuf_gpu_va };
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_FREE, &f) < 0)
+      mesa_loge("kbase: ring buffer MEM_FREE failed: %s", strerror(errno));
+
+   simple_mtx_lock(&kbase_dev->va.lock);
+   util_vma_heap_free(&kbase_dev->va.heap, cs->ringbuf_gpu_va,
+                      cs->ringbuf_size);
+   simple_mtx_unlock(&kbase_dev->va.lock);
+
+   memset(cs, 0, sizeof(*cs));
 }
 
 const struct drm_panthor_csif_info *

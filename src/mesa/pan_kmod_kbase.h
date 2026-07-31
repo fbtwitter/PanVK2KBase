@@ -149,3 +149,49 @@ int pan_kmod_kbase_tiler_heap_create(struct pan_kmod_dev *dev,
  */
 void pan_kmod_kbase_tiler_heap_destroy(struct pan_kmod_dev *dev,
                                        uint64_t gpu_heap_va);
+
+/**
+ * struct pan_kmod_kbase_cs - A bound CSF command stream.
+ * @ringbuf_gpu_va: GPU address of the ring buffer the CS reads from.
+ * @ringbuf_cpu: CPU mapping of the same.
+ * @ringbuf_size: Size in bytes.
+ * @user_io: The 3 pages CS_QUEUE_BIND hands back, ordered
+ *           [doorbell][input][output]. Measured, not assumed - see
+ *           src/utils/csf_user_regs.h and tests/user_io_probe.
+ * @csi_index: CS interface index within the group.
+ */
+struct pan_kmod_kbase_cs {
+   uint64_t ringbuf_gpu_va;
+   void *ringbuf_cpu;
+   uint64_t ringbuf_size;
+   void *user_io;
+   uint8_t csi_index;
+};
+
+/**
+ * pan_kmod_kbase_queue_create() - Allocate, register and bind a CS queue.
+ * @dev: kbase device.
+ * @group_handle: Group from pan_kmod_kbase_group_create().
+ * @csi_index: CS interface index within that group.
+ * @ringbuf_size: Ring buffer size in bytes; rounded up to a page.
+ * @out: Filled in on success.
+ *
+ * Does MEM_ALLOC_EX (ring buffer) -> CS_QUEUE_REGISTER -> CS_QUEUE_BIND ->
+ * mmap of the user-IO pages. The ring buffer is allocated here rather than
+ * by the caller so the whole sequence stays in the one translation unit
+ * that has the kbase UAPI headers.
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int pan_kmod_kbase_queue_create(struct pan_kmod_dev *dev,
+                                uint8_t group_handle, uint8_t csi_index,
+                                uint64_t ringbuf_size,
+                                struct pan_kmod_kbase_cs *out);
+
+/**
+ * pan_kmod_kbase_queue_destroy() - Unbind and free a CS queue.
+ * @dev: kbase device.
+ * @cs: Queue from pan_kmod_kbase_queue_create(). Zeroed on return.
+ */
+void pan_kmod_kbase_queue_destroy(struct pan_kmod_dev *dev,
+                                  struct pan_kmod_kbase_cs *cs);

@@ -181,6 +181,7 @@ mesa-backend-sync:
 	@test -d "$(MESA_KMOD_DIR)" || { echo "error: $(MESA_KMOD_DIR) not found - see docs/mesa-cs-builder.md for the Mesa clone command"; exit 1; }
 	cp src/mesa/pan_kmod_kbase.c src/mesa/pan_kmod_kbase.h $(MESA_KMOD_DIR)/
 	cp src/mesa/panvk_kbase_sync.c src/mesa/panvk_kbase_sync.h $(MESA_DIR)/src/panfrost/vulkan/
+	cp src/mesa/panvk_vX_kbase_queue.c $(MESA_DIR)/src/panfrost/vulkan/csf/
 	@echo ""
 	@echo "Copied pan_kmod_kbase.{c,h} into $(MESA_KMOD_DIR)/"
 	@echo "Copied panvk_kbase_sync.{c,h} into $(MESA_DIR)/src/panfrost/vulkan/"
@@ -189,6 +190,8 @@ mesa-backend-sync:
 	@echo "  - src/mesa/meson.build.kbase.patch     -> $(MESA_KMOD_DIR)/meson.build"
 	@echo "  - src/mesa/patch-panvk-kbase-enumeration.py <mesa-dir>  (PanVK enumeration)"
 	@echo "  - src/mesa/patch-panvk-kbase-sync.py        <mesa-dir>  (PanVK vk_sync)"
+	@echo "  - src/mesa/patch-panthor-csif-dispatch.py   <mesa-dir>  (csif props)"
+	@echo "  - src/mesa/patch-panvk-kbase-queue.py       <mesa-dir>  (GPU queue)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
 # <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to
