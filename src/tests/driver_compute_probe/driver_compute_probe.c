@@ -28,7 +28,9 @@
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <vulkan/vulkan.h>
@@ -96,6 +98,7 @@ int
 main(int argc, char **argv)
 {
    bool do_submit = false, do_fill = false;
+   uint32_t loop_count = 0;
 
    if (argc < 2) {
       fprintf(stderr,
@@ -105,6 +108,9 @@ main(int argc, char **argv)
    }
    for (int i = 2; i < argc; i++) {
       if (!strcmp(argv[i], "--submit")) {
+         do_submit = true;
+      } else if (!strncmp(argv[i], "--loop=", 7)) {
+         loop_count = (uint32_t)strtoul(argv[i] + 7, NULL, 10);
          do_submit = true;
       } else if (!strcmp(argv[i], "--fill")) {
          do_fill = true;
@@ -209,6 +215,7 @@ main(int argc, char **argv)
    PFN_vkCreateFence create_fence = GDPA(vkCreateFence);
    PFN_vkDestroyFence destroy_fence = GDPA(vkDestroyFence);
    PFN_vkWaitForFences wait_fences = GDPA(vkWaitForFences);
+   PFN_vkResetFences reset_fences = GDPA(vkResetFences);
    PFN_vkCreateBuffer create_buffer = GDPA(vkCreateBuffer);
    PFN_vkDestroyBuffer destroy_buffer = GDPA(vkDestroyBuffer);
    PFN_vkGetBufferMemoryRequirements get_buf_reqs =
@@ -387,6 +394,61 @@ main(int argc, char **argv)
       printf("  vkWaitForFences -> %d%s\n", r,
              r == VK_TIMEOUT ? " (TIMEOUT - the GPU did not finish)" : "");
       check(r == VK_SUCCESS, "fence signalled by the GPU");
+   }
+
+   /* Resubmit the same command buffer until the ring has wrapped several
+    * times. Nothing before this has come close: the compute ring is 64KB and
+    * a submit like this one spends on the order of a hundred bytes, so
+    * submit_stream()'s two-part wrap copy and wait_for_ring_space() have
+    * never once executed. A wrap bug corrupts a stream, and a corrupt stream
+    * is a GPU fault, so it is worth finding on purpose rather than meeting
+    * later under a real workload.
+    *
+    * Resubmitting a ONE_TIME_SUBMIT buffer is a Vulkan usage error the
+    * validation layers would flag, but nothing here reuses recorded state
+    * across submits and no layers are loaded - and what is under test is the
+    * ring arithmetic, which does not care what the CALLed stream contains.
+    */
+   if (loop_count && r == VK_SUCCESS) {
+      printf("\n=== ring wrap (%u submits) ===\n", loop_count);
+
+      const uint64_t ring_bytes = 64 * 1024;
+      uint32_t failed_at = 0;
+
+      for (uint32_t i = 0; i < loop_count; i++) {
+         r = reset_fences(device, 1, &fence);
+         if (r != VK_SUCCESS) {
+            failed_at = i;
+            printf("  vkResetFences -> %d at submit %u\n", r, i);
+            break;
+         }
+
+         r = queue_submit(queue, 1, &si, fence);
+         if (r != VK_SUCCESS) {
+            failed_at = i;
+            printf("  vkQueueSubmit -> %d at submit %u\n", r, i);
+            break;
+         }
+
+         r = wait_fences(device, 1, &fence, VK_TRUE, 2000000000ull);
+         if (r != VK_SUCCESS) {
+            failed_at = i;
+            printf("  vkWaitForFences -> %d at submit %u%s\n", r, i,
+                   r == VK_TIMEOUT ? " (TIMEOUT)" : "");
+            break;
+         }
+
+         if (i && i % 500 == 0)
+            printf("  %u submits ok\n", i);
+      }
+
+      if (r == VK_SUCCESS) {
+         printf("  %u submits, no failures (ring is %" PRIu64
+                " bytes, so this wrapped it repeatedly)\n",
+                loop_count, ring_bytes);
+      }
+      check(r == VK_SUCCESS, "ring survived repeated submits");
+      (void)failed_at;
    }
 
    if (do_fill && mapped && r == VK_SUCCESS) {
