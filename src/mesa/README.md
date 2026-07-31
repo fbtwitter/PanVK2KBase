@@ -76,10 +76,38 @@ than plausible-looking fakes:
 - `bo_export` — dma-buf out. Not "not yet": kbase has no export path at
   all, and `pan_kmod_bo_export()` is a `static inline` that calls
   `drmPrimeHandleToFD()` itself. See ROADMAP Phase 3.
-- `vm_create` / `vm_destroy` / `vm_bind` — kbase has no explicit VM
-  object; a context owns one address space and allocations are mapped at
-  `MEM_ALLOC` time, with no separate bind step. Mapping pan_kmod's
-  explicit-VM model onto that needs a design decision, not a guess.
+
+### `vm_create` / `vm_bind` — implemented, and the decision behind it
+
+This list previously said these needed "a design decision, not a guess".
+The decision has been made and implemented; recording it here because it is
+the least obvious thing in the backend and easy to undo by accident.
+
+kbase has no VM object — a context owns exactly one address space and
+`MEM_ALLOC_EX` places an allocation into it directly, with no separate bind
+step. So `vm_create()` returns a bookkeeping object with handle 0, which
+`pan_kmod.h` documents as the value for KMDs with one VM per context.
+
+**`PAN_KMOD_VM_FLAG_AUTO_VA` is forced on, and that is the load-bearing
+choice.** pan_kmod's normal contract is that the caller picks a VA and
+`vm_bind` maps the BO there. kbase cannot honour arbitrary addresses:
+fixed placement works only inside the FIXED_VA zone (`0x800200000000` on
+the tested device), while PanVK's `util_vma_heap` allocates from an
+unrelated range — it asked for `0xfffff000`, which kbase rejects with
+`ENOMEM`. Rather than fight PanVK's allocator, the backend uses an
+inversion pan_kmod already supports: with `AUTO_VA`, `panvk_priv_bo.c`
+leaves `op.va.start` as `PAN_KMOD_VM_MAP_AUTO_VA` and adopts whatever
+address `vm_bind` writes back. The backend chooses from the zone the
+kernel will accept, and PanVK follows.
+
+This is the same path panfrost (arch < 10) already uses, so it is a
+supported configuration rather than something invented here.
+
+`vm_bind` therefore *reports* where memory already is rather than moving
+it. A caller-chosen VA that disagrees fails loudly instead of being
+silently accepted — PanVK dereferences addresses returned from here during
+`vkCreateDevice`'s mempool setup, so a polite lie becomes a segfault. The
+VM counts mismatches and warns once at teardown.
 
 ## `BELONGS-UPSTREAM`: work done here that shouldn't live here
 

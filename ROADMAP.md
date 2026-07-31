@@ -948,13 +948,26 @@ the `BELONGS-UPSTREAM` tags now mark every place this port stands in for
 work that belongs elsewhere.
 
 So the project is genuinely gated on the ringbuf answer, and inventing
-parallel work would mostly be busywork. The things actually worth doing
-while waiting are: rebuild and confirm the external-memory patch compiles
-and the driver still enumerates; decide the `vm_create`/`vm_bind` design
-question (a design decision, not a blocked task); and prepare the follow-up
-upstream question about an fd-taking import entry point, which is the same
-shape of ask as the ringbuf one and could reasonably go in the same
-conversation.
+parallel work would mostly be busywork. Three things were worth doing while
+waiting, and all three are now done:
+
+- **Rebuilt and verified the external-memory gate** — compiles against the
+  Android cross toolchain, links, the driver still enumerates, and
+  `tests/driver_extmem_probe` confirms on-device that both handle types now
+  report `externalMemoryFeatures = 0x0`.
+- **`vm_create`/`vm_bind`** — no decision was outstanding. It had already
+  been made and implemented (force `PAN_KMOD_VM_FLAG_AUTO_VA`, backend picks
+  the address from the zone kbase accepts, PanVK adopts it); only the docs
+  still called it open. `src/mesa/README.md` now records the reasoning.
+- **The follow-up upstream question is drafted** —
+  `docs/upstream-import-question.md`, on giving `pan_kmod_ops` an fd-taking
+  import hook tried before `drmPrimeFDToHandle()`. Small enough to go in the
+  same conversation as the ringbuf one.
+
+A pattern worth noting for whoever reads this next: three separate items
+here turned out to be already done or already decided, and only the docs
+were stale. Before starting anything this file lists as open, check the code
+first.
 
 Tools worth knowing about before touching any of this:
 
