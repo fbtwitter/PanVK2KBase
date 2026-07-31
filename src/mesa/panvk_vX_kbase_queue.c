@@ -69,19 +69,27 @@
  *   landed on, because the latter cannot tell real render work apart from the
  *   epilogue above.
  *
- *   KNOWN GAP: vkCmdFillBuffer crashes during *recording*, before this file
- *   is reached - CPU-side, in the precomp shader path, not a submission
- *   problem. So the deepest thing proven to run here is a barrier, not a
- *   dispatch. tests/driver_compute_probe --fill is the reproducer.
+ *   Implemented and CONFIRMED ON HARDWARE: compute dispatch. A pipeline
+ *   built from application SPIR-V, a descriptor set, push constants and
+ *   vkCmdDispatch, with every element of the result buffer holding what the
+ *   shader computed. tests/driver_pipeline_probe is the check. The earlier
+ *   vkCmdFillBuffer crash was CPU-side, in the precomp shader path, and is
+ *   fixed - it needed executable memory in the EXEC_VA zone.
  *
- *   NOT implemented: GPU-side waits. vk_submit->waits are satisfied on the
- *   CPU before anything is published, so VK_SYNC_FEATURE_GPU_WAIT stays
- *   unadvertised and semaphores still cannot be created. Signalling from
- *   the GPU works; waiting on the GPU needs SYNC_WAIT64 in the stream.
+ *   NOT implemented: rendering. See above.
+ *
+ *   Implemented, but on the CPU: waits. VK_SYNC_FEATURE_GPU_WAIT is
+ *   advertised, which is what lets vkCreateSemaphore succeed, and
+ *   vk_submit->waits are honoured by blocking the submitting thread before
+ *   anything is published rather than by a SYNC_WAIT64 in the stream. The
+ *   wait loop in kbase_queue_submit() explains why it stops there, and what
+ *   would have to change first.
  *
  *   KNOWN LIMITATION: submissions are serialised. A kick only lands on an
  *   idle CS, so every submit waits for CS_ACTIVE to clear first - see
- *   pan_kmod_kbase_queue_wait_idle() for the measurements behind that.
+ *   pan_kmod_kbase_queue_wait_idle() for the measurements behind that. This
+ *   is now load-bearing for more than throughput: it is also what rules out
+ *   GPU-side waits.
  */
 
 #include "genxml/gen_macros.h"
@@ -133,6 +141,14 @@
  * submit_stream_bound() for the accounting.
  */
 #define PANVK_KBASE_MAX_SUBMIT_CS_SIZE 4096
+
+/* How long a submit will block waiting for its dependencies before declaring
+ * the device lost. Generous on purpose - a long dispatch that legitimately
+ * takes seconds must not be killed by this - but finite, because the failure
+ * it exists to catch is a slot no one will ever write. See the wait loop in
+ * kbase_queue_submit().
+ */
+#define PANVK_KBASE_SUBMIT_WAIT_TIMEOUT_NS (10ull * 1000 * 1000 * 1000)
 
 /* Per-item instruction budgets for the ring stream this file builds, in
  * 8-byte CS instructions. Upper bounds, not exact counts: cs_move64_to()
@@ -946,16 +962,44 @@ panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
    if (result != VK_SUCCESS)
       return result;
 
-   /* No GPU-side wait exists yet - panvk_kbase_sync deliberately withholds
-    * VK_SYNC_FEATURE_GPU_WAIT - so waits are satisfied on the CPU before
-    * anything is published. Correct, just pessimistic: it serialises the
-    * queue thread against the wait. In practice this loop does nothing,
-    * because a semaphore cannot currently be created at all.
+   /* Waits are satisfied here, on the submitting thread, before anything is
+    * published. That is what VK_SYNC_FEATURE_GPU_WAIT means on this driver:
+    * the contract is that a submission does not begin until its waits are
+    * satisfied, and blocking until then satisfies it. It is what makes
+    * vkCreateSemaphore work, which is the whole reason the feature is
+    * advertised - see the SCOPE note in panvk_kbase_sync.c.
+    *
+    * The obvious better thing is a SYNC_WAIT64 in the ring stream, letting
+    * the GPU block instead of a thread. Not done, and not merely unfinished:
+    * it is unsafe against the serialisation below it. A kick only lands on
+    * an idle CS, so every submit first waits for CS_ACTIVE to clear, and
+    * gives up after 100ms and kicks anyway. A stream parked in SYNC_WAIT64
+    * holds CS_ACTIVE for as long as the wait lasts, so the next submit would
+    * time out and then write into a ring the GPU is still executing. Doing
+    * GPU-side waits properly means fixing that first - tracking ring
+    * consumption via CS_EXTRACT instead of requiring idleness - and until
+    * then the CPU wait is strictly the safer of the two.
+    *
+    * Bounded, not UINT64_MAX. An unbounded wait on a slot the GPU will never
+    * write - a faulted group, a stream that never ran - hangs the
+    * application inside vkQueueSubmit with nothing to show for it. Timing
+    * out and reporting device loss is the same outcome the GPU's own
+    * progress timeout would produce, arriving somewhere a caller can see it.
     */
    for (uint32_t i = 0; i < vk_submit->wait_count; i++) {
       result = vk_sync_wait(&dev->vk, vk_submit->waits[i].sync,
                             vk_submit->waits[i].wait_value,
-                            VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+                            VK_SYNC_WAIT_COMPLETE,
+                            os_time_get_absolute_timeout(
+                               PANVK_KBASE_SUBMIT_WAIT_TIMEOUT_NS));
+      if (result == VK_TIMEOUT) {
+         return panvk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                             "kbase: timed out after %" PRIu64
+                             "ms waiting on submit dependency %u of %u",
+                             (uint64_t)(PANVK_KBASE_SUBMIT_WAIT_TIMEOUT_NS /
+                                        1000000),
+                             i, vk_submit->wait_count);
+      }
       if (result != VK_SUCCESS)
          return result;
    }

@@ -25,20 +25,43 @@
  *
  * SCOPE - read before relying on this:
  *
- *   Working: CPU signal, CPU reset, CPU wait, get_value, and the type
- *   registration that unblocks physical device creation.
+ *   Working: CPU signal, CPU reset, CPU wait, get_value, GPU signalling via
+ *   SYNC_SET64 from the submitted stream, and the type registration that
+ *   unblocks physical device creation.
  *
- *   Not wired: GPU-side signalling. That needs VkQueueSubmit to emit a
- *   SYNC_SET64 into the submitted command stream targeting this sync's
- *   slot, which is Phase 4 work (panvk_vX_gpu_queue.c still talks
- *   DRM_IOCTL_PANTHOR_*). Until then no GPU work ever moves a slot, so
- *   VK_SYNC_FEATURE_GPU_WAIT is deliberately not advertised.
+ *   VK_SYNC_FEATURE_GPU_WAIT is advertised, which is what lets
+ *   vkCreateSemaphore succeed - get_semaphore_sync_type() in the runtime
+ *   requires it and nothing else non-trivial. But read
+ *   kbase_queue_submit()'s wait loop before assuming what it means here:
+ *   the wait is honoured by blocking the submitting thread until the slot
+ *   reaches its value, not by a SYNC_WAIT64 in the stream. That satisfies
+ *   the feature's contract - a submission does not begin until its waits
+ *   are satisfied - but gives up the pipelining a real GPU-side wait would
+ *   buy. The reasoning for stopping there, and the specific hazard that
+ *   makes SYNC_WAIT64 unsafe today, is in that comment rather than
+ *   duplicated here.
  *
- *   Consequently the CPU wait below polls. Once submission signals slots,
- *   it should block on poll() for the kbase fd's base_csf_notification
- *   instead - the mechanism is proven, it just has no producer yet. Note
- *   that reading a notification consumes it, so that change needs a single
- *   owner of the fd's event stream, not a read() per waiter.
+ *   VK_SYNC_FEATURE_WAIT_PENDING comes with it, and is not optional: with
+ *   GPU_WAIT set and WAIT_PENDING clear, get_timeline_mode() in the runtime
+ *   asserts. Under NDEBUG that assert vanishes and the mode selection
+ *   silently proceeds on a false premise, which is the same shape of bug as
+ *   the vkCmdFillBuffer crash. See wait_satisfied() for what "pending"
+ *   actually means for these slots.
+ *
+ *   Advertising GPU_WAIT without WAIT_BEFORE_SIGNAL puts the device in
+ *   VK_DEVICE_TIMELINE_MODE_ASSISTED, so the runtime holds a submit on its
+ *   queue thread until the waits are pending rather than handing us a wait
+ *   whose signal has not been submitted yet. That is deliberate: this sync
+ *   type genuinely cannot wait before signal - a slot carries no record
+ *   that a signal is coming - and claiming otherwise would turn an ordinary
+ *   application pattern into a hang.
+ *
+ *   Still polling, not blocking. The CPU wait below spins with backoff
+ *   rather than blocking on poll() for the kbase fd's base_csf_notification.
+ *   That mechanism is proven (tests/event_slot_probe) and now has a real
+ *   producer, so the change is finally possible; the reason it has not been
+ *   made is that reading a notification consumes it, so it needs a single
+ *   owner of the fd's event stream rather than a read() per waiter.
  */
 
 #include <string.h>
@@ -167,6 +190,56 @@ panvk_kbase_sync_signal(struct vk_device *device, struct vk_sync *sync,
    return VK_SUCCESS;
 }
 
+/* Move src's payload to dst, leaving src unsignalled.
+ *
+ * Required, not optional, and the requirement is easy to miss: vk_queue.c
+ * asserts type->move exists the moment a binary semaphore's permanent
+ * payload is waited on under threaded submit, and calls it unconditionally
+ * from vk_queue_submit_move_binary_waits_to_temps(). Under NDEBUG the assert
+ * is gone and the call goes through a NULL pointer instead, which is how
+ * this was found - a SIGSEGV at pc 0 inside vkQueueSubmit.
+ *
+ * Swapping the slot indices, not copying the slot contents. Copying looks
+ * simpler and is wrong: at the point the runtime moves a payload, a submit
+ * that will signal src may already be sitting in the ring with a SYNC_SET64
+ * naming src's slot address. Copying the value that is there *now* would let
+ * that write land on the slot src still owns, so dst - the object that
+ * inherited the payload, and the one the wait will actually watch - would
+ * stay at 0 until it timed out.
+ *
+ * A slot is the payload. Handing over the index hands over any write already
+ * in flight against it, which is the behaviour a DRM syncobj gets for free by
+ * moving the underlying fence.
+ *
+ * Both syncs are the same type - vk_sync_move() asserts it - so the indices
+ * come from the same pool and stay valid. Each slot is still freed exactly
+ * once, by whichever vk_sync holds it at finish time.
+ */
+static VkResult
+panvk_kbase_sync_move(struct vk_device *device, struct vk_sync *dst,
+                      struct vk_sync *src)
+{
+   struct panvk_kbase_sync_type *type = to_kbase_sync_type(src->type);
+   struct panvk_kbase_sync *d = to_kbase_sync(dst);
+   struct panvk_kbase_sync *s = to_kbase_sync(src);
+
+   uint32_t moved = s->slot;
+   s->slot = d->slot;
+   d->slot = moved;
+
+   /* src must read as unsignalled afterwards. The slot it now holds is dst's
+    * old one, which is usually a freshly created temporary and already zero,
+    * but the contract is that this function leaves src reset rather than that
+    * the caller happened to hand over something empty.
+    */
+   volatile uint64_t *v = slot_value(type, s->slot);
+   v[0] = 0;
+   v[1] = 0;
+   __sync_synchronize();
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 panvk_kbase_sync_get_value(struct vk_device *device, struct vk_sync *sync,
                            uint64_t *value)
@@ -209,6 +282,26 @@ wait_satisfied(struct panvk_kbase_sync_type *type,
    return have >= wait->wait_value;
 }
 
+/* VK_SYNC_WAIT_PENDING asks whether a signal operation has been *submitted*,
+ * not whether it has completed. A slot cannot answer that: it holds one
+ * 64-bit value that changes when the GPU's SYNC_SET64 retires, and carries
+ * no record that a stream containing one has been published.
+ *
+ * So a pending wait is answered as a complete wait. That is the conservative
+ * direction - it reports "not yet" for a signal that has been submitted but
+ * not executed, never the reverse - and the runtime uses PENDING to decide
+ * when a submit may be released, where answering late costs latency and
+ * answering early would be a correctness bug.
+ *
+ * It is only safe because submissions here are serialised and there is one
+ * queue: the runtime's queue thread waits PENDING with no timeout before
+ * calling into submission, so if a signal could sit behind the waiter in the
+ * same queue this would deadlock rather than stall. It cannot - the thread
+ * drains submits in order, so the signalling submit has always been
+ * processed by the time the waiter is looked at. Adding a second queue means
+ * revisiting this, not just this function.
+ */
+
 static VkResult
 panvk_kbase_sync_wait_many(struct vk_device *device, uint32_t wait_count,
                            const struct vk_sync_wait *waits,
@@ -220,11 +313,17 @@ panvk_kbase_sync_wait_many(struct vk_device *device, uint32_t wait_count,
 
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(waits[0].sync->type);
 
+   /* VK_SYNC_WAIT_PENDING is deliberately not distinguished from a complete
+    * wait - see the note above wait_satisfied() for why a slot cannot answer
+    * "pending" and why collapsing the two is the safe direction. Only
+    * VK_SYNC_WAIT_ANY changes behaviour below.
+    */
+
    /* Polling, not blocking. See the SCOPE note at the top of this file: the
-    * notification path exists and works, but nothing signals a slot from the
-    * GPU yet, so there is no event to block on. Back off to 1ms so a long
-    * wait does not burn a core; start tight so the common
-    * already-signalled case stays cheap.
+    * kbase fd's notification path would let this block, but consuming a
+    * notification is destructive, so it needs a single owner of the event
+    * stream first. Back off to 1ms so a long wait does not burn a core;
+    * start tight so the common already-signalled case stays cheap.
     */
    uint64_t sleep_ns = 1000;
 
@@ -266,16 +365,23 @@ panvk_kbase_sync_type_init(struct panvk_kbase_sync_type *type, int fd)
 
    type->base = (struct vk_sync_type){
       .size = sizeof(struct panvk_kbase_sync),
-      /* No GPU_WAIT: submission does not signal these yet. Advertising it
-       * would let the runtime hand a sync to a queue operation that can
-       * never complete.
+      /* GPU_WAIT and WAIT_PENDING travel together, and neither is a free
+       * claim - see the SCOPE note for what each one commits this type to.
+       *
+       * Deliberately absent: WAIT_BEFORE_SIGNAL, which this cannot do and
+       * which would move the device out of the ASSISTED timeline mode that
+       * compensates for that; and GPU_MULTI_WAIT, so the runtime keeps
+       * resetting binary payloads after a wait rather than assuming one
+       * signal can release several waiters.
        */
       .features = VK_SYNC_FEATURE_BINARY | VK_SYNC_FEATURE_TIMELINE |
                   VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_CPU_RESET |
-                  VK_SYNC_FEATURE_CPU_SIGNAL | VK_SYNC_FEATURE_WAIT_ANY,
+                  VK_SYNC_FEATURE_CPU_SIGNAL | VK_SYNC_FEATURE_WAIT_ANY |
+                  VK_SYNC_FEATURE_GPU_WAIT | VK_SYNC_FEATURE_WAIT_PENDING,
       .init = panvk_kbase_sync_init,
       .finish = panvk_kbase_sync_finish,
       .signal = panvk_kbase_sync_signal,
+      .move = panvk_kbase_sync_move,
       .get_value = panvk_kbase_sync_get_value,
       .reset = panvk_kbase_sync_reset,
       .wait_many = panvk_kbase_sync_wait_many,

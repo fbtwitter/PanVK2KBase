@@ -109,6 +109,13 @@ driver_compute_probe: ./src/tests/driver_compute_probe/driver_compute_probe.c
 driver_pipeline_probe: ./src/tests/driver_pipeline_probe/driver_pipeline_probe.c
 	$(CC) $(CFLAGS) -I./src/tests/driver_pipeline_probe -o ./build/driver_pipeline_probe $<
 
+# Semaphores: creation, a binary chain between two submits, and a timeline
+# value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
+# so nothing before this could order any work. Reuses driver_pipeline_probe's
+# shader and its generated header rather than carrying a second copy.
+driver_semaphore_probe: ./src/tests/driver_semaphore_probe/driver_semaphore_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/driver_pipeline_probe -o ./build/driver_semaphore_probe $<
+
 # Regenerate the embedded SPIR-V. Only needed after editing shader.comp - the
 # generated header is committed so a normal build needs no glslang.
 pipeline_probe_shader:

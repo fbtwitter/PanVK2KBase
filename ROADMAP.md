@@ -322,6 +322,10 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `panvk_kbase_sync` deliberately does not advertise while nothing can
       signal a slot from the GPU. That is the intended behaviour —
       advertising it would hand out semaphores that could never complete.
+      *(Since fixed: the GPU does signal slots now, the feature is
+      advertised, and semaphores work — see the Phase 4 fence-translation
+      item. This line describes the state at the time, not a live
+      limitation.)*
       `vkDeviceWaitIdle` returns `-8` from the submit stub, as designed.
 - [x] **The kick/observe primitives are in the backend.** They existed only
       inside `tests/live_kick_probe` and `tests/event_slot_probe`, so
@@ -509,6 +513,10 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       needs `SYNC_WAIT64` in the stream. (The earlier note here said
       submission working would let semaphores work — that was imprecise:
       signal and wait are separate features and only signal is done.)
+      *(Superseded: semaphores work now. Advertising the feature turned out
+      not to require `SYNC_WAIT64` at all — a CPU block satisfies its
+      contract — and `SYNC_WAIT64` is currently unsafe against the
+      kick-on-idle serialisation. See the fence-translation item.)*
       The CPU wait in `panvk_kbase_sync.c` should also switch from polling
       to blocking on the kbase fd's notification via
       `pan_kmod_kbase_read_event()` (noting `read()` consumes one, so it
@@ -787,10 +795,19 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       the command stream by `SYNC_SET64` at system scope. No DRM syncobj is
       involved, which is the point: the original note below correctly
       identified that the mechanism PanVK assumes does not exist here.
-      Still missing: **GPU-side waits.** `vk_submit->waits` are satisfied on
-      the CPU before anything is published, so `VK_SYNC_FEATURE_GPU_WAIT`
-      stays unadvertised and semaphores cannot be created. That needs
-      `SYNC_WAIT64` in the stream, and it is the next sync-layer job.
+      **Waits and semaphores — also done, and not the way this line
+      predicted.** `VK_SYNC_FEATURE_GPU_WAIT` is advertised, so binary and
+      timeline semaphores create and work; `vk_submit->waits` are honoured by
+      blocking the submitting thread before anything is published. The note
+      here used to say this needed `SYNC_WAIT64` in the stream. It does not,
+      and `SYNC_WAIT64` is in fact currently *unsafe*: a stream parked in one
+      holds `CS_ACTIVE`, which the kick-on-idle serialisation would then
+      violate. Advertising the feature commits only to "a submission does not
+      begin until its waits are satisfied", which a CPU block satisfies.
+      Two things came with it, both in `docs/kbase-notes.md`:
+      `VK_SYNC_FEATURE_WAIT_PENDING` is not optional alongside `GPU_WAIT`,
+      and `vk_sync_type::move` must exist and must swap slots rather than
+      copy their contents. Verified by `tests/driver_semaphore_probe`.
       Original note follows.
 - [ ] **(superseded) Build the fence-translation shim between kbase's
       completion
@@ -809,6 +826,24 @@ Working end to end on the Poco X8 Pro (Mali-G720 MC8, kbase r49p1):
 `vkCreateDevice` → command buffer → compute pipeline from application
 SPIR-V → `vkCmdDispatch` → GPU-signalled fence → correct results read back.
 Stable across 2000 back-to-back submits.
+
+Semaphores work too, as of the same day. `vkCreateSemaphore` used to fail
+outright — the runtime rejects every sync type without
+`VK_SYNC_FEATURE_GPU_WAIT`, so no application that orders work could get past
+device setup, and compute only survived without it because fences do not need
+it. Binary and timeline semaphores now create, a binary semaphore chains two
+submits, and a timeline reaches exactly the value a submit asked for
+(`tests/driver_semaphore_probe`, 5/5).
+
+The wait itself is still on the CPU: the submitting thread blocks until the
+slot reaches its value, rather than a `SYNC_WAIT64` blocking the GPU. That
+satisfies the feature's contract and is deliberately as far as it goes — see
+`docs/kbase-notes.md`. A stream parked in `SYNC_WAIT64` would hold
+`CS_ACTIVE`, and submission here kicks anyway 100ms after giving up on an
+idle CS, so a real GPU-side wait would let the next submit overwrite a ring
+the GPU is still running. **Serialisation has to be fixed first** — tracking
+consumption via `CS_EXTRACT` instead of requiring idleness — and it is now
+load-bearing for correctness, not just throughput.
 
 **Compute works. Rendering does not, and the one thing blocking it is the
 render descriptor ringbuf** — `init_render_desc_ringbuf()` maps one BO at
@@ -834,6 +869,15 @@ Tools worth knowing about before touching any of this:
   `wsl-build*.sh`, and self-skip when already applied. Changing one means
   restoring its target files in `/opt/mesa-src` and re-running *all* of
   them, since they share targets.
+- Release builds define `NDEBUG`, so every `assert()` in the Vulkan runtime
+  is gone. Three separate crashes here have been a runtime precondition
+  asserted upstream and then dereferenced anyway — `assert(shader)` before
+  `precomp_cache_get()`, and `assert(type->move)` before calling it. **A
+  `SIGSEGV` at `pc 0` means an optional-looking function pointer was not
+  optional**; read the caller frame before anything else.
+  `llvm-symbolizer --obj=<unstripped .so> --functions=linkage` on the raw
+  offsets from `adb logcat -b crash` names it in one step, which the device
+  cannot do for `/data/local/tmp` libraries itself.
 
 ## Phase 5 — Headless triangle
 - [ ] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.

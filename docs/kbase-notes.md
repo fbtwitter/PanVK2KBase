@@ -1219,3 +1219,93 @@ back holding the pattern. The buffer is seeded with the complement of the
 pattern first, so a pass cannot be memory that already happened to match.
 
 That is the first shader this port has executed.
+
+## Semaphores: the missing `vk_sync_type` callback is found only at runtime
+
+`vkCreateSemaphore` failed with `VK_ERROR_FEATURE_NOT_PRESENT` until
+`panvk_kbase_sync` advertised `VK_SYNC_FEATURE_GPU_WAIT`.
+`get_semaphore_sync_type()` (`vk_semaphore.c:99`) requires it and nothing else
+non-trivial, so no application that orders any work could get past device
+setup. Fences never needed it, which is why compute worked without it.
+
+Adding the bit is not by itself a claim to have GPU-side waits. What it
+commits to is that a submission does not begin until its waits are satisfied,
+and blocking the submitting thread satisfies that. The reason to stop there
+rather than emit `SYNC_WAIT64` is in the wait loop in
+`panvk_vX_kbase_queue.c`, and it is not laziness: a stream parked in
+`SYNC_WAIT64` holds `CS_ACTIVE`, and every submit here first waits for
+`CS_ACTIVE` to clear and then kicks anyway after 100ms. Real GPU-side waits
+would therefore let the next submit overwrite a ring the GPU is still
+executing. Fixing the serialisation - tracking consumption via `CS_EXTRACT`
+rather than requiring idleness - has to come first.
+
+### Two feature bits that are not independent
+
+Setting `GPU_WAIT` without `WAIT_PENDING` puts `get_timeline_mode()`
+(`vk_device.c:79`) on an `assert` that fires in a debug build and vanishes
+under `NDEBUG`, leaving the mode selection running on a false premise. And
+setting `GPU_WAIT` without `WAIT_BEFORE_SIGNAL` is deliberate: it selects
+`VK_DEVICE_TIMELINE_MODE_ASSISTED`, where the runtime holds a submit on its
+queue thread until the waits are pending instead of handing over a wait whose
+signal has not been submitted. That is exactly the compensation this sync
+type needs, because a slot carries no record that a signal is coming.
+
+`WAIT_PENDING` itself is answered as a complete wait. A slot cannot
+distinguish "a signal has been submitted" from "a signal has landed" - it
+holds one value, written when the `SYNC_SET64` retires. Answering late is the
+safe direction; it costs latency, where answering early would be a
+correctness bug.
+
+### `type->move` is mandatory, and the crash tells you nothing
+
+The first run with `GPU_WAIT` set died with `SIGSEGV` at `pc 0` inside
+`vkQueueSubmit`. `vk_queue.c:276` asserts `semaphore->permanent.type->move`
+exists the moment a binary semaphore's permanent payload is waited on under
+threaded submit, then
+`vk_queue_submit_move_binary_waits_to_temps()` calls it unconditionally.
+Under `NDEBUG` the assert is gone and the call goes through a NULL pointer.
+
+This is the third time in this port that an `assert` compiled out under
+`NDEBUG` has turned a clear precondition into a NULL dereference - the others
+were `precomp_cache_get()` behind `assert(shader)`, and this one. A crash at
+`pc 0` with a plausible caller frame is worth reading as "an optional-looking
+function pointer was not optional" before anything else.
+
+`llvm-symbolizer --obj=<unstripped .so> --functions=linkage` against the raw
+frame offsets from `adb logcat -b crash` named the caller in one step. The
+device cannot symbolize `/data/local/tmp` libraries itself.
+
+### Moving a payload means moving the slot, not its contents
+
+The obvious implementation of `move` - copy src's value into dst, zero src -
+is wrong here, and wrong in a way that would have passed this probe.
+
+At the point the runtime moves a payload, a submit that will signal src can
+already be sitting in the ring with a `SYNC_SET64` naming src's slot
+*address*. Copying the value that is there at that instant leaves the pending
+write aimed at the slot src still owns, so dst - the object that inherited
+the payload and the one the wait actually watches - would stay at 0 until it
+timed out. Serialised submission makes this rare rather than impossible.
+
+Swapping the two slot indices is correct instead: a slot *is* the payload, so
+handing over the index hands over any write already in flight against it.
+This is the behaviour a DRM syncobj gets for free by moving the underlying
+fence, and it is why `move` exists as a callback rather than being emulated
+by the runtime out of `get_value` and `signal`.
+
+### Confirmed on hardware
+
+`tests/driver_semaphore_probe`, 5/5 runs, no failures, alongside
+`driver_pipeline_probe` still passing:
+
+- binary and timeline semaphores create;
+- two submits chained by a binary semaphore both complete, each writing its
+  own buffer with its own push constant;
+- a timeline semaphore reaches exactly the value the submit asked for -
+  checked at 42 rather than 1, so a signal that took the binary path would
+  fail here rather than pass.
+
+Not checked, deliberately: that the second submit's work happens after the
+first's. Submission is serialised anyway, so that would hold with the
+semaphore removed entirely, and a test that passes for the wrong reason is
+worse than no test.
