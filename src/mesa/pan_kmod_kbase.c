@@ -49,6 +49,12 @@
 #include "util/u_memory.h"
 #include "util/vma.h"
 
+/* For struct drm_panthor_csif_info. PanVK reads CSF geometry through
+ * panthor_kmod_get_csif_props(), so a kbase device has to be able to fill
+ * that same struct - see kbase_query_csif_props().
+ */
+#include "drm-uapi/panthor_drm.h"
+
 #include "pan_kmod.h"
 #include "pan_kmod_backend.h"
 #include "pan_kmod_kbase.h"
@@ -136,6 +142,18 @@ struct kbase_kmod_dev {
     * makes exactly one of these per logical device.
     */
    bool already_initialized;
+
+   /* CSF interface geometry, in the shape PanVK expects.
+    *
+    * PanVK reads this through panthor_kmod_get_csif_props() in six places
+    * (panvk_vX_device.c, exception_handler, gpu_queue, cmd_buffer,
+    * cmd_draw, utrace). That accessor container_of()s the pan_kmod_dev
+    * into a panthor_kmod_dev, so on a kbase device it reads whatever
+    * happens to follow this struct - which is how nr_registers ended up
+    * garbage and cs_builder wrote off the end of its buffer. Filling a
+    * real one here and dispatching to it is the fix.
+    */
+   struct drm_panthor_csif_info csif;
 
    /* GPU VA allocator over the FIXED_VA zone.
     *
@@ -418,6 +436,8 @@ pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor)
 }
 
 static int kbase_init_va_heap(struct kbase_kmod_dev *dev);
+static void kbase_query_csif_props(struct kbase_kmod_dev *dev);
+static void kbase_query_allowed_priorities(struct kbase_kmod_dev *dev);
 
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags,
@@ -470,6 +490,9 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
 
    if (kbase_init_va_heap(kbase_dev))
       goto err_cleanup;
+
+   kbase_query_csif_props(kbase_dev);
+   kbase_query_allowed_priorities(kbase_dev);
 
    return &kbase_dev->base;
 
@@ -540,6 +563,131 @@ kbase_init_va_heap(struct kbase_kmod_dev *dev)
              "not work. Set PANVK_KBASE_FIXED_VA_BASE if this device puts "
              "the zone somewhere unexpected.");
    return -1;
+}
+
+/* Number of CS registers, and how many of those the kernel reserves.
+ *
+ * kbase's KBASE_IOCTL_CS_GET_GLB_IFACE reports CSG and CS *slot* counts
+ * but not register counts - panthor gets those from the firmware
+ * interface, and there is no kbase equivalent exposed to userspace. These
+ * are the architectural values for CSF, and they are not guesses here:
+ * tests/cs_encode_probe and tests/live_kick_probe build command streams
+ * with exactly nr_registers=96 / nr_kernel_registers=4 using Mesa's own
+ * cs_builder, and those streams execute on this GPU (CS_EXTRACT advances).
+ * See docs/mesa-cs-builder.md and docs/kbase-notes.md.
+ */
+#define KBASE_CS_REG_COUNT 96
+#define KBASE_UNPRESERVED_CS_REG_COUNT 4
+#define KBASE_SCOREBOARD_SLOT_COUNT 8
+
+/* Fill in the CSF interface geometry PanVK reads via
+ * panthor_kmod_get_csif_props(). Best-effort: on failure the architectural
+ * defaults are kept, which is still far better than the garbage a
+ * container_of() onto the wrong struct produces.
+ */
+static void
+kbase_query_csif_props(struct kbase_kmod_dev *dev)
+{
+   dev->csif = (struct drm_panthor_csif_info){
+      .csg_slot_count = 8,
+      .cs_slot_count = 8,
+      .cs_reg_count = KBASE_CS_REG_COUNT,
+      .scoreboard_slot_count = KBASE_SCOREBOARD_SLOT_COUNT,
+      .unpreserved_cs_reg_count = KBASE_UNPRESERVED_CS_REG_COUNT,
+   };
+
+   /* Counts only: passing 0 for the max_*_num fields means the kernel
+    * fills in the totals without writing any group/stream arrays.
+    */
+   union kbase_ioctl_cs_get_glb_iface iface = { 0 };
+
+   if (ioctl(dev->base.fd, KBASE_IOCTL_CS_GET_GLB_IFACE, &iface) < 0) {
+      mesa_logw("kbase: CS_GET_GLB_IFACE failed (%s), using default CSF "
+                "interface geometry", strerror(errno));
+      return;
+   }
+
+   if (iface.out.group_num) {
+      dev->csif.csg_slot_count = iface.out.group_num;
+
+      /* total_stream_num is summed across all groups. */
+      if (iface.out.total_stream_num)
+         dev->csif.cs_slot_count = iface.out.total_stream_num /
+                                   iface.out.group_num;
+   }
+
+   mesa_logi("kbase: CSF iface v%u.%u.%u, %u CSG slots x %u streams",
+             (iface.out.glb_version >> 24) & 0xff,
+             (iface.out.glb_version >> 16) & 0xff,
+             iface.out.glb_version & 0xffff,
+             dev->csif.csg_slot_count, dev->csif.cs_slot_count);
+}
+
+/* Work out which queue-group priorities this context may actually use.
+ *
+ * PanVK refuses vkCreateDevice with VK_ERROR_NOT_PERMITTED_KHR unless the
+ * requested global priority is set in props.allowed_group_priorities_mask
+ * (panvk_vX_device.c:239). Leaving that mask at 0 - which is what an
+ * unset field means - rejects every priority including the default MEDIUM,
+ * so no device can ever be created.
+ *
+ * kbase answers this directly with KBASE_IOCTL_CONTEXT_PRIORITY_CHECK,
+ * which clamps a requested priority to what the context is permitted and
+ * returns it. The vendor blob calls it for the same reason (see the
+ * libGLES_mali.so ioctl survey in docs/kbase-notes.md). A priority is
+ * allowed iff it survives the round-trip unchanged.
+ */
+static void
+kbase_query_allowed_priorities(struct kbase_kmod_dev *dev)
+{
+   static const struct {
+      uint8_t kbase_prio;
+      enum pan_kmod_group_allow_priority_flags flag;
+   } prios[] = {
+      { BASE_QUEUE_GROUP_PRIORITY_LOW, PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW },
+      { BASE_QUEUE_GROUP_PRIORITY_MEDIUM,
+        PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM },
+      { BASE_QUEUE_GROUP_PRIORITY_HIGH, PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH },
+      { BASE_QUEUE_GROUP_PRIORITY_REALTIME,
+        PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME },
+   };
+
+   uint32_t mask = 0;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(prios); i++) {
+      struct kbase_ioctl_context_priority_check check = {
+         .priority = prios[i].kbase_prio,
+      };
+
+      if (ioctl(dev->base.fd, KBASE_IOCTL_CONTEXT_PRIORITY_CHECK, &check) < 0)
+         continue;
+
+      if (check.priority == prios[i].kbase_prio)
+         mask |= prios[i].flag;
+   }
+
+   if (!mask) {
+      /* Either the ioctl is missing or it clamped everything. MEDIUM is
+       * what every group this repo has created on hardware uses
+       * (priority 0 in tests/queue_group and tests/live_kick_probe, which
+       * do get scheduled and executed), so assume it rather than leave a
+       * zero mask that makes vkCreateDevice impossible.
+       */
+      mesa_logw("kbase: CONTEXT_PRIORITY_CHECK gave nothing usable, "
+                "assuming MEDIUM is allowed");
+      mask = PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
+   }
+
+   dev->base.props.allowed_group_priorities_mask = mask;
+}
+
+const struct drm_panthor_csif_info *
+pan_kmod_kbase_get_csif_props(const struct pan_kmod_dev *dev)
+{
+   const struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, const struct kbase_kmod_dev, base);
+
+   return &kbase_dev->csif;
 }
 
 static void

@@ -60,3 +60,24 @@ void *pan_kmod_kbase_alloc_event_mem(int fd, size_t size, uint64_t *gpu_va);
  * @size: Size originally requested.
  */
 void pan_kmod_kbase_free_event_mem(int fd, void *cpu, size_t size);
+
+struct drm_panthor_csif_info;
+
+/**
+ * pan_kmod_kbase_get_csif_props() - CSF interface geometry for a kbase dev.
+ * @dev: A kbase pan_kmod device.
+ *
+ * PanVK reads CSF geometry through panthor_kmod_get_csif_props(), which
+ * container_of()s a pan_kmod_dev into a panthor_kmod_dev. On a kbase
+ * device that reads past the end of the real struct and returns garbage -
+ * a garbage cs_reg_count makes cs_builder write out of bounds, which
+ * segfaulted vkCreateDevice inside generate_tiler_oom_handler.
+ *
+ * panthor_kmod_get_csif_props() is patched to dispatch here for kbase
+ * devices, so all six of its callers get correct values unchanged.
+ *
+ * Return: geometry filled from KBASE_IOCTL_CS_GET_GLB_IFACE where kbase
+ * exposes it, and architectural CSF defaults where it does not.
+ */
+const struct drm_panthor_csif_info *
+pan_kmod_kbase_get_csif_props(const struct pan_kmod_dev *dev);

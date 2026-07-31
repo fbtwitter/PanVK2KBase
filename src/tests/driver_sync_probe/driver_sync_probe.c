@@ -170,13 +170,13 @@ main(int argc, char **argv)
              "   the sync type is broken - physical device creation, which\n"
              "   is what registers it, succeeds (see driver_enum_probe).\n"
              "\n"
-             "   Check `adb logcat -d | grep MESA` for the reason. Expected\n"
-             "   as of now:\n"
-             "     'kbase: vm_bind cannot honour a caller-chosen VA'\n"
-             "   BOs are allocated BASE_MEM_SAME_VA, so the kernel picks the\n"
-             "   address; PanVK picks its own and then dereferences it.\n"
-             "   Honouring the request needs BASE_MEM_FIXED allocation - see\n"
-             "   ROADMAP.md Phase 2.\n",
+             "   Expected as of now: -3 VK_ERROR_INITIALIZATION_FAILED from\n"
+             "   panvk_vX_gpu_queue.c's DRM_IOCTL_PANTHOR_GROUP_CREATE,\n"
+             "   issued on the kbase fd. The GPU queue is still entirely\n"
+             "   panthor-specific; swapping it for kbase's\n"
+             "   CS_QUEUE_GROUP_CREATE/REGISTER/BIND/KICK is Phase 4 (and is\n"
+             "   already prototyped in tests/queue_group).\n"
+             "   Anything else, check `adb logcat -d | grep MESA`.\n",
              r);
       return 1;
    }

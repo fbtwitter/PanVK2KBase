@@ -263,24 +263,48 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `driver_enum_probe` is unaffected (`count=1`, Mali-G720 MC8).
       Standalone probes were deliberately left on SAME_VA — they are the
       hardware evidence for Phases 3-4 and all still pass.
-- [ ] **`vkCreateDevice` still fails: segfault in
-      `generate_tiler_oom_handler`.** Not root-caused. Device creation now
-      gets much further — past the VM, past mempool setup — and crashes
-      inside `csf/panvk_vX_exception_handler.c` while generating the
-      tiler-OOM handlers, after exactly two BO allocations (4KB, then the
-      32KB `handlers_bo`). No kbase error is logged; the VA path is
-      working.
-      Ruled out so far: short CPU mappings. The obvious theory was that
-      `pan_kmod_bo_mmap()` of a multi-page fixed region covers less than
-      it claims — the fault address sits roughly 32KB above a mapping —
-      but `tests/fixed_va_probe` section 7 allocates 2-, 8- and 8-page
-      fixed regions, maps them, writes every page, and all succeed. So the
-      mapping is fine and the cause is elsewhere.
-      Next things to try: log `handlers_bo->addr.host` and the
-      `cs_builder` capacity at the crash site; check whether
-      `conf.alloc_buffer` is being invoked (i.e. the generated stream
-      overflows `TILER_OOM_HANDLER_MAX_SIZE`) and what it returns; and
-      confirm the arch-specific library selected (v12) matches the device.
+- [x] **The `generate_tiler_oom_handler` segfault — found and fixed. It
+      was not a memory bug.** `panthor_kmod_get_csif_props()` does
+      `container_of(dev, struct panthor_kmod_dev, base)` with no check of
+      which backend the device belongs to, so on a kbase device it read
+      whatever memory followed `struct kbase_kmod_dev`. The garbage landed
+      in `cs_builder_conf.nr_registers` via `csif_info->cs_reg_count`, and
+      `cs_builder` then wrote off the end of its buffer.
+      The short-mapping theory (fault address ~32KB above a mapping) was
+      wrong and is disproved by `tests/fixed_va_probe` section 7, which
+      allocates 2-, 8- and 8-page fixed regions, maps them and writes
+      every page successfully.
+      PanVK reads that accessor in six places, so the fix is one site:
+      `src/mesa/patch-panthor-csif-dispatch.py` makes
+      `panthor_kmod_get_csif_props()` dispatch to
+      `pan_kmod_kbase_get_csif_props()` when `dev->ops == &kbase_kmod_ops`,
+      and all six callers get correct values unchanged. The backend fills
+      a real `drm_panthor_csif_info` from
+      `KBASE_IOCTL_CS_GET_GLB_IFACE` — confirmed on-device as
+      `CSF iface v3.6.0, 8 CSG slots x 8 streams`, matching what
+      `tests/glb_iface_probe` reported independently. Register counts are
+      not exposed by that ioctl, so they use the architectural values
+      (96 registers, 4 kernel-reserved) that `tests/cs_encode_probe` and
+      `tests/live_kick_probe` already validated by executing real command
+      streams on this GPU.
+- [x] **`VK_ERROR_NOT_PERMITTED_KHR` from `vkCreateDevice` — fixed.** With
+      the segfault gone, device creation failed `-1000174001` because
+      `props.allowed_group_priorities_mask` was never set by the kbase
+      backend. A zero mask rejects every priority including the default
+      MEDIUM (`panvk_vX_device.c:239`), so no device could ever be
+      created. Now filled from `KBASE_IOCTL_CONTEXT_PRIORITY_CHECK`, which
+      clamps a requested priority to what the context may use — a priority
+      is allowed iff it survives the round-trip. The vendor blob calls the
+      same ioctl for the same reason (see the `libGLES_mali.so` survey in
+      `docs/kbase-notes.md`).
+- [ ] **`vkCreateDevice` now fails `-3` at the GPU queue — the expected
+      Phase 4 wall.** `panvk_vX_gpu_queue.c:685` issues
+      `DRM_IOCTL_PANTHOR_GROUP_CREATE` on the kbase fd. This is not a new
+      bug: the whole GPU queue is panthor-specific, and replacing it with
+      kbase's `CS_QUEUE_GROUP_CREATE`/`_REGISTER`/`_BIND`/`_KICK` is the
+      "Map VkQueueSubmit onto kbase" item in Phase 4 below, already
+      prototyped end-to-end in `tests/queue_group` and
+      `tests/live_kick_probe`.
 - [ ] ~~Real VA management is required~~ — superseded by the two items
       above. Kept for the reasoning: kbase supports it: the vendored headers
       define `BASE_MEM_FIXED` (`csf/mali_base_csf_kernel.h:34`) and
