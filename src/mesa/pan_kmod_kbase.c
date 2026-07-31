@@ -1473,23 +1473,60 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
    return 0;
 }
 
+/*
+ * dma-buf import. Deliberately left unimplemented, and it is worth being
+ * precise about why, because "fill in the stub" does not fix it.
+ *
+ * kbase can import - KBASE_IOCTL_MEM_IMPORT with BASE_MEM_IMPORT_TYPE_UMM
+ * takes a dma-buf fd directly, and Panfork's kbase_import_dmabuf() runs
+ * that sequence on real hardware. The problem is that this hook is never
+ * reached. The common pan_kmod_bo_import() (lib/kmod/pan_kmod.c) does:
+ *
+ *     int ret = drmPrimeFDToHandle(dev->fd, fd, &handle);
+ *     if (ret)
+ *        goto err_unlock;
+ *     ...
+ *     bo = dev->ops->bo_import(dev, handle, size);
+ *
+ * so the fd is converted to a GEM handle before any backend dispatch. On
+ * /dev/mali0 - a misc device with no DRM ioctls - that fails and the import
+ * returns NULL without ever calling this function. Note the hook's signature
+ * takes the GEM handle, not the fd, so even reaching it would hand us a
+ * number that means nothing here.
+ *
+ * Making this work needs an fd-taking entry point that dispatches to the
+ * backend before touching DRM, which is a change to shared code that panthor
+ * also uses - the same shape of problem as the render descriptor ringbuf.
+ * See ROADMAP.md Phase 3.
+ */
 static struct pan_kmod_bo *
 kbase_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
 {
-   /* dma-buf import. The common pan_kmod_bo_import() reaches this through
-    * drmPrimeFDToHandle() on dev->fd, which cannot work on a misc device -
-    * so wiring this up needs changes above this backend too, not just here.
-    * kbase's own path is KBASE_IOCTL_MEM_IMPORT with
-    * BASE_MEM_IMPORT_TYPE_UMM. Phase 3 work.
-    */
-   mesa_loge("kbase: bo_import not implemented yet");
+   mesa_loge("kbase: bo_import unreachable (pan_kmod_bo_import() requires "
+             "drmPrimeFDToHandle() on a non-DRM device)");
    return NULL;
 }
 
+/*
+ * dma-buf export. Not "not yet" - not possible.
+ *
+ * kbase has no export mechanism at all: there is no PRIME ioctl, no
+ * dmabuf-out, nothing anywhere in the r49p1 UAPI that turns an allocation
+ * into an fd. Import is a one-way door on this driver.
+ *
+ * Even if there were, this hook could not carry it. pan_kmod_bo_export() is
+ * a static inline in pan_kmod.h that calls drmPrimeHandleToFD() itself and
+ * only then invokes ops->bo_export as an optional *post*-export step, with
+ * the fd already made. There is nothing here to override.
+ *
+ * Kept as a hard failure rather than removed, so that a caller which gets
+ * here despite the capability gating fails loudly instead of receiving a
+ * plausible-looking fd.
+ */
 static int
 kbase_kmod_bo_export(struct pan_kmod_bo *bo, int dmabuf_fd)
 {
-   mesa_loge("kbase: bo_export not implemented yet");
+   mesa_loge("kbase: bo_export impossible (kbase has no dma-buf export path)");
    return -1;
 }
 

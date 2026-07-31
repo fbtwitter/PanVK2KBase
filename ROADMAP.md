@@ -608,7 +608,39 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       already gone by then, so it's `munmap()`-only. Wired into
       `memory2.c` and `queue_group.c`'s teardown.
 - [x] mmap — confirmed working (see above).
-- [ ] dma-buf import/export.
+- [ ] **dma-buf import — needs a shared-code change, like the ringbuf.**
+      Scoped 2026-08-01; it is not backend-local work, which is what it
+      looked like. kbase can import: `KBASE_IOCTL_MEM_IMPORT` with
+      `BASE_MEM_IMPORT_TYPE_UMM` takes a dma-buf fd, and Panfork's
+      `kbase_import_dmabuf()` shows the whole sequence working on real
+      hardware. The obstacle is above this backend — `pan_kmod_bo_import()`
+      (`lib/kmod/pan_kmod.c:183`) calls `drmPrimeFDToHandle(dev->fd, ...)`
+      to turn the fd into a GEM handle *before* dispatching to
+      `ops->bo_import`, and on a misc device that fails, so
+      `kbase_kmod_bo_import()` is never reached. Filling in the stub
+      therefore accomplishes nothing on its own. What it needs is an
+      fd-taking entry point that dispatches to the backend before any DRM
+      call — a second upstream question, and a natural companion to the
+      ringbuf one.
+- [ ] ~~dma-buf export~~ — **not expressible on kbase.** Two independent
+      reasons. `pan_kmod_bo_export()` is a `static inline` in
+      `pan_kmod.h:703` that calls `drmPrimeHandleToFD()` itself; the
+      backend's `bo_export` is only an optional post-export hook, so there
+      is nothing to override. More fundamentally, kbase has no export
+      mechanism at all — no PRIME, no dmabuf-out ioctl anywhere in the
+      r49p1 UAPI. Unlike the ringbuf, there is no workaround to negotiate,
+      because there is no primitive to build one from. Anything needing to
+      hand a PanVK allocation to another process or device is out of scope
+      on this driver.
+- [ ] **Consequence, and the actionable part: stop advertising both.**
+      `panvk_physical_device.c:1427` unconditionally reports
+      `OPAQUE_FD | DMA_BUF` with `EXPORTABLE | IMPORTABLE`. On kbase that
+      is untrue in both directions today, so an application that believes
+      it gets `VK_ERROR_OUT_OF_DEVICE_MEMORY` out of `vkGetMemoryFdKHR()`
+      rather than a clean "unsupported" at query time. Gating that on
+      `is_kbase` is backend-local, needs nothing from upstream, and is
+      correctness rather than a feature. Worth doing before WSI, since
+      Phase 6 is where something will actually ask.
 - [ ] Tiler heap / JIT growable memory — PanVK's current growth logic
       assumes panthor/panfrost conventions; expect to adapt it.
 
