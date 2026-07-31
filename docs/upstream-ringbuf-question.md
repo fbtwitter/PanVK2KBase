@@ -150,6 +150,164 @@ order, but that's the part I'd most like checked before writing it.
 
 ---
 
+## The same question as a GitLab issue
+
+For `gitlab.freedesktop.org/mesa/mesa/-/issues` instead of IRC. Self-contained
+— the chat version above assumes someone will ask for detail, this one does
+not. Label it `panfrost` / `vulkan` if the tracker lets you.
+
+**Title:** `panvk/csf: is the render desc ringbuf's double mapping required, or would tail-padding do?`
+
+---
+
+### Summary
+
+`init_render_desc_ringbuf()` maps one BO at two adjacent GPU VAs. I'm porting
+PanVK to Arm's legacy `kbase` kernel driver, which cannot express that, and
+the workaround I can see — tail-padding instead of relying on the mapping to
+wrap — is a change to shared code that would affect panthor too. So I'd
+rather ask before writing it.
+
+**The question, up front:** was the double mapping chosen over tail-padding
+for a reason I should preserve, or mainly because the VA was cheap on
+panthor?
+
+This is not a bug report and nothing in Mesa is broken. It's a design
+question about whether a constraint I have is worth accommodating upstream.
+
+### Context
+
+Out-of-tree experiment: <https://github.com/fbtwitter/PanVK2KBase>. Device is
+a Mali-G720 MC8 (Poco X8 Pro), kbase r49p1, UK interface 1.30, CSF firmware
+v3.6.0. Checked against Mesa 26.3.0-devel.
+
+Most of the CSF path ports cleanly. Compute works end to end — a compute
+pipeline built from application SPIR-V, `vkCmdDispatch`, and a `VkFence`
+signalled by the GPU via `SYNC_SET64` into `BASE_MEM_CSF_EVENT` memory, since
+kbase has no fences and that is the completion primitive it offers. Binary and
+timeline semaphores work. All three subqueue contexts initialise and run.
+
+### What kbase cannot do
+
+`KBASE_IOCTL_MEM_ALIAS` composes the aliased region correctly — entries
+genuinely share `alloc->pages` — but the result always carries
+`BASE_MEM_NEED_MMAP`, so there is no GPU mapping until userspace `mmap()`s the
+returned cookie. `kbase_context_mmap()` then rejects `nr_pages > stride`, so no
+single mapping can cover both windows. Because the GPU address is assigned at
+`mmap()` time, **the GPU can only ever address one window.**
+
+Measured (source is 4 pages; goal is one VA range covering two adjacent
+4-page windows onto the same pages):
+
+| variant | result |
+|---|---|
+| alias handle = allocation's reported `gpu_va` | `ENOMEM` |
+| alias handle = real GPU VA, `SAME_VA` requested | OK — `gpu_va=0x41000`, `va_pages=8`, `out.flags=0x400d` |
+| `stride` = full span (8 pages) | OK — `gpu_va=0x43000`, `va_pages=16`, `out.flags=0x400d` |
+| source allocated `BASE_MEM_FIXABLE` | OK — `gpu_va=0x44000`, `va_pages=8`, `out.flags=0x400c` |
+
+`0x400d` = `NEED_MMAP | GPU_WR | GPU_RD | CPU_RD`. Every variant sets
+`NEED_MMAP`, and `kbase_mem_alias()` strips `SAME_VA` in all of them.
+
+`mmap()` on those cookies:
+
+| shape | result |
+|---|---|
+| `PROT_READ\|PROT_WRITE`, 2x span | `EPERM` |
+| `PROT_READ`, `stride` pages, fresh cookie | `ENOMEM` |
+| `PROT_READ`, `nr_pages == va_pages`, GPU-only alias | `EPERM` |
+
+Raising `stride` to the full span passes the page-count check but changes the
+layout — entries are spaced `stride` apart, so the two copies land `2 x window`
+apart with a hole between them, which is not the mapping the ringbuf wants
+either.
+
+Confirmed against the kernel source for the tree this device runs
+(`mali_kbase_mem_linux.c`, r49p1): `kbase_mem_alias()`'s accepted-flag mask has
+no `CPU_WR` and explicitly strips `SAME_VA`; `kbase_context_mmap()` rejects
+`nr_pages > alias.stride` with `EINVAL`. Probe source and full write-up:
+[`docs/kbase-notes.md`](https://github.com/fbtwitter/PanVK2KBase/blob/dev/docs/kbase-notes.md)
+(the `MEM_ALIAS` section) and
+[`src/tests/alias_probe`](https://github.com/fbtwitter/PanVK2KBase/blob/dev/src/tests/alias_probe/alias_probe.c).
+
+### Scope: this blocks rendering, not bring-up
+
+I had this wrong myself at first, so to be precise: it is not the render
+subqueues. Those come up fine. What an ordinary command buffer dereferences on
+`VERTEX_TILER` and `FRAGMENT` is just the subqueue context register, and
+`vkEndCommandBuffer` appends that epilogue to every subqueue whether the
+application drew anything or not. `render.desc_ringbuf` is the only field
+needing the double mapping, and only draw work reads it.
+
+### What I think the two mappings buy
+
+From `csf/panvk_vX_gpu_queue.c` and `csf/panvk_vX_cmd_draw.c`. Stated as
+inference — this is the part most likely to be wrong:
+
+1. **Contiguity**, so a block straddling the end stays addressable.
+   `cmd_draw.c:1632` does address arithmetic past `desc_ringbuf.ptr` to reach
+   the FBDs, so a split block would break.
+2. **Staying inside one 4G span**, per the comment above the reservation:
+
+   ```c
+   /* We choose the alignment to guarantee that we won't ever cross a 4G
+    * boundary when accessing the mapping. This way we can encode the
+    * wraparound using 32-bit operations. */
+   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap,
+                             ringbuf->size * 2, ringbuf->size * 2);
+   ```
+
+   `cs_render_desc_ringbuf_move_ptr()` bears this out — it increments and wraps
+   `ptr_lo`, the low 32 bits, and never touches the high word.
+
+Tail-padding (skip to offset 0 when a block would straddle) drops the need for
+(1) but keeps (2) — a padded ring still wants aligned VA so `move_ptr()` can
+stay 32-bit, just `size` rather than `size * 2`.
+
+### Why I think this might be reasonable
+
+Tracing mode already runs this with a single mapping:
+
+```c
+/* If tracing is enabled, we keep the second part of the mapping
+ * unmapped to serve as a guard region. */
+ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE,
+                       vm_ops, tracing_enabled ? 1 : ARRAY_SIZE(vm_ops));
+```
+
+and `cmd_draw.c:1208` passes `wrap_around = !tracing_enabled`. So a
+one-mapping configuration and a parameterised wrap both already exist. That
+makes this feel less like adding a kbase special case and more like
+generalising something already there.
+
+### If tail-padding is acceptable
+
+I'm happy to write it. It would also drop panthor's `2 x size` VA reservation.
+
+The wrinkle: producer and consumer both advance by `calc_render_descs_size()`,
+computed independently — producer at `:1199`/`:1208`, consumer at
+`:4005`/`:4108`. They stay in lockstep because they agree on that number, and
+naive padding breaks it: the producer would consume `size + padding` while the
+consumer releases `size`, leaking free space until the ring deadlocks.
+
+What I'd propose is putting the decision inside `move_ptr()` — changing the
+rule from "add then subtract" to "if `pos + size > SIZE`, allocate from 0" — so
+both sides derive the same padding from their own `pos`, which works because
+the consumer retires blocks in creation order. That would also need a new
+invariant: worst-case consumption becomes `padding + size < 2 x size`, so
+`2 x max_block <= RENDER_DESC_RINGBUF_SIZE`, and the current
+`assert(size <= RENDER_DESC_RINGBUF_SIZE)` in `reserve()` would no longer be
+sufficient.
+
+Doing it unconditionally rather than gating on the backend seems better — two
+ring disciplines means the padding arithmetic has to agree across three call
+sites in both variants, and the kbase variant would be untestable in your CI.
+But it changes shared behaviour in a path I cannot test on panthor, and the
+failure mode is a slow leak rather than a crash, which is exactly why I'm
+asking first.
+
+---
+
 ## The follow-up detail
 
 Backing detail, if asked. Device: Mali-G720 MC8 (Poco X8 Pro), kbase r49p1,
