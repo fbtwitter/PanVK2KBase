@@ -641,8 +641,27 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `is_kbase` is backend-local, needs nothing from upstream, and is
       correctness rather than a feature. Worth doing before WSI, since
       Phase 6 is where something will actually ask.
-- [ ] Tiler heap / JIT growable memory — PanVK's current growth logic
-      assumes panthor/panfrost conventions; expect to adapt it.
+- [x] **Tiler heap / JIT growable memory — implemented, not yet
+      exercised.** This entry was stale; re-checked 2026-08-01. The
+      expectation that PanVK's growth logic would need adapting turned out
+      to be wrong, and only heap *creation* differed.
+      `pan_kmod_kbase_tiler_heap_create()` / `_destroy()` wrap
+      `CS_TILER_HEAP_INIT` / `_TERM`, `MEM_JIT_INIT` is done at device
+      setup (without it `CS_TILER_HEAP_INIT` fails `ENOMEM`, since heap
+      chunks are JIT allocations), and `patch-panvk-kbase-subqueue-init.py`
+      routes panthor's create/destroy through them — setting
+      `context.dev_addr` for `cs_heap_set()` and `first_chunk_va` into the
+      `TILER_HEAP` descriptor, with teardown by address since kbase has no
+      heap handle.
+      **Growth needs nothing kbase-specific.** It is not a kernel callback
+      on either driver: PanVK installs a command-stream exception handler
+      (`cs_set_exception_handler(MALI_CS_EXCEPTION_TYPE_TILER_OOM)`,
+      `panvk_vX_cmd_draw.c:3916`) and the firmware runs it against the heap
+      context. Both drivers supply that context the same way; only its
+      creation differed, and that is done.
+      Untested end to end, because the OOM handler is installed during a
+      render pass and rendering is blocked on the ringbuf. So this is
+      "implemented and wired", not "known to work".
 
 ## Phase 4 — Submission and sync (highest risk)
 - [x] First real submission-chain round-trip —
@@ -909,10 +928,33 @@ existing mode rather than add a kbase special case. See
 `docs/upstream-ringbuf-question.md` for both the sent text and that
 re-check.
 
-**Nothing else is blocked on the answer**, which is worth being explicit
-about. Rendering is, and only rendering. The unblocked work below —
-dma-buf import/export, the tiler heap, the stubbed `bo_import`/`bo_export`
-ops — needs no decision from upstream and can proceed while this sits.
+**The unblocked queue is now essentially empty, and that is the honest
+status.** When the question was sent, the plan was to carry on with dma-buf
+and the tiler heap while it sat. Scoping both on 2026-08-01 dissolved that
+plan rather than advancing it:
+
+- **dma-buf import** is not backend-local — `pan_kmod_bo_import()` calls
+  `drmPrimeFDToHandle()` before dispatching, so the hook is unreachable.
+  Needs a shared-code change, i.e. a second upstream question.
+- **dma-buf export** is impossible — kbase has no export path in its UAPI
+  at all, so there is nothing to build on.
+- **The tiler heap was already done**, and its growth path needs nothing
+  kbase-specific. The roadmap entry was simply stale.
+
+What came out of that scoping is real but small: the driver no longer
+advertises dma-buf sharing it cannot do
+(`patch-panvk-kbase-external-memory.py`), which is a correctness fix, and
+the `BELONGS-UPSTREAM` tags now mark every place this port stands in for
+work that belongs elsewhere.
+
+So the project is genuinely gated on the ringbuf answer, and inventing
+parallel work would mostly be busywork. The things actually worth doing
+while waiting are: rebuild and confirm the external-memory patch compiles
+and the driver still enumerates; decide the `vm_create`/`vm_bind` design
+question (a design decision, not a blocked task); and prepare the follow-up
+upstream question about an fd-taking import entry point, which is the same
+shape of ask as the ringbuf one and could reasonably go in the same
+conversation.
 
 Tools worth knowing about before touching any of this:
 
