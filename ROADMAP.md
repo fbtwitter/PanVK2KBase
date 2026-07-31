@@ -781,6 +781,14 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       mostly green. CTS will not catch everything real apps hit.
 
 ## Phase 9 — Upstream conversation
+- [ ] **First concrete question is drafted and waiting to be sent:**
+      `docs/upstream-ringbuf-question.md`. The render descriptor ringbuf's
+      double mapping cannot be expressed on kbase, and the fallback
+      (tail-padding instead of relying on the mapping to wrap) changes
+      shared PanVK code that panthor also runs — so it is the first change
+      here that genuinely needs agreement rather than a patch. The doc
+      holds both the short `#panfrost` message and the measurements and
+      kernel-source citations to back it up.
 - [ ] Raise the project on #panfrost (Matrix/IRC) or mesa-dev BEFORE
       you're deep into Phase 4. Kbase is not currently a stated upstream
       priority (Panthor/Tyr are) — find out early whether this would be
