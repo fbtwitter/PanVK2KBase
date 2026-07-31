@@ -1,0 +1,30 @@
+// The shader behind tests/driver_pipeline_probe.
+//
+// Deliberately trivial, but not so trivial the result could be produced by
+// accident: each invocation writes its own global index times a value that
+// arrives as a push constant. A buffer that comes back holding
+// `i * multiplier` for every i can only have been written by a dispatch that
+// read its descriptor set, read its push constants, and knew its invocation
+// id.
+//
+// Compiled to SPIR-V and embedded as a C array so the probe has no runtime
+// dependency on a shader compiler. See the `pipeline_probe_shader` target in
+// the makefile for the regeneration command; the generated header is
+// committed so a normal build needs no glslang.
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) writeonly buffer Output {
+   uint data[];
+} out_buf;
+
+layout(push_constant) uniform PushConstants {
+   uint multiplier;
+} pc;
+
+void main()
+{
+   out_buf.data[gl_GlobalInvocationID.x] =
+      gl_GlobalInvocationID.x * pc.multiplier;
+}

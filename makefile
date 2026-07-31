@@ -102,6 +102,21 @@ driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 driver_compute_probe: ./src/tests/driver_compute_probe/driver_compute_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_compute_probe $<
 
+# A real compute pipeline from application SPIR-V: descriptor sets, push
+# constants, vkCmdDispatch. driver_compute_probe --fill only reaches PanVK's
+# own precompiled shaders, so this is the first thing to drive SPIR-V through
+# the driver's own compiler.
+driver_pipeline_probe: ./src/tests/driver_pipeline_probe/driver_pipeline_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/driver_pipeline_probe -o ./build/driver_pipeline_probe $<
+
+# Regenerate the embedded SPIR-V. Only needed after editing shader.comp - the
+# generated header is committed so a normal build needs no glslang.
+pipeline_probe_shader:
+	cd ./src/tests/driver_pipeline_probe && \
+	  glslangValidator -V shader.comp -o shader.spv && \
+	  python3 ../../../tools/spv_to_header.py shader.spv shader_spv.h \
+	    pipeline_probe_shader
+
 # Settles what a SAME_VA kbase BO can be re-mmap-ed with (cookie vs resolved
 # address). Decides kbase_kmod_bo_get_mmap_offset()'s implementation.
 # Can kbase map one allocation at two adjacent GPU VAs (KBASE_IOCTL_MEM_ALIAS)?
