@@ -68,7 +68,9 @@ int main(void) {
 
   printf("mmap_handle = 0x%llx\n", (unsigned long long)bind.out.mmap_handle);
 
-  // Input page, output page, and HW doorbell page for this queue
+  // HW doorbell page, input page, output page - in that order, measured
+  // by tests/user_io_probe (see utils/csf_user_regs.h). This probe only
+  // maps them; it does not index into them.
   // (BASEP_QUEUE_NR_MMAP_USER_PAGES, csf/mali_base_csf_kernel.h).
   size_t queue_state_size = BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096;
 
@@ -86,7 +88,7 @@ int main(void) {
       return 1;
   }
 
-  printf("queue_state=%p (input/output/doorbell, %zu bytes)\n",
+  printf("queue_state=%p (doorbell/input/output, %zu bytes)\n",
          queue_state, queue_state_size);
 
   uint32_t *q = queue_bo->cpu;

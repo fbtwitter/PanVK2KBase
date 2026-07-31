@@ -3,8 +3,26 @@
 
 /*
  * Byte offsets into the CS_USER_INPUT_BLOCK / CS_USER_OUTPUT_BLOCK pages
- * (the first two of the BASEP_QUEUE_NR_MMAP_USER_PAGES=3 pages mmap'd via
- * KBASE_IOCTL_CS_QUEUE_BIND's mmap_handle - see csf/mali_base_csf_kernel.h).
+ * of the BASEP_QUEUE_NR_MMAP_USER_PAGES=3 pages mmap'd via
+ * KBASE_IOCTL_CS_QUEUE_BIND's mmap_handle - see csf/mali_base_csf_kernel.h.
+ *
+ * PAGE ORDER IS [doorbell][input][output], NOT [input][output][doorbell].
+ * Measured on-device, 6/6 reproducible, by tests/user_io_probe: writing
+ * CS_INSERT at page 1 + 0x00 and kicking makes page 2 + 0x00 advance to
+ * the CS size ~50ms later without userspace touching it; doing the same at
+ * page 0 changes nothing anywhere. Page 0 also survives across processes
+ * while pages 1 and 2 come up freshly zeroed, which is what a shared HW
+ * doorbell page vs. per-queue I/O blocks look like.
+ *
+ * This corrects an earlier reading of this file's own source (below) that
+ * had it as [input][output][doorbell] and cost a long detour - see
+ * "Prior art found" in docs/kbase-notes.md. The uapi comment at
+ * csf/mali_base_csf_kernel.h:117 ("A pair of input/output pages and a Hw
+ * doorbell page") describes the contents, not the order. Panfork's
+ * pan_vX_base.c:1434 had it right.
+ *
+ * Use CSF_USER_INPUT_PAGE / CSF_USER_OUTPUT_PAGE / CSF_USER_DOORBELL_PAGE
+ * below rather than hardcoding page indices.
  * Not part of any vendored kbase-uapi header set (third_party/kbase-uapi-*)
  * since these are kernel-internal firmware-interface offsets, not part of
  * the ioctl uapi surface. Sourced from the same real kernel driver tree
@@ -31,13 +49,18 @@
  *   sufficient for the kernel to notice and ring it on our behalf.
  */
 
-/* CS_USER_INPUT_BLOCK (page 0) */
+/* Which of the 3 mmap'd pages is which. Measured, see above. */
+#define CSF_USER_DOORBELL_PAGE 0
+#define CSF_USER_INPUT_PAGE 1
+#define CSF_USER_OUTPUT_PAGE 2
+
+/* CS_USER_INPUT_BLOCK (page CSF_USER_INPUT_PAGE) */
 #define CSF_USER_CS_INSERT_LO 0x0000
 #define CSF_USER_CS_INSERT_HI 0x0004
 #define CSF_USER_CS_EXTRACT_INIT_LO 0x0008
 #define CSF_USER_CS_EXTRACT_INIT_HI 0x000C
 
-/* CS_USER_OUTPUT_BLOCK (page 1) */
+/* CS_USER_OUTPUT_BLOCK (page CSF_USER_OUTPUT_PAGE) */
 #define CSF_USER_CS_EXTRACT_LO 0x0000
 #define CSF_USER_CS_EXTRACT_HI 0x0004
 #define CSF_USER_CS_ACTIVE 0x0008

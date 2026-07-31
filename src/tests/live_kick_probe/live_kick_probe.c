@@ -299,8 +299,13 @@ static bool run_config(int fd, const struct group_config *cfg) {
     return false;
   }
 
-  uint8_t *input_page = (uint8_t *)queue_state;
-  uint8_t *output_page = (uint8_t *)queue_state + 4096;
+  // Page order is [doorbell][input][output] - measured by
+  // tests/user_io_probe, see utils/csf_user_regs.h. This was previously
+  // page 0/page 1, which meant writing CS_INSERT into the doorbell page
+  // and polling CS_EXTRACT out of the input page; that is why every run
+  // of this probe reported CS_EXTRACT=0 / CS_ACTIVE=0.
+  uint8_t *input_page = (uint8_t *)queue_state + CSF_USER_INPUT_PAGE * 4096;
+  uint8_t *output_page = (uint8_t *)queue_state + CSF_USER_OUTPUT_PAGE * 4096;
 
   // CS_INSERT is a *byte offset* into the ring buffer, not an address -
   // confirmed against the kernel's own diagnostics (see

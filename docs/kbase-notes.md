@@ -612,6 +612,173 @@ checking whether group creation needs more setup than this probe does
 left zero in `GROUP_CREATE`) before the scheduler will consider the
 group schedulable.
 
+## Prior art found: Panfork already runs Panfrost on kbase/CSF
+
+Searched for existing work instead of continuing to derive this from
+scratch, and there is a lot of it. **Panfork** (icecream95' Mesa fork) is
+a Gallium Panfrost driver that runs on **kbase**, on CSF/Valhall v10
+(G610/G710), built because panthor did not exist yet. Its kbase layer is
+`src/panfrost/base/` (`pan_base.c`, `pan_vX_base.c`, `pan_base.h`) — a
+custom UAPI abstraction sitting exactly where this repo's
+`pan_kmod_kbase.c` sits. It gets CSG groups scheduled and executing on
+real hardware, which is the thing this repo is blocked on.
+
+The canonical GitLab repo (`gitlab.com/panfork/mesa`) has been **emptied**
+— it is now a single-commit README saying "use upstream instead", since
+panthor landed. Use a mirror. Cloned here as
+`third_party/PANFORK` (gitignored, local/ephemeral, same treatment as
+`third_party/MESA-KMOD`) from
+`https://github.com/ROCKNIX/mesa-panfork`.
+
+Other artifacts, not yet mined:
+
+- `github.com/PojavLauncherTeam/panfork_offscreen_rootless` and
+  `github.com/SolDev69/panfrost-gallium-mesa` — Panfork on **stock,
+  unrooted Android on kbase**. Direct evidence the "user build, no root"
+  constraint recorded above is surmountable. (Pojav repo archived
+  2025-06-20.)
+- `gitlab.com/icecream95/panloader` — includes a `pantrace` tool.
+- `gitlab.com/icecream95/kbase-valhall` — kbase patched for `MALI_NO_MALI`,
+  i.e. run the *blob userspace* against a fake kernel driver on a normal
+  machine. This is how the G610 RE series was done: no Mali hardware and
+  no root needed. A plausible replacement for the rooted-device
+  requirement above.
+
+### Finding 1: the user-IO page order contradicts `csf_user_regs.h`
+
+Verbatim from `third_party/PANFORK/src/panfrost/base/pan_vX_base.c:1434`:
+
+```c
+#define CS_RING_DOORBELL(cs)        *((uint32_t *)(cs->user_io)) = 1
+#define CS_READ_REGISTER(cs, r)     *((uint64_t *)(cs->user_io + 4096 * 2 + r))
+#define CS_WRITE_REGISTER(cs, r, v) *((uint64_t *)(cs->user_io + 4096 + r)) = v
+```
+
+and `cs->user_io` is the raw mmap base, same as this repo's `queue_state`
+(`pan_vX_base.c:1322` — `mmap(NULL, page_size * BASEP_QUEUE_NR_MMAP_USER_PAGES,
+..., bind.out.mmap_handle)`).
+
+So the two codebases disagree by exactly one page:
+
+| page | Panfork (working on real HW) | this repo (`utils/csf_user_regs.h`, `live_kick_probe.c:302`) |
+|---|---|---|
+| 0 | HW doorbell | CS_USER_INPUT (writes `CS_INSERT` here) |
+| 1 | CS_USER_INPUT (`CS_INSERT`) | CS_USER_OUTPUT (reads `CS_EXTRACT`/`CS_ACTIVE` here) |
+| 2 | CS_USER_OUTPUT (`CS_EXTRACT`, `CS_ACTIVE`) | HW doorbell (never touched) |
+
+**If Panfork is right, this repo writes `CS_INSERT` into the doorbell page
+and polls `CS_EXTRACT`/`CS_ACTIVE` out of the input page** — which the
+kernel zeroes at bind time and firmware never writes. That produces
+`CS_EXTRACT=0`, `CS_ACTIVE=0`, forever, no hang, healthy device: an exact
+match for the symptom recorded under "Live KICK with a real instruction"
+above.
+
+**Settled on-device by `tests/user_io_probe`: Panfork is right.** The
+probe makes no assumption either way — it writes `CS_INSERT` at each
+candidate page in turn, each with a fresh group/queue, and diffs the whole
+12KB mapping. Result, 6/6 reproducible runs:
+
+| CS_INSERT written at | what changed in the 12KB mapping |
+|---|---|
+| page 0 (this repo's layout) | nothing, anywhere. 0 words. |
+| page 1 (Panfork's layout) | our own write, **plus page 2 + 0x00 advancing `0 -> 8` (= the CS size) ~50ms later, which userspace never wrote** |
+
+Two independent corroborations from the same probe:
+
+- **Page 0 persists across processes; pages 1 and 2 do not.** A value
+  written to page 0 + 0x00 is still there on the next run of the binary
+  (fresh process, fresh context, fresh group), while pages 1 and 2 always
+  come up freshly zeroed. That is what a shared HW doorbell page vs.
+  per-queue I/O blocks zeroed by `init_user_io_pages()` look like.
+- All three pages read back what is written to them, so none is a
+  write-only MMIO aperture — the doorbell page is normal memory here.
+
+So the order is `[doorbell][input][output]`. The uapi comment at
+`csf/mali_base_csf_kernel.h:117` ("A pair of input/output pages **and** a
+Hw doorbell page") describes the *contents*, not the order, and reading it
+as an order was the mistake. Note Panfork hardcodes `4096` in these macros
+while using `k->page_size` for the mmap, so it assumes 4K pages.
+
+`utils/csf_user_regs.h` now carries `CSF_USER_DOORBELL_PAGE` /
+`CSF_USER_INPUT_PAGE` / `CSF_USER_OUTPUT_PAGE` — use those instead of
+hardcoding indices.
+
+### Consequence: the GPU executes. The CSG-slot theory was wrong.
+
+`tests/live_kick_probe` was writing `CS_INSERT` into the doorbell page and
+polling `CS_EXTRACT`/`CS_ACTIVE` out of the input page — a page the kernel
+zeroes at bind and firmware never writes. Every `CS_EXTRACT=0` /
+`CS_ACTIVE=0` reading recorded in the "Live KICK" section above was a read
+of a dead page.
+
+With the two-line page-offset fix, and **nothing else changed**:
+
+```
+==== 3 of 3 configs actually executed on the GPU ====
+  *** CS_EXTRACT advanced to 8 after ~50ms - GPU CONSUMED the instruction ***
+```
+
+All three configs — nr 58 group create, `_1_6` (nr 42), and compute-only.
+So the following are now **withdrawn**, not merely unproven:
+
+- "The group never reaches a CSG slot" / `onslot_csg_add_new_queue()` /
+  `scheduler_group_schedule()`. The group *is* scheduled and firmware *does*
+  run the stream.
+- The MCU-shared-region hypothesis (`kbase_csf_mcu_shared_group_bind_csg_reg()`)
+  that was blocked on needing root. Nothing here needed root.
+- The framing that `KICK` returning 0 proves nothing about execution — it
+  turns out `KICK` was doing its job the whole time.
+
+The kernel-side visibility that was blocked on root (`dmesg`, debugfs,
+`/proc/mtk_mali/*`) was never needed. The bug was a one-page offset in
+this repo's own userspace.
+
+**Method note worth keeping.** The probe initially reported the *opposite*
+answer, twice, because its 2s poll loop broke early: it tested
+`value >= cs_size` on every non-insert page, and page 0's stale value from
+a previous trial satisfied that immediately, so the snapshot diff ran at
+~0ms — before firmware's ~50ms response. Comparing against the post-BIND
+baseline instead of an absolute threshold fixed it. A negative result from
+a polling probe is worth re-checking against its own exit condition before
+being believed.
+
+### Still open after this
+
+`CS_ACTIVE` reads 0 even on runs where `CS_EXTRACT` advanced — consistent
+with the stream having finished by the time it is sampled, but not
+confirmed. No CSF notification arrives within 300ms of a consumed
+instruction either, which is expected: a bare `MOVE32` signals nothing.
+Getting a notification needs a CS that writes an event slot — see
+Finding 2.
+
+### Finding 2: the completion mechanism, which is not a fence at all
+
+Panfork does **not** use DRM syncobjs, and does not use
+`KBASE_IOCTL_INTERNAL_FENCE_WAIT` (correctly buried as a dead end above).
+It builds its own `kbase_syncobj` over **GPU-visible event memory**:
+
+- `alloc_event_mem()` (`pan_vX_base.c:359`) allocates 2 pages with
+  `BASE_MEM_CSF_EVENT` alongside the usual CPU/GPU RW + `SAME_VA` flags.
+  That flag is the load-bearing part — this repo has never set it.
+- Each bound CS gets a slot in that memory
+  (`kbase_cs_bind()`, `pan_vX_base.c:1336`), seeded to `1` because it uses
+  the CSF "Higher" wait condition, with the error word zeroed to avoid
+  inheriting faults.
+- The **command stream itself** signals completion by writing its event
+  slot; userspace waits via `kbase_wait_for_event()` +
+  `kbase_syncobj_update()` (`pan_vX_base.c:872`), with
+  `kbase_read_event()` (`:964`) reading `struct base_csf_notification`
+  off the kbase fd — the same read `tests/event_probe/` was already doing.
+
+So the answer to both open sync items — Phase 2's non-DRM `vk_sync` and
+Phase 4's "fence-translation shim" — is: implement `vk_sync` over
+`BASE_MEM_CSF_EVENT` memory plus CS-emitted sync writes. There is no fence
+object in kbase to translate; you build one.
+
+Note this also means `live_kick_probe`'s single `MOVE32` could never
+signal anything even if it executed. A real submission needs a sync
+instruction targeting event memory.
+
 ## Where to ask
 
 The `#panfrost` channel (Matrix, bridged to OFTC IRC) is where Panfrost/

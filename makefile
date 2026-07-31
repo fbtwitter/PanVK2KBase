@@ -132,6 +132,17 @@ live_kick_probe: ./src/tests/live_kick_probe/live_kick_probe.c $(MESA_PACK_H)
 	  -o ./build/live_kick_probe $< \
 	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
 
+# Determines empirically which of CS_QUEUE_BIND's 3 mmap'd pages is
+# input/output/doorbell, rather than assuming. Exists because Panfork (a
+# Panfrost driver that ran on real kbase hardware) disagrees with
+# utils/csf_user_regs.h by one page - see "Prior art found" in
+# docs/kbase-notes.md. Same setup as live_kick_probe so results are
+# comparable.
+user_io_probe: ./src/tests/user_io_probe/user_io_probe.c $(MESA_PACK_H)
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESA_CS_DEFS) $(MESA_CS_INCLUDES) $(MESA_CS_GC) \
+	  -o ./build/user_io_probe $< \
+	  $(MESA_DIR)/src/util/ralloc.c $(MESA_DIR)/src/util/u_dynarray.c
+
 # --- Phase 2: pan_kmod_kbase Mesa backend (see src/mesa/README.md) ---
 # The Mesa checkout is gitignored, so the backend source lives in this repo
 # and is synced into it. MESA_DIR/PAN_ARCH/KBASE_VERSION are shared with the

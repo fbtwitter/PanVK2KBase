@@ -160,6 +160,12 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       backend does. Needs a `vk_sync` type backed by whatever kbase
       offers — which loops back to the unsolved completion-mechanism
       question in `docs/kbase-notes.md`.
+      **Design answer found in Panfork:** there is no kbase fence object
+      to translate. Panfork builds its own syncobj over GPU-visible event
+      memory allocated with `BASE_MEM_CSF_EVENT` (a flag this repo has
+      never set), signalled by the command stream itself and waited on via
+      `base_csf_notification` reads off the kbase fd. Same answer serves
+      Phase 4's fence-shim item. See "Finding 2" in `docs/kbase-notes.md`.
 - [ ] Fill in the deliberately-stubbed ops: `bo_import`/`bo_export`
       (dma-buf, Phase 3 — and blocked above the backend too, since the
       common `pan_kmod_bo_import()` goes through `drmPrimeFDToHandle()`),
@@ -273,12 +279,33 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       `CS_EXTRACT=0`, `CS_ACTIVE=0`, no notification, every time. So
       neither the missing context setup nor the group-create struct
       version is the blocker.
-      **Leading remaining hypothesis** (needs root to test): the group's
-      MCU shared region never gets bound —
-      `kbase_csf_mcu_shared_group_bind_csg_reg()` must map the group's
-      suspend buffers, ring buffer and user-IO pages into the MCU's
-      address space before it can occupy a slot, and a failure there is
-      silent to userspace.
+      **RESOLVED — everything above this line about the GPU never
+      executing was a measurement error in this repo, not a kernel or
+      firmware behaviour. The GPU runs the command stream.** The queue's
+      3 user-IO pages are ordered `[doorbell][input][output]`, not
+      `[input][output][doorbell]`. So `live_kick_probe` was writing
+      `CS_INSERT` into the doorbell page and polling `CS_EXTRACT`/
+      `CS_ACTIVE` out of the input page — which the kernel zeroes at bind
+      and firmware never writes. Every `CS_EXTRACT=0`/`CS_ACTIVE=0`
+      reading recorded above was a read of a dead page.
+      Found by comparing against Panfork (`third_party/PANFORK`, a
+      Panfrost-on-kbase driver that ran on real hardware —
+      `pan_vX_base.c:1434`), then measured on-device rather than assumed:
+      `tests/user_io_probe` writes `CS_INSERT` at each candidate page with
+      a fresh group each time and diffs the whole 12KB mapping. 6/6 runs:
+      page 0 changes nothing anywhere; page 1 makes page 2 + 0x00 advance
+      to the CS size ~50ms later, unwritten by userspace. Corroborated by
+      page 0 persisting across processes while pages 1 and 2 come up
+      freshly zeroed.
+      After the two-line offset fix and nothing else,
+      `live_kick_probe` reports **3 of 3 configs actually executed on the
+      GPU** (nr 58, `_1_6`/nr 42, and compute-only), `CS_EXTRACT`
+      advancing to 8 after ~50ms in each.
+      **Withdrawn as a result:** the CSG-slot theory, the
+      `kbase_csf_mcu_shared_group_bind_csg_reg()` MCU-shared-region
+      hypothesis, and the claim that this was blocked on root. None of the
+      kernel-side visibility (`dmesg`, debugfs, `/proc/mtk_mali/*`) was
+      needed. Full writeup in `docs/kbase-notes.md`.
       **Blocked on kernel visibility, and it needs root.** Verified on
       this device: `dmesg` → `Permission denied` (no `CAP_SYSLOG`),
       `/sys/kernel/debug/mali0/` absent, tracefs readable but event
