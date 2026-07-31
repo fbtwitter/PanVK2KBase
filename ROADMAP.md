@@ -386,14 +386,41 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       kernel-side visibility ever becomes available — the answer is
       presumably in how `kbase_csf_queue_kick()` decides whether to ring
       the hardware doorbell for a group that is already onslot.
-- [ ] **Command buffers are what is left.** `kbase_queue_submit()` refuses
-      any submit carrying them, because they need the per-subqueue init
-      command stream panthor runs at queue-creation time
-      (`init_subqueue()`) to set up subqueue context registers. A queue
-      created today is structurally valid but its GPU-side context has
-      never been initialised, so running real work against it would produce
-      wrong results rather than an error. That init stream is itself just a
-      submit, which now works — so this is the next thing to build.
+- [x] **The compute subqueue's GPU context is initialised.** Queue creation
+      now calls `panvk_per_arch(init_gpu_queue)` — panthor's own
+      `init_subqueue()` path — which allocates the shared syncobj array and
+      a `panvk_cs_subqueue_context`, then builds and submits an init stream
+      that loads the context register and initialises the scoreboard slots.
+      **Shared, not duplicated.** Unlike the queue lifecycle, which
+      diverges at every ioctl and got its own file, this code converges
+      with panthor almost entirely — it is pool allocation and CS building,
+      none of it driver-specific. It diverges at exactly three points, and
+      `patch-panvk-kbase-subqueue-init.py` patches only those: where the
+      init stream is built (panthor carves it out of the tiler heap's
+      geometry buffer; kbase has no heap descriptor, so it uses a dedicated
+      allocation), how it is submitted and waited on, and `init_queue()`'s
+      panthor-only steps (render descriptor ringbuf and utrace, both of
+      which need a DRM syncobj). That avoids ~260 lines of duplicated
+      upstream logic that would immediately start drifting.
+      Confirmed on hardware: a 48-byte init stream at `0x8003fffbd000` is
+      published to subqueue 2 and consumed by the GPU during
+      `vkCreateDevice`. `kbase_submit_and_wait()` blocks on `CS_EXTRACT`
+      reaching the end of the stream and fails device creation if it does
+      not within 2s — so `vkCreateDevice` returning 0 *is* the proof the
+      stream ran. `driver_sync_probe` still passes all checks.
+- [ ] **The render subqueues, then command buffers.** `init_gpu_queue()`
+      only loops over `PANVK_SUBQUEUE_COMPUTE` on kbase.
+      `PANVK_SUBQUEUE_VERTEX_TILER` and `_FRAGMENT` additionally need the
+      tiler heap descriptor and its geometry buffer, the scratch FBD for
+      the tiler-OOM handler, and the render descriptor ringbuf — the last
+      of which is backed by a syncobj and so needs its own kbase answer.
+      `init_tiler()` is the natural next piece: everything in it is shared
+      except the heap-create ioctl, and this path already has the heap's
+      GPU VA and first chunk from `CS_TILER_HEAP_INIT` at queue creation.
+      Note the chunk size must then come from `phys_dev->csf.tiler`, not
+      the local constants this file currently creates its heap with.
+      `kbase_queue_submit()` keeps refusing submits carrying command
+      buffers until those contexts exist.
       Still not done either: **GPU-side waits**. `vk_submit->waits` are
       satisfied on the CPU before anything is published, so
       `VK_SYNC_FEATURE_GPU_WAIT` stays unadvertised and semaphores still

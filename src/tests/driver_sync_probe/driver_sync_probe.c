@@ -420,8 +420,12 @@ main(int argc, char **argv)
       printf("RESULT: all checks passed. The kbase event-memory vk_sync works\n"
              "        for every CPU-side operation Vulkan exposes, AND the\n"
              "        GPU can signal one through vkQueueSubmit.\n"
-             "        Command buffers are still unsubmittable - they need the\n"
-             "        per-subqueue context init.\n");
+             "        vkCreateDevice succeeding also means the compute\n"
+             "        subqueue's init stream ran on the GPU - it is submitted\n"
+             "        and waited on during queue creation, so a failure there\n"
+             "        would have failed device creation.\n"
+             "        Command buffers are still unsubmittable: the render\n"
+             "        subqueues' contexts are not initialised yet.\n");
    else
       printf("RESULT: %d check(s) FAILED - see above.\n", failures);
    printf("================================================================\n");

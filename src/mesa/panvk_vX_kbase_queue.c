@@ -38,12 +38,19 @@
  *   VkFence passed to vkQueueSubmit comes back signalled by the GPU, which
  *   nothing on the CPU side of this path ever writes.
  *
- *   NOT implemented: command buffers. They need the per-subqueue init
- *   command stream panthor runs at queue-creation time (init_subqueue() in
- *   the panthor file) to set up subqueue context registers. A queue created
- *   here is structurally valid but its GPU-side context has never been
- *   initialised, so kbase_queue_submit() refuses any submit carrying
- *   command buffers rather than running them against it.
+ *   Implemented: the compute subqueue's GPU-side context. Queue creation
+ *   calls panvk_per_arch(init_gpu_queue), which is panthor's own
+ *   init_subqueue() path - the setup it does is pool allocation and CS
+ *   building, none of it driver-specific, so it is shared rather than
+ *   duplicated. Only the submit at the end of it is ours, through
+ *   kbase_submit_and_wait() below. See patch-panvk-kbase-subqueue-init.py.
+ *
+ *   NOT implemented: the VERTEX_TILER and FRAGMENT subqueues' contexts.
+ *   Those additionally need a tiler heap descriptor, a geometry buffer, a
+ *   scratch FBD and a render descriptor ringbuf, none of which this path
+ *   builds - so init_gpu_queue() only loops over COMPUTE on kbase.
+ *   kbase_queue_submit() still refuses any submit carrying command buffers,
+ *   because a render one would run against an uninitialised context.
  *
  *   NOT implemented: GPU-side waits. vk_submit->waits are satisfied on the
  *   CPU before anything is published, so VK_SYNC_FEATURE_GPU_WAIT stays
@@ -71,6 +78,7 @@
 
 #include "panvk_device.h"
 #include "panvk_kbase_sync.h"
+#include "panvk_mempool.h"
 #include "panvk_physical_device.h"
 #include "panvk_queue.h"
 
@@ -103,8 +111,23 @@
  */
 #define PANVK_KBASE_MAX_SUBMIT_CS_SIZE 4096
 
+/* Size of the buffer the per-subqueue init stream is built into. panthor
+ * uses the tiler heap's 64KB geometry buffer for this; the streams are a few
+ * hundred bytes at most, and this path has no tiler descriptor to borrow.
+ */
+#define PANVK_KBASE_INIT_CS_SIZE 4096
+
+/* Embeds panvk_gpu_queue rather than vk_queue directly, because the
+ * per-subqueue GPU context setup is shared with panthor - see
+ * patch-panvk-kbase-subqueue-init.py for why that half is not duplicated.
+ * panvk_per_arch(init_gpu_queue) and its cleanup operate on the embedded
+ * struct; everything below reaches back with container_of().
+ *
+ * gpu must stay first: it starts with the vk_queue that the vk_queue
+ * callbacks container_of() on.
+ */
 struct panvk_kbase_queue {
-   struct vk_queue vk;
+   struct panvk_gpu_queue gpu;
 
    uint8_t group_handle;
    bool group_created;
@@ -121,6 +144,12 @@ struct panvk_kbase_queue {
     */
    uint64_t insert[PANVK_SUBQUEUE_COUNT];
 };
+
+static struct panvk_kbase_queue *
+to_kbase_queue(struct vk_queue *vk_queue)
+{
+   return container_of(vk_queue, struct panvk_kbase_queue, gpu.vk);
+}
 
 static void
 destroy_queue_resources(struct panvk_device *dev,
@@ -153,7 +182,7 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    VkResult result =
-      vk_queue_init(&queue->vk, &dev->vk, create_info, queue_idx);
+      vk_queue_init(&queue->gpu.vk, &dev->vk, create_info, queue_idx);
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
@@ -197,16 +226,50 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
       }
    }
 
-   queue->vk.driver_submit = panvk_per_arch(kbase_queue_submit);
+   queue->gpu.vk.driver_submit = panvk_per_arch(kbase_queue_submit);
 
-   *out_queue = &queue->vk;
+   /* Scratch for the init streams init_gpu_queue() is about to build. It
+    * has to exist before that call, since the shared code reads it rather
+    * than allocating it - see patch-panvk-kbase-subqueue-init.py.
+    */
+   struct panvk_pool_alloc_info alloc_info = {
+      .size = PANVK_KBASE_INIT_CS_SIZE,
+      .alignment = 64,
+   };
+
+   queue->gpu.kbase_init_cs =
+      panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   if (!panvk_priv_mem_check_alloc(queue->gpu.kbase_init_cs)) {
+      result = panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "kbase: failed to allocate the init CS buffer");
+      goto err_destroy_resources;
+   }
+
+   /* Sets up the GPU-side context each subqueue needs before it can run
+    * anything: the shared syncobj array, a panvk_cs_subqueue_context, and
+    * an init stream that loads the context register and initialises the
+    * scoreboard slots. Shared with panthor - only the submit at the end of
+    * it is ours, via panvk_per_arch(kbase_submit_and_wait) below.
+    *
+    * Compute only for now; the render subqueues need a tiler heap
+    * descriptor, geometry buffer and descriptor ringbuf that this path does
+    * not build yet.
+    */
+   result = panvk_per_arch(init_gpu_queue)(&queue->gpu);
+   if (result != VK_SUCCESS)
+      goto err_free_init_cs;
+
+   *out_queue = &queue->gpu.vk;
    return VK_SUCCESS;
+
+err_free_init_cs:
+   panvk_pool_free_mem(&queue->gpu.kbase_init_cs);
 
 err_destroy_resources:
    destroy_queue_resources(dev, queue);
 
 err_finish_queue:
-   vk_queue_finish(&queue->vk);
+   vk_queue_finish(&queue->gpu.vk);
 
 err_free_queue:
    vk_free(&dev->vk.alloc, queue);
@@ -216,14 +279,22 @@ err_free_queue:
 void
 panvk_per_arch(destroy_kbase_queue)(struct vk_queue *vk_queue)
 {
-   struct panvk_kbase_queue *queue =
-      container_of(vk_queue, struct panvk_kbase_queue, vk);
+   struct panvk_kbase_queue *queue = to_kbase_queue(vk_queue);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
+   /* Frees the subqueue contexts and syncobjs init_gpu_queue() allocated.
+    * Safe here even though the render half was never set up - every step in
+    * it is guarded.
+    */
+   panvk_per_arch(cleanup_gpu_queue)(&queue->gpu);
+   panvk_pool_free_mem(&queue->gpu.kbase_init_cs);
+
    destroy_queue_resources(dev, queue);
-   vk_queue_finish(&queue->vk);
+   vk_queue_finish(&queue->gpu.vk);
    vk_free(&dev->vk.alloc, queue);
 }
+
+/* cs_builder wants somewhere to go when a stream outgrows its buffer. This
 
 /* cs_builder wants somewhere to go when a stream outgrows its buffer. This
  * one builds into a fixed staging buffer that is bounds-checked up front,
@@ -338,12 +409,70 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
    return VK_SUCCESS;
 }
 
+/* Publish an init stream that panvk_per_arch(init_gpu_queue) already built
+ * into queue->gpu.kbase_init_cs, and block until the GPU has run it.
+ *
+ * Blocking is the point: the stream sets up context registers that
+ * everything submitted afterwards depends on, so returning before it has
+ * executed would let real work run against an uninitialised context -
+ * exactly the state this exists to remove.
+ *
+ * Completion is CS_EXTRACT reaching the end of the stream, not an event
+ * slot. The stream is built by shared code that knows nothing about kbase
+ * event memory, and "the GPU has read every byte" is a sufficient signal
+ * for a stream whose instructions are all synchronous register writes.
+ */
+VkResult
+panvk_per_arch(kbase_submit_and_wait)(struct panvk_gpu_queue *gpu_queue,
+                                      enum panvk_subqueue_id subqueue,
+                                      uint64_t stream_addr,
+                                      uint32_t stream_size)
+{
+   struct panvk_kbase_queue *queue =
+      container_of(gpu_queue, struct panvk_kbase_queue, gpu);
+   struct panvk_device *dev = to_panvk_device(gpu_queue->vk.base.device);
+   struct pan_kmod_kbase_cs *cs = &queue->subqueues[subqueue];
+
+   if (!stream_size)
+      return VK_SUCCESS;
+
+   /* The shared code hands back the GPU address it built at; the bytes to
+    * copy are the CPU view of the same allocation. Nothing else is ever
+    * built there, so the offset is zero and the two must correspond.
+    */
+   assert(stream_addr == panvk_priv_mem_dev_addr(gpu_queue->kbase_init_cs));
+
+   VkResult result =
+      submit_stream(dev, queue, subqueue,
+                    panvk_priv_mem_host_addr(gpu_queue->kbase_init_cs),
+                    stream_size);
+   if (result != VK_SUCCESS)
+      return result;
+
+   uint64_t target = queue->insert[subqueue];
+
+   /* 2s, the budget the standalone probes use before calling a stream
+    * never-going-to-run.
+    */
+   for (unsigned i = 0; i < 2000; i++) {
+      if (pan_kmod_kbase_queue_extract(cs) >= target)
+         return VK_SUCCESS;
+
+      os_time_sleep(1000);
+   }
+
+   return panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                       "kbase: subqueue %u init stream never ran "
+                       "(insert=%" PRIu64 ", extract=%" PRIu64 ", active=%u)",
+                       subqueue, target, pan_kmod_kbase_queue_extract(cs),
+                       pan_kmod_kbase_queue_active(cs));
+}
+
 VkResult
 panvk_per_arch(kbase_queue_submit)(struct vk_queue *vk_queue,
                                    struct vk_queue_submit *vk_submit)
 {
-   struct panvk_kbase_queue *queue =
-      container_of(vk_queue, struct panvk_kbase_queue, vk);
+   struct panvk_kbase_queue *queue = to_kbase_queue(vk_queue);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
