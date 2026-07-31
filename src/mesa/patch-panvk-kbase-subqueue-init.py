@@ -293,9 +293,12 @@ panvk_per_arch(cleanup_gpu_tiler)(struct panvk_gpu_queue *queue)
     new = """   const bool is_kbase =
       to_panvk_physical_device(dev->vk.physical)->is_kbase;
 
-   /* Both of these need a DRM syncobj, which kbase has no fd to hang one
-    * off, and both are only needed by the render subqueues - which are not
-    * initialised on kbase yet. */
+   /* init_utrace() asserts vk_sync_type_is_drm_syncobj(), and
+    * init_render_desc_ringbuf() needs one BO mapped at two adjacent GPU VAs
+    * - see the MEM_ALIAS section in docs/kbase-notes.md for why kbase cannot
+    * express that. Only the ringbuf field of the render subqueues' context
+    * depends on the latter, so skipping both here does not stop those
+    * subqueues from being initialised below. */
    if (!is_kbase) {
       result = init_render_desc_ringbuf(queue);
       if (result != VK_SUCCESS)
@@ -306,17 +309,59 @@ panvk_per_arch(cleanup_gpu_tiler)(struct panvk_gpu_queue *queue)
          goto err_cleanup_queue;
    }
 
-   /* kbase: compute only for now. VERTEX_TILER and FRAGMENT additionally
-    * need the tiler heap descriptor, geometry buffer, scratch FBD and
-    * render descriptor ringbuf. */
+   /* Every subqueue, on kbase too. This used to be compute-only, on the
+    * assumption that the render subqueues could not be set up without the
+    * ringbuf. Disassembling a rejected stream (PANVK_KBASE_DUMP=1) showed
+    * otherwise: what VERTEX_TILER and FRAGMENT actually dereference for an
+    * ordinary command buffer is the subqueue context register, for syncobjs
+    * and last_error, and vkEndCommandBuffer appends that epilogue to every
+    * subqueue whether the application touched it or not. Leaving the context
+    * register at 0 is what made those streams unrunnable, not the ringbuf.
+    *
+    * They still cannot *render* - see the req_resource check in
+    * kbase_queue_submit(), which is what refuses work that needs the tiler
+    * or fragment endpoints. */
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-      if (is_kbase && i != PANVK_SUBQUEUE_COMPUTE)
-         continue;
-
       result = init_subqueue(queue, i);
       if (result != VK_SUCCESS)
          goto err_cleanup_queue;
    }"""
+    src = src.replace(old, new, 1)
+
+    # --- 3b. skip only the ringbuf field of the render context ------------
+    #
+    # tiler_heap, geom_buf and the fragment queue's scratch FBD all come from
+    # init_gpu_tiler(), which kbase shares - so they are real addresses here
+    # and are left alone. Only desc_ringbuf comes from
+    # init_render_desc_ringbuf(), which is skipped above, and reading it
+    # would yield 0.
+    #
+    # Left as 0 deliberately rather than pointed somewhere harmless: a null
+    # deref is diagnosable, whereas a plausible-looking wrong address is the
+    # failure mode that has twice cost a reboot here.
+    old = """         /* Initialize the ringbuf */
+         cs_ctx->render.desc_ringbuf = (struct panvk_cs_desc_ringbuf){
+            .syncobj =
+               panvk_priv_mem_dev_addr(queue->render_desc_ringbuf.syncobj),
+            .ptr = queue->render_desc_ringbuf.addr.dev,
+            .pos = 0,
+         };"""
+    assert old in src, "desc_ringbuf context init not found"
+
+    new = """         /* Initialize the ringbuf.
+          *
+          * Not on kbase: init_render_desc_ringbuf() was skipped there, so
+          * every field would read back 0 anyway. Left zeroed on purpose -
+          * anything that actually renders will null-deref it, which is a far
+          * better outcome than a plausible wrong address. */
+         if (!phys_dev->is_kbase) {
+            cs_ctx->render.desc_ringbuf = (struct panvk_cs_desc_ringbuf){
+               .syncobj =
+                  panvk_priv_mem_dev_addr(queue->render_desc_ringbuf.syncobj),
+               .ptr = queue->render_desc_ringbuf.addr.dev,
+               .pos = 0,
+            };
+         }"""
     src = src.replace(old, new, 1)
 
     # --- 4. export init_queue ---------------------------------------------
