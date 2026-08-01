@@ -1046,6 +1046,14 @@ Tools worth knowing about before touching any of this:
       **Still not exercised:** descriptor sets, push constants, textures,
       depth/stencil, multiple draws per render pass — each its own
       first-time unknown, not implied by this result.
+- [x] **Real vertex buffers — done, same session.**
+      `tests/render_vbo_probe`: same triangle as above, one variable
+      changed — positions fetched from a bound `VkBuffer` via
+      `vkCmdBindVertexBuffers` instead of hardcoded in the shader. Result:
+      190/66/0, an **exact match** with the hardcoded version, which the
+      probe checks and prints explicitly as a cross-check against a
+      subtly-wrong fetch. Device healthy after. Third hardware-risk probe
+      in a row clean on the first attempt.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process

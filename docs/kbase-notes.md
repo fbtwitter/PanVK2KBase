@@ -1617,3 +1617,29 @@ vertex buffers works. It does not yet prove descriptor sets, push
 constants, textures, depth/stencil, multiple draws in one render pass, or
 anything Vulkan-conformance-shaped - each of those is its own
 first-time-on-this-device unknown, not implied by this result.
+
+## Vertex attribute fetch also works, and matches the hardcoded result exactly
+
+Same session, next single variable: `tests/render_vbo_probe` is
+`render_triangle_probe`'s exact triangle, changed in exactly one way -
+positions come from a real bound `VkBuffer` (`vkCmdBindVertexBuffers`, a
+real `VkVertexInputBindingDescription`/`VkVertexInputAttributeDescription`)
+instead of `gl_VertexIndex` into a shader-hardcoded array. Worth doing
+separately: the hardcoded-position trick `render_triangle_probe` used is a
+rare idiom, not how real applications draw, so vertex fetch was still an
+open unknown even with a triangle already proven.
+
+Ran twice on the Poco X8 Pro. Both times: **190 clear-colour, 66
+triangle-colour, 0 other pixels - an exact match with
+`render_triangle_probe`'s result on the same geometry.** That match is
+itself a cross-check, not just a pass/fail: the probe prints both counts
+and compares them, so a subtly-wrong vertex fetch (an off-by-one stride, a
+wrong format, reading the wrong buffer) would likely have produced a
+different but still "valid-looking" split rather than an exact match.
+Device confirmed healthy after via `driver_compute_probe --fill` and
+`render_triangle_probe`, both clean.
+
+Three real hardware-risk probes in a row now, all clean on the first
+attempt: render-pass entry, a full draw, and vertex fetch. Still
+unexercised, per the list above: descriptor sets, push constants,
+textures, depth/stencil, multiple draws in one pass.

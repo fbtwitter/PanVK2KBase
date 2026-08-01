@@ -166,6 +166,22 @@ render_triangle_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py triangle_frag.spv \
 	    triangle_frag_spv.h render_triangle_probe_frag
 
+# One variable changed from render_triangle_probe: positions come from a
+# real bound VkBuffer instead of a hardcoded shader array. Same
+# --i-know-it-hangs gate - vertex fetch has not run on this device before
+# either.
+render_vbo_probe: ./src/tests/render_vbo_probe/render_vbo_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_vbo_probe -o ./build/render_vbo_probe $<
+
+render_vbo_probe_shaders:
+	cd ./src/tests/render_vbo_probe && \
+	  glslangValidator -V vbo.vert -o vbo_vert.spv && \
+	  glslangValidator -V vbo.frag -o vbo_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py vbo_vert.spv \
+	    vbo_vert_spv.h render_vbo_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py vbo_frag.spv \
+	    vbo_frag_spv.h render_vbo_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's
