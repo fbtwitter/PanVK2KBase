@@ -1280,11 +1280,29 @@ Tools worth knowing about before touching any of this:
       have converged on a precise, well-evidenced characterization
       (kernel-level `ENOMEM`, unrelated to live-device count or system
       memory, following a severe-but-resolved CMA crunch) without a
-      definitive root cause reachable from userspace.** This is the
-      natural stopping point pending root or kernel-source access; the
-      known workaround (excluding the specific leaves that hit it) is
-      already in use and doesn't block broader CTS work. See
-      `docs/kbase-notes.md` for the full sample data and reasoning.
+      definitive root cause reachable from userspace.**
+- [x] **Closed via open-source prior art, not root access** (2026-08-01).
+      Root/kernel-log access deliberately not pursued (explicit
+      instruction). Searched instead for whether kbase's own public
+      source explains this symptom shape — it does: kbase's kernel-side
+      memory pool (`kbase_mem_pool`) is backed by a Linux shrinker that
+      reclaims pages under memory pressure (matching the observed CMA
+      crunch/recovery), and `kbase_mem_pool_grow()` regrowing that pool
+      afterward is documented to be able to fail with `ENOMEM`
+      independently of `/proc/meminfo`-visible metrics — exactly the
+      mismatch this dig measured. Also a known **category** of kbase
+      issues, not a one-off: two GitHub Security Lab advisories
+      ([GHSL-2022-127](https://securitylab.github.com/advisories/GHSL-2022-127_Arm_Mali/),
+      [GHSL-2023-005](https://securitylab.github.com/advisories/GHSL-2023-005_Android/))
+      are rooted in the same pool/shrinker/eviction-list subsystem.
+      **Conclusion: very likely downstream kbase kernel-driver behavior,
+      not a bug in this repo's `pan_kmod_kbase.c`/
+      `panvk_vX_kbase_queue.c`** — any userspace driver on this kernel
+      would hit the same pool-regrowth failure mode after the same kind
+      of memory-pressure burst. Known workaround (excluding the specific
+      leaves that land on this ceiling) already in use; doesn't block
+      broader CTS work. See `docs/kbase-notes.md` for full reasoning and
+      sources.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
