@@ -151,6 +151,36 @@
  */
 #define PANVK_KBASE_RINGBUF_SIZE (64 * 1024)
 
+/* Temporary diagnostic instrumentation, companion to the counters in
+ * pan_kmod_kbase.c - see the comment there for why this exists (the
+ * ~307-case ceiling in docs/kbase-notes.md's "root-cause dig"). This file
+ * is where every VkDevice's queue group, per-subqueue CS queues and tiler
+ * heap are actually created (create_kbase_queue() below runs once per
+ * requested VkDeviceQueueCreateInfo entry, during vkCreateDevice itself) -
+ * real kbase-specific kernel objects a synthetic buffer/pipeline probe
+ * never touches directly. Same PANVK_KBASE_DEBUG_COUNTERS env var gates
+ * both files' output together.
+ */
+#include <stdatomic.h>
+
+static int
+kbase_debug_counters_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0) {
+      const char *v = getenv("PANVK_KBASE_DEBUG_COUNTERS");
+      enabled = v && *v && *v != '0';
+   }
+
+   return enabled;
+}
+
+static atomic_uint kbase_debug_live_groups;
+static atomic_uint kbase_debug_live_subqueues;
+static atomic_uint kbase_debug_live_tiler_heaps;
+static atomic_uint kbase_debug_total_queues_created;
+
 /* Tiler heap geometry is no longer chosen here. It comes from
  * phys_dev->csf.tiler via the shared init_gpu_tiler(), which is what writes
  * the TILER_HEAP descriptor - picking it locally meant the descriptor could
@@ -226,12 +256,30 @@ static void
 destroy_queue_resources(struct panvk_device *dev,
                         struct panvk_kbase_queue *queue)
 {
-   for (unsigned i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+   for (unsigned i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      /* pan_kmod_kbase_queue_destroy() no-ops on a subqueue that was never
+       * successfully created (ringbuf_gpu_va == 0) - this loop runs
+       * unconditionally even on a partial-creation error path, so check the
+       * same condition here to keep the live counter accurate rather than
+       * decrementing for subqueues that were never counted as created.
+       */
+      bool was_live = queue->subqueues[i].ringbuf_gpu_va != 0;
       pan_kmod_kbase_queue_destroy(dev->kmod.dev, &queue->subqueues[i]);
+      if (was_live && kbase_debug_counters_enabled()) {
+         unsigned live =
+            atomic_fetch_sub(&kbase_debug_live_subqueues, 1) - 1;
+         mesa_logi("kbase-dbg: queue_destroy subqueue %u, live_subqueues=%u",
+                   i, live);
+      }
+   }
 
    if (queue->group_created) {
       pan_kmod_kbase_group_destroy(dev->kmod.dev, queue->group_handle);
       queue->group_created = false;
+      if (kbase_debug_counters_enabled()) {
+         unsigned live = atomic_fetch_sub(&kbase_debug_live_groups, 1) - 1;
+         mesa_logi("kbase-dbg: group_destroy, live_groups=%u", live);
+      }
    }
 
    /* The tiler heap is not freed here - it belongs to the shared tiler
@@ -256,11 +304,23 @@ panvk_per_arch(kbase_create_tiler_heap)(struct panvk_gpu_queue *gpu_queue,
    if (pan_kmod_kbase_tiler_heap_create(dev->kmod.dev, chunk_size,
                                         initial_chunks, max_chunks,
                                         &queue->tiler_heap_va,
-                                        &queue->tiler_first_chunk_va))
+                                        &queue->tiler_first_chunk_va)) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: tiler_heap_create FAILED, live_tiler_heaps=%u",
+                   atomic_load(&kbase_debug_live_tiler_heaps));
       return -1;
+   }
 
    *heap_ctx_va = queue->tiler_heap_va;
    *first_chunk_va = queue->tiler_first_chunk_va;
+
+   if (kbase_debug_counters_enabled()) {
+      unsigned live =
+         atomic_fetch_add(&kbase_debug_live_tiler_heaps, 1) + 1;
+      mesa_logi("kbase-dbg: tiler_heap_create SUCCESS, heap_ctx_va=0x%"
+                PRIx64 ", live_tiler_heaps=%u",
+                queue->tiler_heap_va, live);
+   }
 
    return 0;
 }
@@ -277,6 +337,12 @@ panvk_per_arch(kbase_destroy_tiler_heap)(struct panvk_gpu_queue *gpu_queue)
 
    pan_kmod_kbase_tiler_heap_destroy(dev->kmod.dev, queue->tiler_heap_va);
    queue->tiler_heap_va = 0;
+
+   if (kbase_debug_counters_enabled()) {
+      unsigned live =
+         atomic_fetch_sub(&kbase_debug_live_tiler_heaps, 1) - 1;
+      mesa_logi("kbase-dbg: tiler_heap_destroy, live_tiler_heaps=%u", live);
+   }
 }
 
 VkResult
@@ -290,6 +356,17 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
                 VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!queue)
       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   unsigned dbg_queue_no = 0;
+   if (kbase_debug_counters_enabled()) {
+      dbg_queue_no = atomic_fetch_add(&kbase_debug_total_queues_created, 1) + 1;
+      mesa_logi("kbase-dbg: create_kbase_queue #%u entry, queue_idx=%u, "
+                "live_groups=%u live_subqueues=%u live_tiler_heaps=%u",
+                dbg_queue_no, queue_idx,
+                atomic_load(&kbase_debug_live_groups),
+                atomic_load(&kbase_debug_live_subqueues),
+                atomic_load(&kbase_debug_live_tiler_heaps));
+   }
 
    VkResult result =
       vk_queue_init(&queue->gpu.vk, &dev->vk, create_info, queue_idx);
@@ -307,8 +384,13 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
     * this file used to pick on its own.
     */
    result = panvk_per_arch(init_gpu_tiler)(&queue->gpu);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: create_kbase_queue #%u FAILED at "
+                   "init_gpu_tiler, result=%d",
+                   dbg_queue_no, result);
       goto err_finish_queue;
+   }
 
    /* Priority 0 is BASE_QUEUE_GROUP_PRIORITY_HIGH in kbase's numbering,
     * but what actually matters is that it is the value every group this
@@ -318,11 +400,21 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
     */
    if (pan_kmod_kbase_group_create(dev->kmod.dev, 0, 0,
                                    &queue->group_handle)) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: create_kbase_queue #%u FAILED at "
+                   "group_create, live_groups=%u",
+                   dbg_queue_no, atomic_load(&kbase_debug_live_groups));
       result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                             "kbase: failed to create the queue group");
       goto err_destroy_resources;
    }
    queue->group_created = true;
+   if (kbase_debug_counters_enabled()) {
+      unsigned live = atomic_fetch_add(&kbase_debug_live_groups, 1) + 1;
+      mesa_logi("kbase-dbg: create_kbase_queue #%u group_create SUCCESS, "
+                "group_handle=%u, live_groups=%u",
+                dbg_queue_no, queue->group_handle, live);
+   }
 
    /* One CS per subqueue, bound to consecutive CS interfaces of the group.
     * The firmware reports 8 streams per group (see
@@ -332,9 +424,21 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
       if (pan_kmod_kbase_queue_create(dev->kmod.dev, queue->group_handle, i,
                                       PANVK_KBASE_RINGBUF_SIZE,
                                       &queue->subqueues[i])) {
+         if (kbase_debug_counters_enabled())
+            mesa_logi("kbase-dbg: create_kbase_queue #%u FAILED at "
+                      "queue_create subqueue %u, live_subqueues=%u",
+                      dbg_queue_no, i,
+                      atomic_load(&kbase_debug_live_subqueues));
          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                                "kbase: failed to bind CS queue %u", i);
          goto err_destroy_resources;
+      }
+      if (kbase_debug_counters_enabled()) {
+         unsigned live =
+            atomic_fetch_add(&kbase_debug_live_subqueues, 1) + 1;
+         mesa_logi("kbase-dbg: create_kbase_queue #%u queue_create subqueue "
+                   "%u SUCCESS, live_subqueues=%u",
+                   dbg_queue_no, i, live);
       }
    }
 
@@ -351,8 +455,16 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
     * on that step in patch-panvk-kbase-subqueue-init.py.
     */
    result = panvk_per_arch(init_gpu_queue)(&queue->gpu);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: create_kbase_queue #%u FAILED at "
+                   "init_gpu_queue, result=%d",
+                   dbg_queue_no, result);
       goto err_destroy_resources;
+   }
+
+   if (kbase_debug_counters_enabled())
+      mesa_logi("kbase-dbg: create_kbase_queue #%u SUCCESS", dbg_queue_no);
 
    *out_queue = &queue->gpu.vk;
    return VK_SUCCESS;

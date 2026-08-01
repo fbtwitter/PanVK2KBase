@@ -1218,6 +1218,27 @@ Tools worth knowing about before touching any of this:
       `object_management` caselist against that build, rather than
       continuing to guess the reproduction shape with hand-written
       probes. See `docs/kbase-notes.md` for the full writeup.
+- [x] **Root-cause dig, third pass: found the exact failure mechanism**
+      (2026-08-01). Instrumented the real driver
+      (`PANVK_KBASE_DEBUG_COUNTERS=1`, kept in the tree, silent by
+      default) and re-ran the failing caselist. Result: **device creation
+      itself succeeds** (`dev_create #792 SUCCESS`); the failure is a
+      genuine kernel `ENOMEM` from `KBASE_IOCTL_MEM_ALLOC_EX` on the
+      *first buffer allocation after* that successful creation, with only
+      3 devices live — far below the 18-device peak this same run reaches
+      cleanly elsewhere, ruling out live-device count as the trigger. Also
+      directly falsified the "any pattern eventually exhausts something
+      after enough cumulative creations" theory: 1000 sequential
+      iterations in one process (2000 cumulative `dev_create` calls) ran
+      clean, well past the real failure's cumulative count of 792. The
+      failure lands immediately after the `multithreaded_*` test groups,
+      on `private_data`'s first case — a `VK_EXT_private_data` device
+      with real slot-request `pNext` chain, a configuration nothing
+      tested so far has touched. Two narrower next steps identified:
+      probe `multithreaded_shared_resources`'s actual shape (threads
+      sharing one device, not each owning its own), and probe
+      `VK_EXT_private_data` with real slot requests directly. See
+      `docs/kbase-notes.md` for the full log excerpt and reasoning.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

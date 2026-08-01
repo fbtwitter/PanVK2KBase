@@ -2236,3 +2236,111 @@ continuing to guess the reproduction shape with hand-written probes. The
 real run already reliably reproduces the failure at a known, fixed point
 (case 307/308) - instrumenting it directly will show what's actually
 happening there far faster than further synthetic reproduction attempts.
+
+## Root-cause dig, third pass: the real driver, instrumented - found the exact mechanism
+
+Added counters and step-by-step logging to `src/mesa/pan_kmod_kbase.c`
+(device/BO create-destroy, per-candidate FIXED_VA probing) and
+`src/mesa/panvk_vX_kbase_queue.c` (group/subqueue/tiler-heap
+create-destroy - real kbase kernel objects a synthetic buffer/pipeline
+probe never touches, since every `vkCreateDevice` that requests a queue
+triggers this file's `create_kbase_queue()` automatically). Gated behind
+`PANVK_KBASE_DEBUG_COUNTERS=1`, silent otherwise - matches this file's
+existing `PANVK_KBASE_FIXED_VA_BASE` convention. Uses atomics: CTS's
+`multithreaded_*` groups create devices from multiple threads at once,
+and a torn counter would make the log lie about what was actually live
+at the moment of a real failure.
+
+One build wrinkle worth recording: Mesa's `mesa_logi()` routes to Android
+logcat by default on this platform (`MESA_LOG_CONTROL_ANDROID`,
+`src/util/log.c`), not stderr - the instrumentation was silent on the
+first attempt until `MESA_LOG=file` was also set, which routes it to
+`stderr` (captured the same way as everything else in this repo's
+probes). Worth remembering for any future driver-side debug logging in
+this repo, not just this instrumentation.
+
+Rebuilt `libvulkan_panfrost.so` via `wsl-build-android.sh` (both scripts
+have pre-existing CRLF line endings from the Windows checkout, worked
+around with `tr -d '\r'` piped into `bash`, not committed as a fix since
+`git status` shows no modification, and it may work fine on a native
+Linux/WSL clone), deployed it to the on-device path the ICD shim already
+expects, and confirmed the instrumented build has zero behavioral
+difference from the uninstrumented one with the env var unset (clean
+`driver_compute_probe --submit --fill`).
+
+Re-ran the exact caselist that reliably fails
+(`objmgmt_filtered3.txt` - `object_management` minus the
+already-known-bad `device`/`device_group` leaves) with
+`PANVK_KBASE_DEBUG_COUNTERS=1 MESA_LOG=file`. The failure, captured with
+full instrumentation:
+
+```
+Test case 'dEQP-VK.api.object_management.private_data.buffer_storage_large'..
+kbase-dbg: dev_create #792 entry, fd=6, live_devices=2
+kbase-dbg: va_heap candidate 0 (0x800200000000) accepted
+kbase: CSF iface v3.6.0, 8 CSG slots x 8 streams
+kbase-dbg: dev_create #792 SUCCESS, live_devices=3
+kbase: MEM_ALLOC_EX at 0x8003fffff000 failed: Out of memory
+kbase-dbg: dev_destroy, fd=6, owns_fd=1, live_devices=2
+  ResourceError (... VK_ERROR_OUT_OF_DEVICE_MEMORY at vktCustomInstancesDevices.cpp:456)
+```
+
+**This changes the picture substantially - three findings that weren't
+visible from the black-box CTS output alone:**
+
+1. **The device creation itself succeeds.** `kbase_kmod_dev_create()`
+   completes cleanly - the VA heap FIXED_VA probe, the CSF interface
+   query, everything. The failure is the *first buffer allocation after*
+   a successful device creation, at `0x8003fffff000` - the same address
+   every fresh device's first allocation gets in every clean run this
+   session has produced (confirmed in the `device_churn_probe` logs
+   above). The address itself is unremarkable; the kernel ioctl behind
+   it (`KBASE_IOCTL_MEM_ALLOC_EX`) is what returned real `ENOMEM`.
+2. **Only 3 devices are live at the moment of failure** - far below what
+   this exact instrumented run demonstrably handles cleanly elsewhere:
+   grepping the same log for the peak `live_devices` value anywhere in
+   the run shows **18**, reached earlier without incident. Live device
+   *count* is not the trigger.
+3. **It follows immediately after the `multithreaded_*` groups**
+   (`multithreaded_per_thread_device`, `multithreaded_per_thread_resources`,
+   `multithreaded_shared_resources`), landing on the very first case of
+   `private_data`, in a `SingletonDevice` that requests
+   `VK_EXT_private_data` with actual private-data-slot counts via a
+   `VkDevicePrivateDataCreateInfoEXT` `pNext` chain - the combination of
+   "right after multithreaded tests" and "a device configuration nothing
+   else in this run or in `device_churn_probe` has exercised" is the
+   most specific fact this pass has produced.
+
+**Also directly falsified by this pass:** re-ran `device_churn_probe`'s
+plain sequential mode for **1000 iterations in one process** (2000
+cumulative `dev_create` calls, confirmed in the instrumented log) -
+clean, no failure. The real run fails at cumulative `dev_create` **#792**
+- lower than what this synthetic run comfortably passed. So it is not
+simply "any device-creation pattern eventually exhausts something after
+enough cumulative creations either" - ruling that out too, on top of
+everything ruled out in passes one and two.
+
+**Where this leaves it:** the failure is a genuine kernel-level `ENOMEM`
+on an otherwise-ordinary buffer allocation, triggered by some state that
+`multithreaded_*` (thread-based device/resource creation with real
+synchronization, unlike `device_churn_probe --threads`' simpler uniform
+worker loop) and/or `private_data`'s slot-requesting `pNext` chain leaves
+behind - not visible as an elevated live-device or live-BO count, so
+whatever it is isn't tracked by any counter added so far. Two concrete,
+narrower next steps, now that the black-box mystery is a specific,
+characterized mechanism rather than an unknown one:
+
+1. Add a probe mode that matches `multithreaded_shared_resources`'
+   actual shape - multiple threads operating on *one shared* device, not
+   each thread owning its own (what `device_churn_probe --threads`
+   currently does) - since that specific pattern has not been tested at
+   all.
+2. Add a probe mode that requests `VK_EXT_private_data` with real slot
+   counts via the same `pNext` chain shape CTS uses, in case the
+   extension path itself - untested by anything so far - is what
+   allocates the exhausted resource.
+
+The `PANVK_KBASE_DEBUG_COUNTERS` instrumentation is committed and stays
+in the tree (silent by default) - re-running the caselist against
+whichever of the two candidates above is tried next will show the same
+level of detail without re-adding logging from scratch.

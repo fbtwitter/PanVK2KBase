@@ -209,6 +209,41 @@ to_kbase_kmod_bo(struct pan_kmod_bo *bo)
    return container_of(bo, struct kbase_kmod_bo, base);
 }
 
+/* Temporary diagnostic instrumentation for the ~307-case ceiling found
+ * running dEQP-VK.api.object_management through deqp-vk (docs/kbase-notes.md
+ * - "root-cause dig"): after a few hundred VkInstance/VkDevice create+destroy
+ * cycles in one process, vkCreateDevice starts failing with
+ * VK_ERROR_OUT_OF_DEVICE_MEMORY. Two passes of hand-written synthetic
+ * reproduction (tests/device_churn_probe) came up clean at far larger scale
+ * than the real failure, so this instruments the real driver instead of
+ * guessing the reproduction shape further. Gated behind
+ * PANVK_KBASE_DEBUG_COUNTERS so it is silent by default, matching this
+ * file's PANVK_KBASE_FIXED_VA_BASE convention. Atomic because CTS's
+ * multithreaded_* test groups create devices from multiple threads at once
+ * (see tests/device_churn_probe's --threads mode, which confirmed
+ * concurrent creation itself is not the ceiling) - a torn counter here would
+ * make the log lie about live_devices at the moment of any real failure.
+ */
+#include <stdatomic.h>
+
+static int
+kbase_debug_counters_enabled(void)
+{
+   static int enabled = -1;
+
+   if (enabled < 0) {
+      const char *v = getenv("PANVK_KBASE_DEBUG_COUNTERS");
+      enabled = v && *v && *v != '0';
+   }
+
+   return enabled;
+}
+
+static atomic_uint kbase_debug_live_devices;
+static atomic_uint kbase_debug_total_devices_created;
+static atomic_uint kbase_debug_live_bos;
+static atomic_uint kbase_debug_total_bos_created;
+
 /*
  * GPU property decoding.
  *
@@ -467,6 +502,15 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       return NULL;
    }
 
+   unsigned dbg_creation_no = 0;
+   if (kbase_debug_counters_enabled()) {
+      dbg_creation_no =
+         atomic_fetch_add(&kbase_debug_total_devices_created, 1) + 1;
+      mesa_logi("kbase-dbg: dev_create #%u entry, fd=%d, live_devices=%u",
+                dbg_creation_no, fd,
+                atomic_load(&kbase_debug_live_devices));
+   }
+
    pan_kmod_dev_init(&kbase_dev->base, fd, flags, drv_info, &kbase_kmod_ops,
                      allocator);
 
@@ -496,19 +540,40 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       struct kbase_ioctl_set_flags set_flags = { .create_flags = 0 };
       if (ioctl(fd, KBASE_IOCTL_SET_FLAGS, &set_flags) < 0) {
          mesa_loge("kbase: SET_FLAGS failed: %s", strerror(errno));
+         if (kbase_debug_counters_enabled())
+            mesa_logi("kbase-dbg: dev_create #%u FAILED at SET_FLAGS "
+                      "(errno=%d %s), live_devices=%u",
+                      dbg_creation_no, errno, strerror(errno),
+                      atomic_load(&kbase_debug_live_devices));
          goto err_cleanup;
       }
    }
 
-   if (kbase_dev_query_props(kbase_dev))
+   if (kbase_dev_query_props(kbase_dev)) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: dev_create #%u FAILED at "
+                   "kbase_dev_query_props, live_devices=%u",
+                   dbg_creation_no, atomic_load(&kbase_debug_live_devices));
       goto err_cleanup;
+   }
 
-   if (kbase_init_va_heap(kbase_dev))
+   if (kbase_init_va_heap(kbase_dev)) {
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: dev_create #%u FAILED at kbase_init_va_heap, "
+                   "live_devices=%u",
+                   dbg_creation_no, atomic_load(&kbase_debug_live_devices));
       goto err_cleanup;
+   }
 
    kbase_query_csif_props(kbase_dev);
    kbase_query_allowed_priorities(kbase_dev);
    kbase_init_context_zones(kbase_dev);
+
+   if (kbase_debug_counters_enabled()) {
+      unsigned live = atomic_fetch_add(&kbase_debug_live_devices, 1) + 1;
+      mesa_logi("kbase-dbg: dev_create #%u SUCCESS, live_devices=%u",
+                dbg_creation_no, live);
+   }
 
    return &kbase_dev->base;
 
@@ -550,6 +615,10 @@ kbase_init_va_heap(struct kbase_kmod_dev *dev)
       probe.in.fixed_address = base;
 
       if (ioctl(dev->base.fd, KBASE_IOCTL_MEM_ALLOC_EX, &probe) < 0) {
+         if (kbase_debug_counters_enabled())
+            mesa_logi("kbase-dbg: va_heap candidate %u (0x%" PRIx64
+                      ") MEM_ALLOC_EX failed: %s",
+                      i, base, strerror(errno));
          if (forced)
             break;
          continue;
@@ -562,10 +631,19 @@ kbase_init_va_heap(struct kbase_kmod_dev *dev)
          mesa_logw("kbase: could not free the FIXED_VA probe allocation");
 
       if (!exact) {
+         if (kbase_debug_counters_enabled())
+            mesa_logi("kbase-dbg: va_heap candidate %u (0x%" PRIx64
+                      ") got 0x%" PRIx64 " instead - not exact, rejecting",
+                      i, base, (uint64_t)probe.out.gpu_va);
          if (forced)
             break;
          continue;
       }
+
+      if (kbase_debug_counters_enabled())
+         mesa_logi("kbase-dbg: va_heap candidate %u (0x%" PRIx64
+                   ") accepted",
+                   i, base);
 
       dev->va.start = base;
       dev->va.size = KBASE_FIXED_VA_ZONE_SIZE;
@@ -1171,6 +1249,12 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
 {
    struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
 
+   if (kbase_debug_counters_enabled()) {
+      unsigned live = atomic_fetch_sub(&kbase_debug_live_devices, 1) - 1;
+      mesa_logi("kbase-dbg: dev_destroy, fd=%d, owns_fd=%d, live_devices=%u",
+                dev->fd, !!(dev->flags & PAN_KMOD_DEV_FLAG_OWNS_FD), live);
+   }
+
    if (kbase_dev->va.ready) {
       util_vma_heap_finish(&kbase_dev->va.heap);
       simple_mtx_destroy(&kbase_dev->va.lock);
@@ -1239,6 +1323,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
          mesa_loge("kbase: MEM_ALLOC for %" PRIu64
                    " bytes of executable memory failed: %s",
                    aligned, strerror(errno));
+         if (kbase_debug_counters_enabled())
+            mesa_logi("kbase-dbg: bo_alloc EXEC FAILED, size=%" PRIu64
+                      " errno=%d %s, live_bos=%u",
+                      aligned, errno, strerror(errno),
+                      atomic_load(&kbase_debug_live_bos));
          pan_kmod_dev_free(dev, bo);
          return NULL;
       }
@@ -1247,6 +1336,15 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
       pan_kmod_bo_init(&bo->base, dev, exclusive_vm, aligned, flags,
                        (uint32_t)(bo->gpu_va >> 12));
+
+      if (kbase_debug_counters_enabled()) {
+         unsigned total =
+            atomic_fetch_add(&kbase_debug_total_bos_created, 1) + 1;
+         unsigned live = atomic_fetch_add(&kbase_debug_live_bos, 1) + 1;
+         mesa_logi("kbase-dbg: bo_alloc EXEC #%u SUCCESS, gpu_va=0x%" PRIx64
+                   ", size=%" PRIu64 ", live_bos=%u",
+                   total, bo->gpu_va, aligned, live);
+      }
 
       return &bo->base;
    }
@@ -1336,6 +1434,14 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
 
    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, aligned, flags, handle);
 
+   if (kbase_debug_counters_enabled()) {
+      unsigned total = atomic_fetch_add(&kbase_debug_total_bos_created, 1) + 1;
+      unsigned live = atomic_fetch_add(&kbase_debug_live_bos, 1) + 1;
+      mesa_logi("kbase-dbg: bo_alloc #%u SUCCESS, gpu_va=0x%" PRIx64
+                ", size=%" PRIu64 ", live_bos=%u",
+                total, va, aligned, live);
+   }
+
    return &bo->base;
 }
 
@@ -1414,9 +1520,20 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
     */
    struct kbase_ioctl_mem_free free_req = { .gpu_addr = kbase_bo->gpu_va };
 
-   if (ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &free_req) < 0)
+   int free_ret = ioctl(bo->dev->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+   int free_errno = errno;
+   if (free_ret < 0)
       mesa_loge("kbase: MEM_FREE of 0x%" PRIx64 " failed: %s",
-                kbase_bo->gpu_va, strerror(errno));
+                kbase_bo->gpu_va, strerror(free_errno));
+
+   if (kbase_debug_counters_enabled()) {
+      unsigned live = atomic_fetch_sub(&kbase_debug_live_bos, 1) - 1;
+      mesa_logi("kbase-dbg: bo_free gpu_va=0x%" PRIx64
+                ", executable=%d, MEM_FREE_ret=%d%s, live_bos=%u",
+                kbase_bo->gpu_va,
+                !!(bo->flags & PAN_KMOD_BO_FLAG_EXECUTABLE), free_ret,
+                free_ret < 0 ? strerror(free_errno) : "", live);
+   }
 
    /* Only addresses this backend handed out go back to it. An executable BO
     * lives in kbase's EXEC_VA zone and its address was chosen by the kernel,
