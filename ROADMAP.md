@@ -1174,11 +1174,28 @@ Tools worth knowing about before touching any of this:
       beyond this repo's own probes. `dEQP-VK.api.*` as a whole is
       267,166 cases (confirmed by dumping the case tree first, not
       discovered by running it blind) — too large for one unattended run.
+- [x] **Real finding: a hard ~307-case ceiling on cumulative
+      VkInstance/VkDevice creation** (2026-08-01), found running
+      `dEQP-VK.api.object_management.*` (457 cases). Most cases in this
+      group create their own throwaway `VkInstance`+`VkDevice` pair; after
+      exactly 307 such cases succeed in one `deqp-vk` process, every
+      subsequent `VkDevice` creation fails with
+      `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Confirmed twice, landing on the
+      identical 307-case count both times regardless of which specific
+      case was next — points to a fixed-size resource table/slot count
+      being exhausted (kbase context slots and fd `RLIMIT`s are the
+      leading suspects), not a variable-rate leak. Not yet root-caused.
+      Device/GPU confirmed unaffected (fresh probe processes stay clean).
+      **Follow-up task: instrument `/proc/<pid>/fd` and kbase context
+      ioctls across a `deqp-vk` run to find exactly what's not being
+      released.** See `docs/kbase-notes.md` for the full writeup.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
-      driver issue). Next: scoped `dEQP-VK.api.*` sub-groups and
-      `dEQP-VK.query_pool.*`, one group at a time, not the full tree.
+      driver issue); `object_management`'s `*.device`/`*.device_group`
+      leaves excluded pending the resource-ceiling investigation above.
+      Next: scoped `dEQP-VK.api.*` sub-groups and `dEQP-VK.query_pool.*`,
+      one group at a time, not the full tree.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is

@@ -1966,3 +1966,117 @@ sub-groups rather than the whole 267k-case tree at once, `dEQP-VK.query_pool.*`
 and similar), each run and checked before the next, `dEQP-VK.info.platform`
 excluded from future runs as a known upstream-CTS gap rather than
 re-triggered every time.
+
+## dEQP-VK.api.* is 267,166 cases; object_management surfaces a real resource-limit finding
+
+Before running any of `dEQP-VK.api.*` at scale, dumped its case tree
+(`--deqp-runmode=stdout-caselist`) to see what "the next suite" actually
+means size-wise, rather than discovering it mid-run:
+
+```
+201346  dEQP-VK.api.copy_and_blit          (huge format/size parameter sweep)
+ 45636  dEQP-VK.api.image_clearing         (huge format/size parameter sweep)
+ 10481  dEQP-VK.api.info                   (per-extension query sweep)
+  3076  dEQP-VK.api.buffer
+  1320  dEQP-VK.api.ds_color_copy
+  1004  dEQP-VK.api.buffer_view
+   457  dEQP-VK.api.object_management
+   ...  (long tail of small groups)
+```
+
+`copy_and_blit` and `image_clearing` alone are 246,982 of the 267,166 -
+deliberately deferred, not attempted blind. Picked
+`dEQP-VK.api.object_management` (457 cases: create/destroy lifecycle
+across every core object type - buffers, images, pipelines, descriptor
+sets, devices, etc.) as a bounded, foundational next step.
+
+Ran it; the run **aborted at case 67 of 457**, at
+`max_concurrent.device`:
+
+```
+Passed:        61/66 (92.4%)
+Failed:        1/66 (1.5%)
+Warnings:      4/66 (6.1%)
+Test run was ABORTED!
+```
+
+The 4 warnings (`QualityWarning: Allocation callbacks not called`, on
+`descriptor_set_layout_*` and `pipeline_layout_*`) are benign and expected
+- this driver doesn't route those allocations through the app-supplied
+`VkAllocationCallbacks`, which CTS flags as a quality note, not a
+correctness failure.
+
+The abort: `max_concurrent.device` is a stress test that creates `VkDevice`
+objects in a loop until creation fails, to find the practical concurrent-
+device limit. It hit `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+(`vktCustomInstancesDevices.cpp:456`) - a spec-legal error response, but
+CTS categorizes running out of resources mid-stress-test as
+`ResourceError`, which is treated as fatal to the *whole test run* (later
+cases can't be trusted once a resource leak or exhaustion state is
+possible), not just a failure of that one case. This is a genuine
+data point - either this device's concurrent-VkDevice ceiling is lower
+than CTS expects, or there's a real leak somewhere in the kbase-backed
+device-creation path - not yet distinguished, and not chased further this
+session. Device confirmed healthy afterward via
+`driver_compute_probe --submit --fill` (clean) - this was a resource
+ceiling hit deliberately by a stress test, not a hang or crash.
+
+Next: re-run `object_management` with `max_concurrent.device` excluded to
+get the remaining ~390 cases' results, and note whether `max_concurrent.*`
+as a category (stress/limit-finding tests) needs the same
+run-in-isolation treatment as `dEQP-VK.info.platform`.
+
+## A real finding: a hard ~307-case ceiling on cumulative VkInstance/VkDevice creation
+
+Followed up on the `max_concurrent.device` abort by excluding it and
+re-running - `max_concurrent.device_group` hit the identical
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` at `vktCustomInstancesDevices.cpp:456`.
+Excluded both, and every other `*.device`/`*.device_group` leaf across the
+whole 457-case group (16 total - most of `object_management`'s subgroups
+each have their own `device`/`device_group` leaf, since most of these
+tests spin up a fresh custom `VkInstance`+`VkDevice` per
+`vktCustomInstancesDevices.cpp`, not the shared default device), then
+re-ran the remaining 441.
+
+**That run aborted too - not on a `device` leaf at all, but on
+`private_data.buffer_storage_large`, at exactly 307 cases passed.**
+Excluded that specific case and ran again: **aborted again, at exactly the
+same 307-case count**, this time on the very next case in sequence
+(`private_data.buffer_storage_small`) rather than a different one.
+
+That's the load-bearing detail: **the failure point is a fixed case
+count, not a fixed test name.** A slow memory leak whose per-case leak
+size varies (small buffers vs. large ones, single-threaded vs.
+multithreaded resource creation) would exhaust at a point that shifts
+depending on which cases ran and in what order. A count that lands on
+307 twice in a row, regardless of which case happens to be case 308,
+looks instead like a **fixed-size resource table or slot count** being
+filled - each `object_management` test case that isn't excluded creates
+its own throwaway `VkInstance`+`VkDevice` pair
+(`vktCustomInstancesDevices.cpp`'s pattern), and something in this
+driver's or kbase's device/instance teardown path is not releasing
+whatever that fixed resource is (plausible candidates, not yet checked:
+kbase context slots, an fd class with a low `RLIMIT`, a fixed-size handle
+table in `pan_kmod_kbase.c` or the CSF queue-group allocator) before the
+next `VkDevice` tries to claim one.
+
+**Not yet root-caused** - this would need instrumenting the actual
+resource in question (likely starting with `lsof`/`/proc/<pid>/fd` count
+on the `deqp-vk` process across the run, and checking whether kbase
+context creation ioctls succeed/fail at the same point) rather than
+guessing further from CTS's black-box error message. Recorded here as a
+genuine, reproducible driver-quality finding from CTS - not a hang, not a
+crash, and confirmed not to affect the GPU/device itself
+(`driver_compute_probe --submit --fill` stayed clean throughout, since
+each probe run is a fresh process). This is exactly the kind of defect
+CTS work exists to surface, and is a better next investigation than
+grinding through more of the case tree with the same leak silently
+capping every future run's coverage at ~300-some cases.
+
+With those 17 known-bad leaves (16 `device`/`device_group` variants + the
+one `private_data` case that happened to land on the ceiling) excluded,
+**306/312 passed, 4 quality warnings (benign, allocation-callback
+routing), 1 boundary case left aborting the tail of the run** - the
+remaining ~145 untested `object_management` cases are simply past where
+the ceiling bites, not independently interesting until the ceiling itself
+is understood.
