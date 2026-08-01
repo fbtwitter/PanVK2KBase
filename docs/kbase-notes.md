@@ -2430,3 +2430,88 @@ set aside in favor of broader CTS coverage - the mechanism (kernel
 live-device count, following the `multithreaded_*`/`private_data` region
 of the caselist) is now well enough understood to recognize immediately
 if it recurs elsewhere.
+
+## Root-cause dig, fifth pass: memory-sampled the real run - not system memory pressure either
+
+Followed the fourth pass's own recommendation instead of inventing a
+fifth synthetic pattern: instrumented the *real* failing caselist run
+with live `/proc/meminfo` sampling (`MemFree`, `MemAvailable`, `CmaFree`,
+`Cached`, `SwapFree`, and the `deqp-vk` process's own `VmRSS`), polled
+throughout, correlated against case progress via the same
+`PANVK_KBASE_DEBUG_COUNTERS=1 MESA_LOG=file` instrumentation from the
+third pass. `CmaFree` specifically - the Contiguous Memory Allocator pool
+size, what Mali/kbase GPU allocations typically draw from on this
+MediaTek SoC - was the target: this device has no accessible debugfs
+(`/sys/kernel/debug/` is present but empty for the shell user, `mali0`'s
+own debug directory does not exist) and no kernel log access
+(`dmesg`/`klogctl`/`/proc/kmsg` all return `Permission denied` without
+root), so `/proc/meminfo`'s `CmaFree` line is the closest thing to a
+GPU-memory-specific signal available from userspace on this device.
+
+**First pass at 0.5s resolution found something real and unexpected:**
+`CmaFree` crashed from a healthy ~105,000 kB down to **236 kB** - visibly
+near-zero - around case 59-79 (during `max_concurrent.*`, which is
+exactly the group that stress-tests many simultaneous buffer/image
+allocations). That is a genuine, severe CMA crunch, not a measurement
+artifact. But it fully **recovered** by the next sample (case 183,
+`CmaFree` back to ~92,000 kB) and then stayed stable in the ~95,000-
+116,000 kB range for the rest of that run, including its last captured
+sample at case 300 - just before the 0.5s-interval sampling missed the
+actual failure (the process exited before the next poll).
+
+**Re-ran at 0.1s resolution to close that gap.** This time the samples
+extend to **case 305**, two cases before the abort point (307-308) that
+every prior run has landed on:
+
+```
+case 292: cmafree=115684  memfree=392920  memavail=5916728  rss=133024
+case 300: cmafree=115128  memfree=394060  memavail=5920880  rss=132136
+case 302: cmafree=115316  memfree=389848  memavail=5921092  rss=131752
+case 305: cmafree=115060  memfree=395704  memavail=5920428  rss=131712
+```
+
+**Every single indicator is completely ordinary** - the same healthy
+range it had held since case 183, no trend, no decline, nothing
+distinguishing this moment from any of the hundreds of cases that passed
+cleanly before it. `deqp-vk`'s own process RSS is small (~130 MB) and
+flat. There is no observable system-wide or CMA-specific memory pressure
+at the moment `KBASE_IOCTL_MEM_ALLOC_EX` returns real kernel `ENOMEM` two
+cases later.
+
+**This rules out the fourth pass's remaining external hypothesis.** The
+earlier severe CMA crunch (case 59-79) was real but is not the cause -
+it resolved over 200 cases before the failure and stayed resolved.
+Whatever is exhausted is not visible in `/proc/meminfo` at all, which
+narrows it to one of two things, neither checkable from userspace on
+this device without further access:
+
+1. **Physical fragmentation not reflected in aggregate free-byte
+   counts** - a specific allocation shape (contiguity, alignment, a
+   particular CMA sub-region) unavailable even though the totals look
+   fine. Weakened by the failing allocation being tiny (one 4 KB page,
+   per the `bo_alloc #1`-style address every fresh device's first
+   allocation gets) - a single free page being unfindable while
+   `CmaFree` reports 115 MB free would be an extreme case of
+   fragmentation.
+2. **A kbase kernel-driver-internal accounting structure or limit** -
+   a table, an ID space, an internal memory pool with a cap - entirely
+   separate from the general page allocator and therefore invisible to
+   `/proc/meminfo` regardless of how carefully it's sampled.
+
+**Investigation is now blocked by environment access, not by remaining
+hypotheses to test.** The next step that could actually distinguish these
+two - reading `dmesg` at the moment of failure, or reading the real GPL
+kbase kernel source for this exact device/firmware to check for a
+documented limit - requires either root access this session does not
+have, or the Poco X8 Pro kernel source Xiaomi has not yet published
+(checked in the second pass; still not available). Five full passes
+(fd leak and every churn/concurrency pattern constructible; both specific
+hypotheses the driver instrumentation suggested; and now live system and
+CMA memory sampling of the real run) have converged on a precise,
+well-evidenced characterization - kernel-level resource exhaustion,
+invisible to `/proc/meminfo`, following a severe-but-resolved CMA crunch
+earlier in the run - without a definitive root cause reachable from
+userspace. This is the natural stopping point for this investigation
+until root/kernel-source access is available; it does not block broader
+CTS work, since the workaround (excluding the specific leaves that hit
+this ceiling) is already known and in use.

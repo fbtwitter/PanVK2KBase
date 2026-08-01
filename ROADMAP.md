@@ -1260,6 +1260,31 @@ Tools worth knowing about before touching any of this:
       pattern; otherwise treat this as a well-characterized, deliberately
       set-aside finding and prioritize broader CTS coverage. See
       `docs/kbase-notes.md` for full reasoning.
+- [x] **Root-cause dig, fifth pass: memory-sampled the real run — not
+      system memory pressure either** (2026-08-01). Live `/proc/meminfo`
+      sampling (`CmaFree` especially — the Contiguous Memory Allocator
+      pool Mali/kbase GPU allocations typically draw from on this
+      MediaTek SoC) during the real failing caselist run. Found something
+      real: `CmaFree` crashed from ~105,000 kB to **236 kB** around case
+      59-79 (during `max_concurrent.*`) — a genuine severe crunch — but
+      it fully recovered and stayed stable (~95,000-116,000 kB) for over
+      200 cases, including a sample at **case 305**, two cases before the
+      abort point, where every memory indicator (`MemFree`,
+      `MemAvailable`, `CmaFree`, `Cached`, `SwapFree`, process `VmRSS`)
+      was completely ordinary — no trend, no decline. This rules out
+      system-wide and CMA-specific memory pressure as the direct cause.
+      No `dmesg`/kernel-log access without root, no accessible kbase
+      debugfs on this device, and the Poco X8 Pro's kernel source still
+      isn't published — so whatever is exhausted is invisible to every
+      userspace vantage point available this session. **Five full passes
+      have converged on a precise, well-evidenced characterization
+      (kernel-level `ENOMEM`, unrelated to live-device count or system
+      memory, following a severe-but-resolved CMA crunch) without a
+      definitive root cause reachable from userspace.** This is the
+      natural stopping point pending root or kernel-source access; the
+      known workaround (excluding the specific leaves that hit it) is
+      already in use and doesn't block broader CTS work. See
+      `docs/kbase-notes.md` for the full sample data and reasoning.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
