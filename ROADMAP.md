@@ -1303,13 +1303,45 @@ Tools worth knowing about before touching any of this:
       leaves that land on this ceiling) already in use; doesn't block
       broader CTS work. See `docs/kbase-notes.md` for full reasoning and
       sources.
+- [x] **`dEQP-VK.api.*` widened: 2194/2194 non-huge-sweep cases run**
+      (2026-08-01) — everything except `copy_and_blit`/`image_clearing`
+      (huge sweeps, deferred), `info` (deferred), `buffer`/
+      `ds_color_copy`/`buffer_view`/`image_compression_control` (medium
+      sweeps, deferred), and `object_management` (already covered).
+      **1258 passed, 931 correctly `NotSupported`, 5 genuine failures.**
+      Rebooted the device mid-pass (normal power cycle, not root) after
+      the resource ceiling started recurring much earlier than the
+      original 792-case finding — the reboot gave a genuinely useful
+      negative result: `device_init.create_device_global_priority.basic`
+      failed identically before and after, ruling out session-cumulative
+      wear for *that* case and pointing instead at a real, likely-fixable
+      bug in this driver's acknowledged-incomplete global-priority
+      mapping. Two real `SIGSEGV` crashes found (device confirmed healthy
+      after both): `create_instance_device_intentional_alloc_fail` (a
+      simulated host-allocation failure isn't handled gracefully) and
+      `null_handle.destroy_device` (`vkDestroyDevice(VK_NULL_HANDLE)`
+      should be a spec-legal no-op). One CTS-side bug, not this driver's:
+      the whole `external.memory.android_hardware_buffer` subtree hits a
+      CTS assertion that doesn't hold on this device's SDK version (36).
+      `command_buffers` (131 cases, real GPU work per case → slow, not
+      risky) deferred but partially run, surfacing two genuine
+      rendering-correctness failures both specific to **drawing from
+      secondary command buffers** — a shape no render probe this session
+      has tested. Five genuine failures in the completed run itself:
+      layer-name-abuse validation not enforced, wrong reported
+      `conformanceVersion`, `extension_duplicates.device.*` failing with
+      `VK_ERROR_OUT_OF_DEVICE_MEMORY` (not yet distinguished from the
+      resource-ceiling pattern vs. a real duplicate-extension-handling
+      bug), and `version_check.unavailable_entry_points`. See
+      `docs/kbase-notes.md` for full classification and the exact
+      exclusion list.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
       driver issue); `object_management`'s `*.device`/`*.device_group`
       leaves excluded pending the resource-ceiling investigation above.
-      Next: scoped `dEQP-VK.api.*` sub-groups and `dEQP-VK.query_pool.*`,
-      one group at a time, not the full tree.
+      Next: the deferred medium/huge sweeps, `command_buffers` to
+      completion, and `dEQP-VK.query_pool.*` per the standing plan.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is

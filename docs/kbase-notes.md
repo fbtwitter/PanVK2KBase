@@ -2559,3 +2559,136 @@ after a memory-heavy CTS group on kbase hardware, and not a blocker for
 CTS work generally: the practical workaround (excluding the specific
 leaves that land on this ceiling, and treating any future occurrence as
 "probably this again" rather than a fresh mystery) is already in use.
+
+## Widening CTS coverage: dEQP-VK.api.* (excluding the huge sweeps), 2194/2194 cases run
+
+With the resource-ceiling dig closed, moved on to running the rest of
+`dEQP-VK.api.*` - everything except `copy_and_blit` (201k),
+`image_clearing` (45k), `info` (10k, a per-extension query sweep),
+`buffer`/`ds_color_copy`/`buffer_view`/`image_compression_control`
+(medium sweeps deferred for a later pass), and `object_management`
+(already covered above). Ran as one filtered caselist
+(`--deqp-caselist-file`), excluding specific leaves as each was found to
+either hit the closed resource-ceiling pattern again or crash the test
+binary, until the remaining ~2194 cases completed cleanly in one run:
+**1258 passed, 931 correctly `NotSupported` (unimplemented optional
+extensions - `VK_KHR_maintenance7`, `VK_KHR_cooperative_matrix`,
+`VK_KHR_fragment_shading_rate`, `VK_KHR_surface`/WSI, etc. - all expected
+for this driver's current feature set), 5 genuine failures.**
+
+**Rebooted the device mid-pass** (a normal power cycle, not root access -
+deliberately not pursued, see the closing note above) after the resource
+ceiling started recurring within 10-30 cases of a fresh process instead
+of the ~792 cumulative creates the original `object_management` finding
+needed, suspecting this session's very heavy earlier testing (thousands
+of device creations, a 96,000-cycle stress test, a 125,000-buffer stress
+test) had left the kernel's own memory pool in a degraded state that
+persists across process invocations. All deployed files
+(`deqp-vk`, the driver `.so`, the ICD shim, the `vulkan/` CTS data
+directory, caselist files) survive a reboot (`/data` is not wiped);
+redeployed nothing, just waited for `sys.boot_completed` and resumed.
+
+**The reboot produced a genuinely informative negative result:** the very
+same test (`device_init.create_device_global_priority.basic`) failed at
+the exact same point, identically, before and after. That rules out
+"cumulative session wear" as *that* test's explanation - it's
+deterministic, tied to that specific device configuration
+(`VK_EXT_global_priority`), not to prior session history. Consistent with
+this repo's own acknowledged gap: `panvk_vX_kbase_queue.c`'s comment on
+`create_kbase_queue` states outright that "mapping Vulkan global priority
+onto kbase priorities properly is left for when submission works" - this
+is likely that gap surfacing as a real, fixable bug, not a recurrence of
+the closed kbase-kernel mystery. Filed separately below rather than
+lumped in with the resource-ceiling findings.
+
+Leaves excluded en route, with their real classification (not all the
+same issue - resist the temptation to lump every `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+together):
+
+- **Likely the closed resource-ceiling pattern recurring** (transient,
+  consistent with the kbase memory-pool/shrinker characterization above):
+  `buffer_marker.graphics.default_mem.bottom_of_pipe.memory_dep.buffer_copy`
+  (`ResourceError` on `vkCreateDevice`),
+  `buffer_memory_requirements.create_sparse_binding_sparse_residency.ext_mem_flags_excluded.method1.other_usage_bits`
+  (`ResourceError` on `vkCreateBuffer` - sparse allocations are exactly
+  the kind of memory-heavy pattern that would stress the same pool).
+- **A likely real, fixable driver bug** (not the closed mystery -
+  deterministic, survives reboot):
+  `device_init.create_device_global_priority.basic` - see above.
+- **Real crashes (`SIGSEGV`), confirmed the device/GPU stayed healthy
+  after each** (`driver_compute_probe --submit --fill` clean both times -
+  userspace process crashes, not GPU hangs):
+  - `device_init.create_instance_device_intentional_alloc_fail.basic` -
+    this test deliberately injects allocation failures (via
+    `VkAllocationCallbacks` that fail on cue) to verify the driver
+    propagates `VK_ERROR_OUT_OF_HOST_MEMORY` gracefully everywhere in
+    instance/device creation rather than crashing. This driver crashes
+    instead somewhere in that path - a real, standard robustness bug
+    (dereferencing a pointer from an allocation that was made to fail),
+    not specific to kbase.
+  - `null_handle.destroy_device` - `vkDestroyDevice(VK_NULL_HANDLE, ...)`
+    must be a safe no-op per spec (destroying `VK_NULL_HANDLE` is valid
+    for every `vkDestroy*`/`vkFree*` entry point). This driver crashes
+    instead - missing a null check Mesa's common `vk_device` layer
+    usually provides, or this backend bypasses it somewhere.
+- **A CTS-side bug, not this driver's** (`SIGABRT`, an assertion in CTS's
+  own test utility): the whole
+  `external.memory.android_hardware_buffer` subtree hits
+  `assertion "!(sdkVersion >= 33)" failed` in
+  `vktExternalMemoryAndroidHardwareBufferUtil.cpp` - this CTS version's
+  AHardwareBuffer test helper hard-codes an assumption that doesn't hold
+  on this device's Android SDK version (36). Same category as the
+  earlier `dEQP-VK.info.platform` finding: an environment/CTS-version
+  mismatch, not a driver defect.
+- **Slow, deferred for pacing, not excluded for correctness reasons**:
+  `command_buffers` (131 cases, each doing real GPU submission - far
+  slower per-case than everything else in this batch). Partially run
+  before being deferred; surfaced two genuine rendering-correctness
+  failures worth recording now rather than re-finding later:
+  `many_indirect_draws_on_secondary` and `record_many_draws_secondary_2`
+  both fail with wrong pixel colors - both specifically about **drawing
+  from secondary command buffers**, a shape none of this session's own
+  render probes exercised (they all drew from primary command buffers
+  directly). A real, scoped lead for future rendering-correctness work.
+
+**Five genuine failures in the completed 2194-case run itself** (beyond
+the excluded leaves above):
+
+1. `device_init.create_instance_layer_name_abuse.basic` - "Runtime check
+   failed: `!gotInstance`" - this driver doesn't reject a malformed/abusive
+   layer name the way the test expects; likely because this driver
+   doesn't implement layer validation at all yet (plausible for a driver
+   at this stage - not urgent, but real).
+2. `driver_properties.conformance_version` - "Wrong driver conformance
+   version (older than used API version)" - `VkPhysicalDeviceDriverProperties.conformanceVersion`
+   is reported inconsistently with the Vulkan API version this driver
+   claims (1.4.0, per `version_check.version` passing). A metadata/
+   reporting bug, likely a quick fix once looked at directly - this driver
+   is reporting a conformance version that doesn't match reality (it
+   isn't conformant, so arguably any specific version claimed needs
+   re-examining, not just "made consistent").
+3. `extension_duplicates.device.by_names` / `by_pointers` - both fail
+   with `VK_ERROR_OUT_OF_DEVICE_MEMORY` specifically when duplicate
+   extension names/pointers are passed to `vkCreateDevice` (the test's
+   whole point - verifying duplicates are handled gracefully, e.g.
+   deduplicated, not double-processed). Worth checking whether this is
+   the closed resource-ceiling pattern again or a real over-allocation
+   bug specific to *processing* duplicate extension entries (allocating
+   per-listed-extension rather than per-unique-extension, for instance) -
+   not distinguished yet, flagged for follow-up rather than assumed.
+4. `version_check.unavailable_entry_points` - fails with
+   `VK_ERROR_EXTENSION_NOT_PRESENT` from the generic custom-device-creation
+   helper; not yet determined whether this is the correct response
+   mis-categorized by CTS's harness or a genuine mishandling on this
+   driver's part.
+
+Device confirmed healthy after every excluded/crashing case via
+`driver_compute_probe --submit --fill`, run individually after each one
+before continuing - the same discipline as every hardware-risk step this
+session.
+
+**Next**: the deferred medium sweeps (`buffer`, `ds_color_copy`,
+`buffer_view`, `image_compression_control`, `info`), `command_buffers`
+run to completion with a longer timeout (each case does real GPU work, so
+it is slow rather than risky), and `dEQP-VK.query_pool.*` per the
+standing plan - none attempted yet this pass.
