@@ -182,6 +182,23 @@ render_vbo_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py vbo_frag.spv \
 	    vbo_frag_spv.h render_vbo_probe_frag
 
+# One variable changed from render_vbo_probe: the fragment colour comes
+# from a push constant instead of being hardcoded. Same --i-know-it-hangs
+# gate - push constants have not reached a graphics-stage fragment shader
+# on this device before (compute already works, per driver_pipeline_probe,
+# but that is different code).
+render_push_probe: ./src/tests/render_push_probe/render_push_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_push_probe -o ./build/render_push_probe $<
+
+render_push_probe_shaders:
+	cd ./src/tests/render_push_probe && \
+	  glslangValidator -V push.vert -o push_vert.spv && \
+	  glslangValidator -V push.frag -o push_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py push_vert.spv \
+	    push_vert_spv.h render_push_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py push_frag.spv \
+	    push_frag_spv.h render_push_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

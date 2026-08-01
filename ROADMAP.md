@@ -1054,6 +1054,14 @@ Tools worth knowing about before touching any of this:
       probe checks and prints explicitly as a cross-check against a
       subtly-wrong fetch. Device healthy after. Third hardware-risk probe
       in a row clean on the first attempt.
+- [x] **Push constants, graphics stage — done, same session.**
+      `tests/render_push_probe`: same triangle again, one variable changed
+      — the fragment colour comes from `vkCmdPushConstants` instead of
+      being hardcoded. Checked against the *specific pushed value*
+      (`66cc33ff`), not a separately-hardcoded expectation, so a shader
+      silently falling back to a stale value would show up as a mismatch.
+      190/66/0 again, pushed colour exact. Fourth hardware-risk probe in a
+      row clean on the first attempt.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process

@@ -1643,3 +1643,32 @@ Three real hardware-risk probes in a row now, all clean on the first
 attempt: render-pass entry, a full draw, and vertex fetch. Still
 unexercised, per the list above: descriptor sets, push constants,
 textures, depth/stencil, multiple draws in one pass.
+
+## Push constants reach a graphics-stage fragment shader too
+
+Fourth probe, same session, one more variable: `tests/render_push_probe`
+takes `render_vbo_probe`'s exact triangle and changes only the fragment
+shader's colour source, from hardcoded to a push constant
+(`layout(push_constant) uniform PushConstants { vec4 color; } pc;`,
+`vkCmdPushConstants` with `VK_SHADER_STAGE_FRAGMENT_BIT`). Worth checking
+separately from `driver_pipeline_probe`'s already-proven compute push
+constants: the graphics pipeline is different code (no IDVS, no tiler, no
+fragment stage on the compute side), so that result implied nothing here.
+
+The check is stricter than the earlier probes': it compares against the
+*specific value pushed at record time* (`66cc33ff`, deliberately not the
+magenta earlier probes used), not a hardcoded expectation living
+separately in the file - so a fragment shader that silently fell back to
+some other value (a stale register, zero-initialised memory, a leftover
+from a previous run) would show up as a mismatch rather than an accidental
+pass.
+
+Ran twice. Both times: 190 clear-colour, 66 pushed-colour, 0 other -
+again an exact match with the earlier probes' split on the same geometry,
+and the pushed colour came back byte-exact. Device confirmed healthy after
+via `driver_compute_probe --fill` and `render_vbo_probe`, both clean.
+
+Four hardware-risk probes run this session, four clean on the first
+attempt: render-pass entry, a full draw, vertex fetch, push constants.
+Still unexercised: descriptor sets, textures, depth/stencil, multiple
+draws in one render pass.
