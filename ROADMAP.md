@@ -1167,11 +1167,18 @@ Tools worth knowing about before touching any of this:
       a null `ANativeActivity*` upstream in `tcuAndroidPlatform.cpp`, not
       a driver defect). Device confirmed healthy after. See
       `docs/kbase-notes.md` for the full writeup.
+- [x] **First external rendering test passes** (2026-08-01):
+      `dEQP-VK.api.smoke.*` (CTS's own purpose-built first-thing-to-run
+      group), 6/6 pass, 4 of them real triangle renders through CTS's own
+      pipeline — independent confirmation of this driver's rendering path
+      beyond this repo's own probes. `dEQP-VK.api.*` as a whole is
+      267,166 cases (confirmed by dumping the case tree first, not
+      discovered by running it blind) — too large for one unattended run.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
-      driver issue). Next: broader non-rendering suites (`dEQP-VK.api.*`,
-      `dEQP-VK.query_pool.*`), one group at a time.
+      driver issue). Next: scoped `dEQP-VK.api.*` sub-groups and
+      `dEQP-VK.query_pool.*`, one group at a time, not the full tree.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is

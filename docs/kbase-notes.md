@@ -1932,9 +1932,37 @@ findings above - what it corroborates is the integration path itself: a
 standard, unmodified Vulkan test consumer, using only the documented
 loader/ICD contract, reaching this driver through nothing but the shim and
 getting back real, differentiated answers (some pass, some genuine
-conformance fails, one platform-layer crash unrelated to the driver). Next
-step is the same one CTS work always was headed toward - broader
-non-rendering suites first (`dEQP-VK.api.*`, `dEQP-VK.query_pool.*` and
-similar), each run and checked before the next, `dEQP-VK.info.platform`
+conformance fails, one platform-layer crash unrelated to the driver).
+
+## The first external rendering test passes: dEQP-VK.api.smoke.*
+
+`dEQP-VK.api.*` alone contains **267,166** cases (confirmed by dumping the
+case tree with `--deqp-runmode=stdout-caselist` before running anything -
+not a number to discover by attempting to run it unattended). Rather than
+starting a run that size blind, used CTS's own purpose-built entry point
+for exactly this situation: `dEQP-VK.api.smoke.*`, 6 cases, meant to be the
+first thing run against any new Vulkan implementation.
+
+```
+dEQP-VK.api.smoke.asm_triangle                 Pass (Rendering succeeded)
+dEQP-VK.api.smoke.asm_triangle_no_opname       Pass (Rendering succeeded)
+dEQP-VK.api.smoke.create_sampler               Pass (Creating sampler succeeded)
+dEQP-VK.api.smoke.create_shader                Pass (Creating shader module succeeded)
+dEQP-VK.api.smoke.triangle                     Pass (Rendering succeeded)
+dEQP-VK.api.smoke.unused_resolve_attachment    Pass (Rendering succeeded)
+```
+
+**6/6 pass, first attempt.** Four of the six actually render a triangle and
+read back the framebuffer, through CTS's own shader-compilation and
+pipeline-construction code - entirely independent of every render probe
+this repo wrote earlier in the session. This is the first external,
+standard-conformance-suite confirmation that this driver's rendering path
+works, not just this repo's own hand-written probes reporting success.
+Device confirmed healthy after via `driver_compute_probe --submit --fill`
+(clean).
+
+Next: broader non-rendering suites first (`dEQP-VK.api.*` scoped to
+sub-groups rather than the whole 267k-case tree at once, `dEQP-VK.query_pool.*`
+and similar), each run and checked before the next, `dEQP-VK.info.platform`
 excluded from future runs as a known upstream-CTS gap rather than
 re-triggered every time.
