@@ -1672,3 +1672,33 @@ Four hardware-risk probes run this session, four clean on the first
 attempt: render-pass entry, a full draw, vertex fetch, push constants.
 Still unexercised: descriptor sets, textures, depth/stencil, multiple
 draws in one render pass.
+
+## Descriptor sets work in a graphics pipeline too - the last basic mechanism
+
+Fifth probe, same session: `tests/render_ubo_probe` takes
+`render_push_probe`'s triangle and swaps the push constant for a uniform
+buffer read through a real descriptor set -
+`VkDescriptorSetLayout`/`VkDescriptorPool`/`VkAllocateDescriptorSets`/
+`VkUpdateDescriptorSets`/`vkCmdBindDescriptorSets`, the full allocation and
+binding path, not a shortcut. This was the last basic plumbing mechanism
+this port had not exercised in a graphics pipeline - a texture-sampling or
+transform-matrix shader needs the same binding machinery with a different
+descriptor type, not a new mechanism, so this was the gating unknown for
+"does anything resembling a real shader work."
+
+Same cross-check discipline as the push-constant probe: checked against
+the specific colour written into the UBO (`3399ccff`, a third distinct
+value from every earlier probe), not a hardcoded expectation. Ran twice.
+Both times: 190 clear-colour, 66 UBO-colour, 0 other - the same exact
+split every probe on this geometry has gotten, and the UBO's specific
+colour came back byte-exact. Device confirmed healthy after via
+`driver_compute_probe --fill` and `render_push_probe`, both clean.
+
+**Five hardware-risk probes run this session, five clean on the first
+attempt:** render-pass entry, a full draw, vertex fetch, push constants,
+descriptor sets. Every basic Vulkan plumbing mechanism a simple textured,
+transformed shader would need is now proven except sampled images
+specifically and multi-attachment/depth state. Still unexercised: textures
+(a `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` binding, not fundamentally
+different from what this probe just proved, but untested), depth/stencil,
+multiple draws in one render pass.

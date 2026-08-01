@@ -1062,6 +1062,16 @@ Tools worth knowing about before touching any of this:
       silently falling back to a stale value would show up as a mismatch.
       190/66/0 again, pushed colour exact. Fourth hardware-risk probe in a
       row clean on the first attempt.
+- [x] **Descriptor sets — done, same session.** `tests/render_ubo_probe`:
+      same triangle, one variable changed — the fragment colour comes from
+      a uniform buffer through a real, full `VkDescriptorSetLayout` /
+      `VkDescriptorPool` / `vkCmdBindDescriptorSets` path instead of a push
+      constant. Checked against the specific UBO value (`3399ccff`), a
+      third distinct colour from every earlier probe. 190/66/0 again.
+      Fifth hardware-risk probe in a row clean on the first attempt — the
+      last basic plumbing mechanism a graphics pipeline needs, proven.
+      What's left (textures, depth/stencil, multi-draw) is variation on
+      this and the earlier probes, not a new mechanism.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process

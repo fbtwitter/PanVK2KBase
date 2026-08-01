@@ -199,6 +199,22 @@ render_push_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py push_frag.spv \
 	    push_frag_spv.h render_push_probe_frag
 
+# One variable changed from render_push_probe: the fragment colour comes
+# from a uniform buffer through a real descriptor set instead of a push
+# constant - the last basic plumbing mechanism this port had not
+# exercised. Same --i-know-it-hangs gate.
+render_ubo_probe: ./src/tests/render_ubo_probe/render_ubo_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_ubo_probe -o ./build/render_ubo_probe $<
+
+render_ubo_probe_shaders:
+	cd ./src/tests/render_ubo_probe && \
+	  glslangValidator -V ubo.vert -o ubo_vert.spv && \
+	  glslangValidator -V ubo.frag -o ubo_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py ubo_vert.spv \
+	    ubo_vert_spv.h render_ubo_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py ubo_frag.spv \
+	    ubo_frag_spv.h render_ubo_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's
