@@ -1397,6 +1397,20 @@ Tools worth knowing about before touching any of this:
       trying both `--deqp-case` lists and ordered `--deqp-caselist-file`).
       See `docs/kbase-notes.md` for the full reasoning, evidence, and next
       step.
+- [x] **Built `tests/render_secondary_warmup_probe`: clean negative result**
+      (2026-08-01). Tested on hardware whether `many_indirect_draws_on_secondary`
+      shares `record_many_draws_secondary_2`'s cold-start bug: one indirect
+      draw from a secondary command buffer, as the first secondary op in
+      the process, then a warm-up draw, then the same indirect draw again.
+      **Both rounds passed cleanly, first attempt** — ruling out the simple
+      "same bug, different case" hypothesis. Whatever breaks CTS's own test
+      needs something this probe didn't replicate: draw volume (CTS issues
+      4096 indirect draws, this probe issued 1), point-list topology
+      (vs. triangle list), or target size (64×64 vs. 16×16). Device
+      confirmed healthy after. Next step, not attempted this pass: scale
+      the same probe's cold round toward CTS's actual shape to isolate
+      which factor is load-bearing. See `docs/kbase-notes.md` for full
+      detail.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

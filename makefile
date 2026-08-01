@@ -261,6 +261,27 @@ render_multidraw_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py multidraw_frag.spv \
 	    multidraw_frag_spv.h render_multidraw_probe_frag
 
+# Tests whether the cold-start bug found in CTS's
+# record_many_draws_secondary_2 (fails 100% of the time as the FIRST
+# secondary-command-buffer draw in a process, passes after any other
+# secondary draw ran first - see docs/kbase-notes.md) also covers
+# many_indirect_draws_on_secondary. deqp-vk's own fixed alphabetical case
+# order made this untestable through CTS case selection alone. Same
+# --i-know-it-hangs gate as every render probe, though the actual risk is
+# lower here - deqp-vk has already run this exact combination (secondary
+# buffer + indirect draw) many times this session without hanging.
+render_secondary_warmup_probe: ./src/tests/render_secondary_warmup_probe/render_secondary_warmup_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_secondary_warmup_probe -o ./build/render_secondary_warmup_probe $<
+
+render_secondary_warmup_probe_shaders:
+	cd ./src/tests/render_secondary_warmup_probe && \
+	  glslangValidator -V warmup.vert -o warmup_vert.spv && \
+	  glslangValidator -V warmup.frag -o warmup_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py warmup_vert.spv \
+	    warmup_vert_spv.h warmup_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py warmup_frag.spv \
+	    warmup_frag_spv.h warmup_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

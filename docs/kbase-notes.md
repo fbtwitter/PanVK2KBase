@@ -2943,3 +2943,65 @@ indirect-draw-specific issue - genuinely unresolved, and the next concrete
 step (a small warm-up probe) is now precisely scoped. Device confirmed
 healthy after every run in this investigation via
 `driver_compute_probe --submit --fill`.
+
+## The warm-up probe: a clean negative result, ruling out the simple unification
+
+Built `tests/render_secondary_warmup_probe` to test the hypothesis directly
+on hardware, since `deqp-vk`'s fixed alphabetical case-execution order made
+it untestable through CTS case selection alone. Three rounds, same device,
+same process - the same shape that proved the cold-start mechanism for
+`record_many_draws_secondary_2`:
+
+1. **Cold**: one `vkCmdDrawIndirect` recorded into a secondary command
+   buffer, executed via a primary within a dynamic-rendering render pass
+   (`VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT`,
+   `VkCommandBufferInheritanceRenderingInfo` for the secondary's begin) -
+   as the very first secondary-buffer operation in the process.
+2. **Warm-up**: an ordinary, non-indirect draw from a secondary buffer, to
+   a throwaway target - exactly the kind of draw that fixed
+   `record_many_draws_secondary_2` when run first.
+3. **Warm**: the identical indirect-draw-from-secondary as round 1, on a
+   fresh target, after the warm-up.
+
+Reused `render_vbo_probe`'s exact shaders (`warmup.vert`/`.frag`, copied
+verbatim - vertex-buffer-fetched position and fixed magenta output, both
+already proven, neither under test here) so only the mechanism actually
+being tested - secondary command buffers plus indirect draws - was new.
+Ran with `--i-know-it-hangs` per this repo's render-probe convention,
+though the real hang risk was lower than usual: `deqp-vk` itself had
+already executed this exact combination (secondary buffer + indirect
+draw) many times this session without ever hanging, only ever producing
+wrong pixels.
+
+**Result: both rounds passed cleanly, first attempt.**
+
+```
+[cold indirect result] 190 clear, 66 triangle, 0 other (of 256 total)
+[warm indirect result] 190 clear, 66 triangle, 0 other (of 256 total)
+```
+
+The cold round - a single indirect draw from a secondary command buffer,
+as the first secondary op ever in the process - rendered correctly. This
+is a real, clean negative result, not an inconclusive one: it rules out
+the simple hypothesis that `many_indirect_draws_on_secondary` is the exact
+same cold-start bug as `record_many_draws_secondary_2`, landing on the
+alphabetically-first case. Whatever breaks CTS's own test is not "any
+indirect draw from a secondary buffer while cold" - something more
+specific to that test's actual shape must be involved. Candidates this
+probe did not replicate and has not ruled out: the sheer volume (CTS's
+test issues 4096 separate `vkCmdDrawIndirect` calls in one secondary
+buffer, this probe issued 1), the primitive topology (CTS uses a point
+list, this probe a triangle list), or the target size (CTS renders to
+64x64, this probe to 16x16 to match every other probe's established
+baseline). Device confirmed healthy after via
+`driver_compute_probe --submit --fill`.
+
+**Where this leaves it**: `record_many_draws_secondary_2` remains fully
+characterized as a genuine cold-start bug (from the prior CTS-only
+investigation). `many_indirect_draws_on_secondary` is now confirmed
+**not** simply the same bug - it needs its own investigation, most
+directly by scaling this same probe's cold round up toward CTS's actual
+4096-draw, point-list, 64x64 shape to find which specific factor (volume,
+topology, or size) is load-bearing, rather than guessing further. Not
+attempted in this pass - the probe and its clean negative result are the
+deliverable, not a full re-investigation.
