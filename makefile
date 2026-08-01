@@ -147,6 +147,25 @@ driver_pipeline_probe: ./src/tests/driver_pipeline_probe/driver_pipeline_probe.c
 render_clear_probe: ./src/tests/render_clear_probe/render_clear_probe.c
 	$(CC) $(CFLAGS) -o ./build/render_clear_probe $<
 
+# A real triangle - vertex shader, IDVS, tiling, fragment shader - the step
+# after render_clear_probe proved render-pass entry works. Same
+# --i-know-it-hangs gate, for the same reason: nothing here has run on this
+# device before either.
+render_triangle_probe: ./src/tests/render_triangle_probe/render_triangle_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_triangle_probe -o ./build/render_triangle_probe $<
+
+# Regenerate the embedded triangle shaders. Only needed after editing
+# triangle.vert/.frag - the generated headers are committed so a normal
+# build needs no glslang.
+render_triangle_probe_shaders:
+	cd ./src/tests/render_triangle_probe && \
+	  glslangValidator -V triangle.vert -o triangle_vert.spv && \
+	  glslangValidator -V triangle.frag -o triangle_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py triangle_vert.spv \
+	    triangle_vert_spv.h render_triangle_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py triangle_frag.spv \
+	    triangle_frag_spv.h render_triangle_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

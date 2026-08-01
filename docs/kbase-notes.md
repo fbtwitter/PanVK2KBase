@@ -1587,3 +1587,33 @@ in the docs and roadmap - it read as settled. The lesson generalises past
 this one finding: a conclusion that was correct when written can become
 stale as the surrounding code changes shape, and the way to catch that is
 re-reading the source behind a claim, not re-reading the claim.
+
+## A real triangle renders correctly on kbase
+
+Same session, immediately after the finding above, with the same
+`--i-know-it-hangs` caution: `tests/render_triangle_probe` is the actual
+draw call that `render_clear_probe` deliberately did not attempt. A vertex
+shader (hardcoded positions, indexed by `gl_VertexIndex`, no vertex
+buffers) through this driver's real compiler for the first time on a
+graphics stage, `vkCmdDraw(3, 1, 0, 0)`, IDVS, tiling, and a fragment
+shader (hardcoded magenta, no descriptor sets) - a 16x16 render target,
+triangle covering roughly the lower-left half with margin so a correct
+result has to show partial coverage, not all-or-nothing.
+
+**It rendered correctly. Twice, reproducibly, device fully healthy after**
+- confirmed by re-running both `driver_compute_probe --fill` and
+`render_clear_probe` clean immediately after. Readback: 190 clear-colour
+pixels, 66 triangle-colour pixels, **zero pixels holding anything else** -
+no garbage, no stale memory, no blended-edge artifacts, an exact two-colour
+result with real geometric coverage. `vkCreateGraphicsPipelines` compiled
+both shaders (Bifrost, not the precompiled path
+`tests/driver_compute_probe` used), `vkQueueSubmit` was accepted by the
+loosened gate, and the fence signalled from the GPU.
+
+This is the first triangle this project has ever rendered, and the first
+real graphics-pipeline execution on kbase in this repo. Same discipline as
+above: this proves a non-`simul_use` draw with no descriptors and no
+vertex buffers works. It does not yet prove descriptor sets, push
+constants, textures, depth/stencil, multiple draws in one render pass, or
+anything Vulkan-conformance-shaped - each of those is its own
+first-time-on-this-device unknown, not implied by this result.

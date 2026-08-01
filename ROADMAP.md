@@ -1031,17 +1031,28 @@ Tools worth knowing about before touching any of this:
       `docs/kbase-notes.md`'s "Non-simul_use rendering works". Recorded
       here rather than only in "Where this actually is" because it is real
       Phase 5 progress, not a Phase 4 status update.
-- [ ] **Not done: an actual draw.** `render_clear_probe` deliberately
-      recorded zero draw calls, to isolate render-pass entry from
-      rasterization. A real `vkCmdDraw` — vertex input, IDVS, a fragment
-      shader actually running per-pixel — is genuinely untested and could
-      surface its own first-time issues on this device, separate from
-      everything resolved above. This is the actual next step, not
-      attempted in the same pass that found the render-pass-entry fix per
-      the caution that produced it.
-- [ ] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
-      The clear-only probe already does the "render to a buffer" and
-      "diff pixels" halves of this; what remains is a real triangle.
+- [x] **A real triangle — done, 2026-08-01, same session.**
+      `tests/render_triangle_probe`: vertex shader (no vertex buffers,
+      positions indexed by `gl_VertexIndex`) through this driver's real
+      compiler on a graphics stage for the first time, `vkCmdDraw`, IDVS,
+      tiling, a fragment shader (hardcoded colour, no descriptor sets).
+      16x16 target, partial-coverage triangle so the result can't pass by
+      accident. Ran clean twice on the Poco X8 Pro: 190 clear-colour + 66
+      triangle-colour + **0 other** pixels, device fully healthy after
+      (compute and clear-only probes both re-ran clean). First triangle
+      this project has ever rendered. Full writeup:
+      `docs/kbase-notes.md`'s "A real triangle renders correctly on
+      kbase".
+      **Still not exercised:** descriptor sets, push constants, textures,
+      depth/stencil, multiple draws per render pass — each its own
+      first-time unknown, not implied by this result.
+- [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
+      Substance done by the two probes above (render to a buffer, diff
+      pixels programmatically); no PNG dump exists, since the in-process
+      byte comparison already proves correctness without needing a human
+      to look at an image. Add a PNG dump only if visual inspection
+      becomes useful for a harder case — not needed for what's been
+      tested so far.
 
 ## Phase 6 — WSI and Android driver packaging
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
