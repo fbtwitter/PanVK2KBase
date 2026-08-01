@@ -2692,3 +2692,54 @@ session.
 run to completion with a longer timeout (each case does real GPU work, so
 it is slow rather than risky), and `dEQP-VK.query_pool.*` per the
 standing plan - none attempted yet this pass.
+
+## Fixed: vkDestroyDevice(VK_NULL_HANDLE) segfault
+
+First of the two `SIGSEGV` crashes above triaged and fixed. Symbolized
+the crash tombstone against the **unstripped** local build of the driver
+(`third_party/VK-GL-CTS/build-android/.../deqp-vk` and
+`/opt/mesa-src/build-android/.../libvulkan_panfrost.so` - both still
+present locally from the earlier build, never stripped except the
+*deployed* copy of `deqp-vk`) with the NDK's own `llvm-addr2line`,
+entirely from userspace, no root needed:
+
+```
+llvm-addr2line -e libvulkan_panfrost.so -f -C -i 0x995510
+-> panvk_DestroyDevice
+   panvk_physical_device.c:0
+```
+
+`panvk_DestroyDevice()` (`src/panfrost/vulkan/panvk_physical_device.c`,
+plain upstream PanVK code - not one of this repo's own kbase-specific
+files, and not copied in by `wsl-build.sh`) dereferences the device
+handle before checking whether it's `VK_NULL_HANDLE`:
+
+```c
+VK_FROM_HANDLE(panvk_device, device, _device);
+struct panvk_physical_device *physical_device =
+   to_panvk_physical_device(device->vk.physical);   /* segfault: device == NULL */
+```
+
+Every Vulkan `vkDestroy*`/`vkFree*` command accepts `VK_NULL_HANDLE` for
+the object being destroyed as a defined no-op - `vkDestroyDevice` is no
+exception, and `dEQP-VK.api.null_handle.destroy_device` exercises exactly
+that. The tombstone's fault address (`0x70`) lines up with
+`vk_device.physical`'s offset inside the struct, confirming exactly where
+the null dereference lands.
+
+Fixed via `src/mesa/patch-panvk-null-device-destroy.py`, a new hand-run
+idempotent patch script matching this directory's existing
+`patch-panvk-kbase-*.py` convention - except **not kbase-specific**:
+this bug and fix are in shared PanVK code also used by the panthor and
+panfrost backends, so it's named without `kbase` and is a real candidate
+for reporting upstream once verified against actual Mesa (not just this
+repo's vendored checkout) - matching this project's standing discipline
+of verifying on hardware before treating anything as a conclusion.
+Rebuilt, deployed, and verified: `dEQP-VK.api.null_handle.destroy_device`
+now passes (`Pass (OK: no observable change)`), the full
+`dEQP-VK.api.null_handle.*` group passes 23/24 (1 correctly
+`NotSupported`, no regressions), and `driver_compute_probe --submit
+--fill` stayed clean throughout.
+
+Second crash (`create_instance_device_intentional_alloc_fail`) not yet
+triaged - deeper dig, tracked separately.

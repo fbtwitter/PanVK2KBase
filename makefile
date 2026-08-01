@@ -420,6 +420,7 @@ mesa-backend-sync:
 	@echo "  - src/mesa/patch-panthor-csif-dispatch.py   <mesa-dir>  (csif props)"
 	@echo "  - src/mesa/patch-panvk-kbase-queue.py       <mesa-dir>  (GPU queue)"
 	@echo "  - src/mesa/patch-panvk-kbase-subqueue-init.py <mesa-dir> (subqueue init)"
+	@echo "  - src/mesa/patch-panvk-null-device-destroy.py <mesa-dir> (null-handle vkDestroyDevice, not kbase-specific)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
 # <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to

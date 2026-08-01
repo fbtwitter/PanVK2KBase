@@ -1335,6 +1335,23 @@ Tools worth knowing about before touching any of this:
       bug), and `version_check.unavailable_entry_points`. See
       `docs/kbase-notes.md` for full classification and the exact
       exclusion list.
+- [x] **Fixed: `vkDestroyDevice(VK_NULL_HANDLE)` segfault** (2026-08-01).
+      Symbolized the crash tombstone against the unstripped local build
+      with the NDK's own `llvm-addr2line` (no root needed) — pinpointed
+      to `panvk_DestroyDevice()` (`panvk_physical_device.c`, plain
+      upstream PanVK code, not kbase-specific) dereferencing the device
+      handle before checking for `VK_NULL_HANDLE`, which every
+      `vkDestroy*` command must accept as a no-op. Fixed via
+      `src/mesa/patch-panvk-null-device-destroy.py`, a new hand-run
+      idempotent patch following the existing `patch-panvk-kbase-*.py`
+      convention but deliberately not named `kbase` — this bug/fix is
+      shared PanVK code, a real candidate for upstreaming once verified
+      against actual Mesa. Rebuilt, deployed, verified:
+      `dEQP-VK.api.null_handle.destroy_device` passes, the full
+      `null_handle.*` group is 23/24 (1 correctly `NotSupported`, no
+      regressions). Second crash
+      (`create_instance_device_intentional_alloc_fail`) not yet
+      triaged — deeper dig, tracked separately.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
