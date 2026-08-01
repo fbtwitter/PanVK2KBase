@@ -1,5 +1,34 @@
 # Architecture notes
 
+**Status (2026-08-01): historical.** Everything below was written as
+pre-work analysis, before any of it existed — the "Action item" at the
+end of the first section literally says "before writing a
+`pan_kmod_kbase.c` backend, go read...". That backend has existed for a
+long time now, and every problem this document treats as open is solved:
+
+- **Device probe** — `pan_kmod_kbase.c` + the enumeration patch
+  (`src/mesa/patch-panvk-kbase-enumeration.py`).
+- **BO/VM management** — `pan_kmod_kbase.c`, with the SAME_VA/cookie and
+  FIXED_VA design this doc flags as needing "real design decisions" both
+  resolved and documented in `docs/kbase-notes.md`.
+- **Submission + sync, called out below as "the hardest part... where to
+  expect the most iteration"** — correctly predicted. The kbase-specific
+  sibling to `panvk_vX_gpu_queue.c` this document says will be needed is
+  `src/mesa/panvk_vX_kbase_queue.c`, 1294 lines. Compute runs end to end
+  on real hardware (application SPIR-V, `vkCmdDispatch`, GPU-signalled
+  fences, 2000 back-to-back submits with no failures), binary and
+  timeline semaphores work, and as of today, rendering does too — a real
+  triangle, vertex buffers, push constants, descriptor sets, texture
+  sampling, depth test/write, multiple draws per pass, each proven with
+  its own hardware probe in `src/tests/render_*_probe/`.
+
+Kept below for the reasoning — the seam diagram, the Turnip/kgsl
+precedent, and the JM-vs-CSF call are all still accurate background - but
+treat every "needs adapting" / "still unsolved" / "action item" past this
+point as describing the state before this backend was built, not the
+state now. For the current, accurate picture: `ROADMAP.md` (Phase 4's
+"Where this actually is", Phase 5's checkboxes) and `docs/kbase-notes.md`.
+
 ## The core mismatch: kbase is not a DRM driver
 
 Every Mesa Vulkan driver's physical-device enumeration path assumes it's
