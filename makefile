@@ -140,6 +140,13 @@ driver_compute_probe: ./src/tests/driver_compute_probe/driver_compute_probe.c
 driver_pipeline_probe: ./src/tests/driver_pipeline_probe/driver_pipeline_probe.c
 	$(CC) $(CFLAGS) -I./src/tests/driver_pipeline_probe -o ./build/driver_pipeline_probe $<
 
+# The first real VERTEX_TILER/FRAGMENT execution ever attempted on kbase in
+# this repo - a render pass with LOAD_OP_CLEAR and no draw calls, gated the
+# way tests/alias_cs_probe is. Requires --i-know-it-hangs to run. See the
+# file header before running this on a device.
+render_clear_probe: ./src/tests/render_clear_probe/render_clear_probe.c
+	$(CC) $(CFLAGS) -o ./build/render_clear_probe $<
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

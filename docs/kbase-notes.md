@@ -1496,3 +1496,94 @@ in this area looks identical from outside - a fence that never signals - so
 the log is the only thing that distinguishes "not kicked" from "kicked and
 ignored" from "still running". `PANVK_KBASE_KICK_LOG_AFTER=1` adds a sample
 2ms later, which is what shows a kick returning 0 and doing nothing.
+
+## Non-simul_use rendering works - the ringbuf blocker was narrower than stated
+
+"Rendering is blocked on the ringbuf" has been this repo's and the
+roadmap's conclusion since the `MEM_ALIAS` section above. Re-checking that
+conclusion against Mesa's actual source (2026-08-01, `/opt/mesa-src`,
+26.3.0-devel) while looking for unblocked work found it was broader than
+the real hazard, and confirming that on real hardware turned out to
+**unblock non-simultaneous-use rendering outright.**
+
+### What the source actually says
+
+Every reference to `render.desc_ringbuf` in `panvk_vX_cmd_draw.c` - all 10
+of them, read individually rather than sampled - is conditional on
+`VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT` (`simul_use`):
+`get_tiler_desc()`'s choice between the ringbuf and a per-command-buffer
+descriptor pool (`simul_use ? ringbuf : panvk_cmd_alloc_desc_array(...)`),
+the FBD patch-copy (`copy_fbds = simul_use && cmdbuf->state.gfx.render.tiler`,
+with the code's own comment: *"if... not simultaneous use of the command
+buffer, we can avoid the copy"*), and the producer/consumer release pair at
+the end of the fragment stream (`free_render_descs = simul_use &&
+needs_tiling`). `panvk_vX_gpu_queue.c`'s two references - context init and
+`PANVK_DEBUG(TRACE)` readback - are already correctly gated on `is_kbase`
+or only fire under a tracing build. And the other render-subqueue fields a
+real draw needs - `render.tiler_heap`, `render.geom_buf`, the tiler-OOM
+scratch FBD - are already set unconditionally and correctly on kbase, from
+this repo's tiler-heap work.
+
+So a command buffer recorded **without** `SIMULTANEOUS_USE` never touches
+the zeroed ringbuf field anywhere in the shared PanVK path. What was
+actually stopping it was this repo's own submit-time gate in
+`collect_cmdbuf_calls()` (`panvk_vX_kbase_queue.c`), which refused any
+stream requesting tiler/IDVS/fragment resources regardless of `simul_use` -
+more conservative than the hardware needed.
+
+### The fix, and the measurement
+
+The gate now requires `simul_use` alongside the resource-mask check,
+matching how Mesa's own code computes the identical distinction
+(`free_render_descs = simul_use && needs_tiling`). Rebuilt and run against
+the existing regression set first (`driver_enum_probe`, the external-memory
+gate, `driver_compute_probe --fill`, `driver_pipeline_probe`,
+`driver_semaphore_probe`) to confirm the loosening changed nothing for
+compute - 0 failures, all five.
+
+Then `tests/render_clear_probe` - a render pass with `LOAD_OP_CLEAR` /
+`STORE_OP_STORE` and **no draw calls**, deliberately smaller than a
+triangle so it isolates "does VERTEX_TILER/FRAGMENT execute at all" from
+"does rasterization produce correct output" - run on the Poco X8 Pro,
+gated behind `--i-know-it-hangs` the way `tests/alias_cs_probe` is, since
+this is the first real VERTEX_TILER/FRAGMENT execution ever attempted on
+this device in this repo and the static analysis above is software-side
+only.
+
+**It worked. Twice, reproducibly, with the device fully healthy
+afterward** - `driver_compute_probe --fill` re-run clean immediately after.
+`vkQueueSubmit` returned `0` (the gate accepted the stream), the fence
+signalled from the GPU, and the readback buffer held the exact clear colour
+(`2ab35cff`) in all 16 pixels - not a silently-skipped clear, not stale
+memory, the GPU actually ran `FRAGMENT`'s clear path and the result came
+back correct.
+
+### What this does and does not mean
+
+**Does:** a real render pass - entering and leaving one, with a clear - now
+works on kbase, for command buffers that avoid `SIMULTANEOUS_USE`. That is
+most real usage; it is an opt-in flag most application and test code never
+sets. The upstream ringbuf question
+(`docs/upstream-ringbuf-question.md`) is still worth its answer, but Phase
+5 (headless triangle) is **not** blocked on it the way the roadmap said.
+
+**Does not, yet:** prove an actual draw call works. This probe deliberately
+recorded zero draws, to isolate the render-pass-entry hazard (the one just
+retired) from rasterization, IDVS, or pipeline correctness, which are
+untested here and could still surface their own first-time-on-this-device
+issues. That is the next, separate step - not taken in this pass, and not
+to be taken without a fresh check-in given what a real fault costs here.
+
+### Why this stayed hidden until now
+
+Two things share the blame. First, "rendering is blocked on the ringbuf"
+was true when it was concluded - it was written *before* the driver's own
+submit-time gate existed in its current form, and the gate was written
+conservatively (block all render-work resource requests) rather than
+precisely (block only the ones that touch the actual hazard), which was the
+reasonable choice at the time given how little was known. Second, nobody
+had reason to re-derive the conclusion once it was load-bearing elsewhere
+in the docs and roadmap - it read as settled. The lesson generalises past
+this one finding: a conclusion that was correct when written can become
+stale as the surrounding code changes shape, and the way to catch that is
+re-reading the source behind a claim, not re-reading the claim.

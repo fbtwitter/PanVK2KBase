@@ -912,12 +912,29 @@ compute subqueue's stream — even though a standalone probe cannot reproduce
 the rule that wait is built on. That disagreement is unexplained and is the
 open question in this area.
 
-**Compute works. Rendering does not, and the one thing blocking it is the
-render descriptor ringbuf** — `init_render_desc_ringbuf()` maps one BO at
-two adjacent GPU VAs, and kbase cannot express that (see the `MEM_ALIAS`
-section in `docs/kbase-notes.md` for why, measured and then confirmed
-against the kernel source). The fix is a change to *shared* PanVK code, not
-to this backend, which is why `docs/upstream-ringbuf-question.md` exists.
+**Compute works. Rendering works too, for command buffers that avoid
+`VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT` — this line was wrong until
+2026-08-01.** The render descriptor ringbuf was believed to block all
+rendering; re-checking that against Mesa's actual source found the real
+hazard was narrower — every touch of `render.desc_ringbuf` in
+`panvk_vX_cmd_draw.c` is conditional on `simul_use` — and this repo's own
+submit-time gate was refusing render work more conservatively than the
+hardware needed. Loosened and verified on-device: `tests/render_clear_probe`
+(a render pass, `LOAD_OP_CLEAR`/`STORE_OP_STORE`, deliberately no draw
+calls) ran to completion twice, reproducibly, with a byte-correct readback
+and the device fully healthy afterward. Full writeup, including why the old
+conclusion was reasonable when it was written and what stayed untested:
+`docs/kbase-notes.md`'s "Non-simul_use rendering works" section.
+
+**What is still actually true:** `init_render_desc_ringbuf()` maps one BO at
+two adjacent GPU VAs, and kbase genuinely cannot express that (see the
+`MEM_ALIAS` section in `docs/kbase-notes.md`) — so `SIMULTANEOUS_USE`
+rendering is still blocked, and the fix for that is still a change to
+*shared* PanVK code, which is why `docs/upstream-ringbuf-question.md`
+exists and is still worth its answer. And **no actual draw call has been
+tested** — `render_clear_probe` deliberately recorded zero draws, to
+isolate the render-pass-entry hazard just retired from IDVS/rasterization
+correctness, which is genuinely new, untested territory of its own.
 
 **That question is now sent** (2026-08-01), as a Mesa GitLab issue. It was
 re-checked against the tree it describes before going out, which changed it
@@ -950,9 +967,12 @@ advertises dma-buf sharing it cannot do
 the `BELONGS-UPSTREAM` tags now mark every place this port stands in for
 work that belongs elsewhere.
 
-So the project is genuinely gated on the ringbuf answer, and inventing
-parallel work would mostly be busywork. Three things were worth doing while
-waiting, and all three are now done:
+**This section previously said the project was genuinely gated on the
+ringbuf answer. That is no longer true** — see the correction above the
+Phase 4 status. What actually happened while looking for unblocked parallel
+work: the search itself found that Phase 5 doesn't need the ringbuf answer
+at all, only a scoped local fix. Three narrower things were also worth
+doing, and all three are done:
 
 - **Rebuilt and verified the external-memory gate** — compiles against the
   Android cross toolchain, links, the driver still enumerates, and
@@ -1003,7 +1023,25 @@ Tools worth knowing about before touching any of this:
   cannot do for `/data/local/tmp` libraries itself.
 
 ## Phase 5 — Headless triangle
+- [x] **Entering and leaving a render pass — done, 2026-08-01.**
+      `tests/render_clear_probe`: a render pass with `LOAD_OP_CLEAR` /
+      `STORE_OP_STORE`, no draw calls, no `SIMULTANEOUS_USE`. Ran clean
+      twice on the Poco X8 Pro, byte-correct readback, device healthy
+      after. This was believed blocked on the ringbuf; it was not — see
+      `docs/kbase-notes.md`'s "Non-simul_use rendering works". Recorded
+      here rather than only in "Where this actually is" because it is real
+      Phase 5 progress, not a Phase 4 status update.
+- [ ] **Not done: an actual draw.** `render_clear_probe` deliberately
+      recorded zero draw calls, to isolate render-pass entry from
+      rasterization. A real `vkCmdDraw` — vertex input, IDVS, a fragment
+      shader actually running per-pixel — is genuinely untested and could
+      surface its own first-time issues on this device, separate from
+      everything resolved above. This is the actual next step, not
+      attempted in the same pass that found the render-pass-entry fix per
+      the caution that produced it.
 - [ ] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
+      The clear-only probe already does the "render to a buffer" and
+      "diff pixels" halves of this; what remains is a real triangle.
 
 ## Phase 6 — WSI and Android driver packaging
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
