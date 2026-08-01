@@ -1775,3 +1775,39 @@ shouldn't be necessary" is exactly the kind of workaround that needs to
 stay visible if it turns out to matter for the render descriptor ringbuf
 work or anything else that moves data between transfer and shader access
 on this device.
+
+## Depth test and depth write work, clean on the first attempt
+
+Seventh probe, same session: `tests/render_depth_probe` adds a real depth
+attachment to `render_vbo_probe`'s triangle - `VkPipelineDepthStencilState`
+with `depthTestEnable`/`depthWriteEnable` true and `depthCompareOp =
+LESS`, a `D32_SFLOAT` attachment cleared to `1.0`. The Z-test unit and
+depth write-back had no prior art in this repo at all - `docs/kbase-notes.md`
+had flagged this as untested territory before this session started.
+
+Learned from the texture probe immediately before it: went through an
+explicit `TRANSFER_SRC_OPTIMAL` intermediate stage for *both* attachments'
+readback from the start, rather than assuming a direct
+`ATTACHMENT_OPTIMAL -> TRANSFER` transition would work - since that
+assumption had just failed once, for a different attachment type, in the
+same session.
+
+Checked more strictly than any earlier probe: not just colour output, but
+the depth buffer itself, read back independently. Both matched exactly,
+both times run: **190 far-depth (`1.0`, the untouched clear value) + 66
+near-depth (`0.0`, the triangle) + 0 anything else** - the identical split
+colour rendering has produced on this geometry all session, now
+independently confirmed by a second hardware path. The Z-test unit wrote
+precisely where the rasterizer covered and nowhere else.
+
+Clean on the first attempt - no repeat of the texture probe's failure.
+Device confirmed healthy after via `driver_compute_probe --fill` and
+`render_texture_probe`, both clean.
+
+**Seven hardware-risk probes run this session: six clean on the first
+attempt, one (texture sampling) genuinely wrong on the first attempt and
+fixed with a documented, only-partially-understood change.** Between them:
+render-pass entry, a full draw, vertex fetch, push constants, descriptor
+sets, texture sampling, depth test/write. What is left for a
+conformance-shaped shader: multiple draws in one render pass, and
+everything CTS-scale (Phase 7) rather than basic-plumbing-scale.

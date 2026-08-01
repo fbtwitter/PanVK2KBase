@@ -231,6 +231,21 @@ render_texture_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py texture_frag.spv \
 	    texture_frag_spv.h render_texture_probe_frag
 
+# One variable changed from render_vbo_probe: a real depth attachment,
+# depth test and write enabled - the Z-test unit, untested until now. Same
+# --i-know-it-hangs gate.
+render_depth_probe: ./src/tests/render_depth_probe/render_depth_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_depth_probe -o ./build/render_depth_probe $<
+
+render_depth_probe_shaders:
+	cd ./src/tests/render_depth_probe && \
+	  glslangValidator -V depth.vert -o depth_vert.spv && \
+	  glslangValidator -V depth.frag -o depth_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py depth_vert.spv \
+	    depth_vert_spv.h render_depth_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py depth_frag.spv \
+	    depth_frag_spv.h render_depth_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

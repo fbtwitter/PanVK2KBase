@@ -1089,6 +1089,23 @@ Tools worth knowing about before touching any of this:
       live hypotheses. **First probe this session not clean on the first
       attempt** — worth remembering that the five-clean streak before it
       was real progress, not proof the next thing will also just work.
+- [x] **Depth test and depth write — done, same session, clean on the
+      first attempt.** `tests/render_depth_probe`: a real `D32_SFLOAT`
+      depth attachment, depth test/write enabled — the Z-test unit, no
+      prior art in this repo at all. Checked more strictly than any
+      earlier probe: both the colour output *and* the depth buffer itself,
+      read back independently. Both matched exactly, both runs — 190
+      far-depth + 66 near-depth + 0 other, the same split colour rendering
+      has produced all session, now confirmed by a second, independent
+      hardware path. No repeat of the texture probe's failure — applied
+      that lesson going in by using the `TRANSFER_SRC_OPTIMAL`
+      intermediate stage from the start rather than assuming the direct
+      transition would work.
+      **Seven hardware-risk probes this session: six clean on first
+      attempt, one fixed with a documented, partially-understood change.**
+      What remains for a conformance-shaped shader: multiple draws in one
+      render pass. Everything past that is CTS scale (Phase 7), not
+      basic-plumbing scale.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process
