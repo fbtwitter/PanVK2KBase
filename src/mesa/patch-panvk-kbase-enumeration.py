@@ -66,25 +66,55 @@ create_kbase_kmod_dev(struct panvk_physical_device *device,
    if (PANVK_DEBUG(NO_USER_MMAP_SYNC))
       flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
 
-   /* Do NOT probe with pan_kmod_fd_is_kbase() here. pan_kmod_dev_create()
-    * already calls it to pick the kbase backend, and
-    * KBASE_IOCTL_VERSION_CHECK may only be issued once per fd - a second
-    * call returns -EPERM. Probing here would make the dispatch's own probe
-    * the second one, so it would decide this isn't a kbase device and fall
-    * through to drmGetVersion(), which fails on a misc device. The whole
-    * kbase path would then silently never run.
+   /* Call pan_kmod_fd_is_kbase() directly here, exactly once, instead of
+    * going through pan_kmod_dev_create()'s dispatcher (which would call it
+    * again internally for the kbase branch). KBASE_IOCTL_VERSION_CHECK may
+    * only be issued once per fd - a second call returns -EPERM - so this
+    * is the *only* place that probe may happen for this fd. Calling
+    * kbase_kmod_ops.dev_create() directly afterward, rather than through
+    * the generic dispatcher, is what makes that possible: it is the exact
+    * same pair of calls pan_kmod_dev_create() makes internally for the
+    * kbase branch, just relocated to the caller.
+    *
+    * That relocation is also the fix for a real bug found via CTS
+    * (dEQP-VK.api.device_init.create_instance_device_intentional_alloc_fail):
+    * going through the generic dispatcher collapsed two different failure
+    * reasons - "this fd genuinely is not kbase" and "this fd is kbase but
+    * kbase_kmod_dev_create() failed for a real reason (host allocation,
+    * SET_FLAGS, GET_GPUPROPS, FIXED_VA heap init)" - into the same NULL
+    * return, indistinguishable by the caller. Both were reported as
+    * VK_ERROR_INCOMPATIBLE_DRIVER, which Mesa's vk_instance layer treats as
+    * "try DRM enumeration instead" - correct for the first case, but for
+    * the second it silently turned a genuine allocation failure into
+    * vkEnumeratePhysicalDevices succeeding with zero devices, which then
+    * crashed the CTS test (and would crash any real application) on the
+    * very next physical-device access. Calling both steps directly here
+    * lets the two cases be told apart and reported correctly.
     *
     * See tests/double_handshake_probe/ for the probe that established the
     * once-per-fd rule.
     */
-   device->kmod.dev = pan_kmod_dev_create(fd, flags, &instance->kmod.allocator);
+   uint16_t uk_major = 0, uk_minor = 0;
+   if (!pan_kmod_fd_is_kbase(fd, &uk_major, &uk_minor)) {
+      close(fd);
+      /* Genuinely not a kbase device - let DRM enumeration have a turn. */
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
+
+   const struct pan_kmod_driver kbase_drv_info = {
+      .version = {.major = uk_major, .minor = uk_minor},
+   };
+   device->kmod.dev = kbase_kmod_ops.dev_create(fd, flags, &kbase_drv_info,
+                                                &instance->kmod.allocator);
 
    if (!device->kmod.dev) {
       close(fd);
-      /* Not necessarily an error: the node may exist but not be kbase.
-       * Report incompatibility so DRM enumeration still gets a turn.
+      /* fd was already confirmed kbase above, so this is a genuine
+       * internal failure - not "wrong device". Must NOT be
+       * VK_ERROR_INCOMPATIBLE_DRIVER; see the comment above.
        */
-      return VK_ERROR_INCOMPATIBLE_DRIVER;
+      return panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
+                          "kbase device init failed");
    }
 
    if (PANVK_DEBUG(STARTUP))
