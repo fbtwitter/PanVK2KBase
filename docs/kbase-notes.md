@@ -2820,3 +2820,126 @@ visible.
 
 **Both `SIGSEGV` crashes found by this session's CTS widening are now
 fixed and verified on hardware.**
+
+## Triaging the remaining findings: three are not code bugs, one sharpened into a real cold-start lead
+
+The CTS widening pass left four more findings untriaged. Dispatched three
+parallel `Explore` agents (read-only) plus a direct read for the fourth.
+Three resolved to "not a code bug to fix"; one turned into a genuinely new
+and much sharper finding through a short, staged follow-up CTS session.
+
+### `driver_properties.conformance_version` - an honest signal, not a bug
+
+`get_conformance_version()` (`panvk_vX_physical_device.c:782-788`) returns
+`{1,4,1,2}` only for `PAN_ARCH == 10` (Mali-G610, PanVK's one
+officially-conformant target) and `{0,0,0,0}` for every other architecture,
+including this device's. The CTS check fails because reporting API version
+1.4 alongside conformance version 0.0 is spec-inconsistent - but `0.0.0.0`
+for an architecture that has genuinely never been conformance-tested is the
+*honest* answer, consistent with this driver's own explicit runtime warning
+("panvk is not a conformant Vulkan implementation, testing use only").
+Faking a conformance claim to pass the test would be actively wrong. No
+code change - accepted, expected failure.
+
+### `extension_duplicates.device.*` - confirmed resource-ceiling recurrence
+
+The `Explore` agent read the actual CTS source: duplication factor is small
+and bounded (2-4x per extension, never more), the requested extension set is
+identical to what hundreds of other passing cases already request, and
+PanVK's extension-enable walk (`vk_device.c:182-207`) is allocation-free -
+setting a bool flag twice costs nothing. Both `by_names` and `by_pointers`
+fail identically, which a real pointer/dedup bug would not produce but a
+device-level kernel `ENOMEM` would. Matches the closed resource-ceiling
+finding's exact signature (device creation succeeds, then the first real
+kbase allocation returns `ENOMEM`, unrelated to any property of the
+request). No code change - exclude these two leaves in future runs, same
+treatment as `object_management`'s already-excluded leaves.
+
+### `create_instance_layer_name_abuse` - confirmed architectural, not a driver gap
+
+Layer-name validation/rejection is the Vulkan **loader's** job, not the
+ICD's - confirmed by reading `vk_instance.c` (validates extensions, never
+reads `enabledLayerCount` at all) and grepping all of Mesa's drivers for
+`ppEnabledLayerNames` (zero ICDs touch it). This project's CTS runs go
+through `src/tests/icd_shim/panvk_kbase_icd_shim.c` directly - deliberately,
+to avoid installing the driver as the system Vulkan HAL - bypassing the
+loader entirely, so the layer-rejection stage this test expects structurally
+doesn't exist in the tested path. Adding non-standard layer validation to
+`panvk_CreateInstance` would diverge from every Mesa driver and be rejected
+upstream. This upgrades the earlier hypothesis ("doesn't implement layer
+validation yet") to a confirmed architectural attribution: it's an artifact
+of testing through a bare ICD, not a driver bug, and not fixable here
+without either a real loader in front of CTS or a non-upstreamable
+divergence. No code change - accepted limitation of this testing setup.
+
+### Secondary command buffer draws - sharpened into a real, specific cold-start lead
+
+The two rendering-correctness failures
+(`many_indirect_draws_on_secondary`, `record_many_draws_secondary_2`) got a
+genuinely new characterization through a short staged follow-up, not from
+code reading alone (the `Explore` agent traced the whole path - CTS test
+setup, `panvk_per_arch(CmdExecuteCommands)`, `collect_cmdbuf_calls()`,
+indirect-draw handling - and found the machinery structurally complete, no
+clear missing branch; low-to-medium confidence on any single cause from
+reading alone).
+
+Ran the two known failures alongside two structurally-similar variants that
+had never been tried: `record_many_draws_secondary_1` (a much smaller,
+128x128 version of the same secondary-buffer draw test) and
+`record_many_draws_primary_2` (the same heavy draw count, but from a
+**primary** buffer, no secondary/nesting at all). All four in one
+`deqp-vk` process:
+
+```
+many_indirect_draws_on_secondary   Fail (unchanged)
+record_many_draws_primary_2        Pass
+record_many_draws_secondary_1      Pass
+record_many_draws_secondary_2      Pass   <- previously failed in isolation!
+```
+
+`record_many_draws_secondary_2` passing here, after failing in the original
+CTS widening run, was the live wire. Re-ran it alone three times: **fails
+100% of the time in isolation.** Then ran `record_many_draws_secondary_1`
+(much smaller, otherwise the same shape) immediately before it in the same
+process: **`record_many_draws_secondary_2` passes.** This is fully
+deterministic and reproducible, not flakiness -
+`record_many_draws_secondary_2` fails if and only if it is the *first*
+secondary-command-buffer draw sequence executed in a fresh process; any
+prior secondary-buffer draw, however small, makes it pass. A classic
+cold-start / lazy-initialization bug signature: something set up once per
+process (not per-command-buffer, not per-draw) is either missing or wrong
+on its first use and self-corrects as a side effect of that first use
+happening at all, regardless of what specifically triggered it.
+
+Tried to test whether `many_indirect_draws_on_secondary` shares this exact
+mechanism, using `deqp-vk`'s own case selection to precede it with a
+warm-up case (`record_many_draws_secondary_1` or others) - both a
+comma-separated `--deqp-case` list and an explicitly ordered
+`--deqp-caselist-file` were tried, and neither changed execution order:
+`deqp-vk` walks its selected cases in a fixed order (alphabetical by full
+case path, not source-registration order or caselist-file order) regardless
+of how they were selected. Dumped the full sorted `command_buffers.*`
+caselist to check: the only cases that sort alphabetically before
+`many_indirect_draws_on_secondary` are `allocate_many_secondary` /
+`allocate_single_secondary` (allocate a secondary buffer, record and
+execute nothing) and `many_indirect_disps_on_secondary` (compute
+*dispatch*, not draw) - none of them actually draws, so none can serve as
+a warm-up case through `deqp-vk`'s own selection mechanism. Testing the
+same hypothesis for this case would need a small dedicated probe (record
+one trivial draw, then reproduce this test's exact sequence) rather than
+CTS case reordering - a well-scoped, still-cheap next step, but a new probe
+rather than "just run more CTS," and out of scope for this pass.
+
+**Where this leaves it**: `record_many_draws_secondary_2` is fully
+characterized - a deterministic, reproducible cold-start bug in whatever
+this driver initializes once per process for secondary-command-buffer
+draws (plausible candidates, not yet checked: lazy pipeline/shader setup
+specific to the secondary-execution path, first-time tiler/geometry-buffer
+sizing, or something in `cmd_prepare_exec_cmd_for_draws`/
+`cmd_inherit_render_state` that only runs correctly once already-warm
+state exists). `many_indirect_draws_on_secondary` may well be the exact
+same bug landing on the alphabetically-first case, or may be a distinct
+indirect-draw-specific issue - genuinely unresolved, and the next concrete
+step (a small warm-up probe) is now precisely scoped. Device confirmed
+healthy after every run in this investigation via
+`driver_compute_probe --submit --fill`.

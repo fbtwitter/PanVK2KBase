@@ -1376,6 +1376,27 @@ Tools worth knowing about before touching any of this:
       **Both `SIGSEGV` crashes found by this session's CTS widening are now
       fixed and verified on hardware.** See `docs/kbase-notes.md` for full
       reasoning.
+- [x] **Triaged the remaining four CTS findings** (2026-08-01). Three are
+      not code bugs: `driver_properties.conformance_version` (an honest
+      `{0,0,0,0}` for a non-conformance-tested architecture, not something
+      to fake); `extension_duplicates.device.*` (confirmed recurrence of
+      the closed resource-ceiling finding, not a real dedup bug — excluded
+      like `object_management`'s leaves); `create_instance_layer_name_abuse`
+      (confirmed architectural — layer validation is the loader's job, and
+      this project's CTS runs deliberately bypass the loader via the ICD
+      shim). The fourth — the two secondary-command-buffer rendering
+      failures — sharpened into a real, specific lead via a short staged
+      CTS follow-up (not code reading): `record_many_draws_secondary_2`
+      **fails 100% of the time in isolation, but passes if literally any
+      other secondary-buffer draw ran first in the same process** — a
+      deterministic cold-start/lazy-init bug, not flakiness or a volume
+      issue. `many_indirect_draws_on_secondary` may be the same bug landing
+      on the alphabetically-first case or a distinct one — testing that
+      needs a small dedicated probe (`deqp-vk`'s fixed alphabetical case
+      order makes it untestable via CTS case selection alone, confirmed by
+      trying both `--deqp-case` lists and ordered `--deqp-caselist-file`).
+      See `docs/kbase-notes.md` for the full reasoning, evidence, and next
+      step.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
