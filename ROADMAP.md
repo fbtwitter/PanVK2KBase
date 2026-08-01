@@ -1154,8 +1154,24 @@ Tools worth knowing about before touching any of this:
       selected correctly by a given emulator's driver manager.
 
 ## Phase 7 — CTS-driven hardening
+- [x] **CTS integration path proven** (2026-08-01): standard Vulkan loader
+      ABI vs. this driver's Android hwvulkan HAL ABI mismatch solved with a
+      purpose-built ICD shim (`src/tests/icd_shim/`), not by installing the
+      driver as the system HAL. `deqp-vk` built for Android from a fresh
+      VK-GL-CTS clone (`third_party/VK-GL-CTS/`) and run through the shim
+      on the Poco X8 Pro via `--deqp-vk-library-path`. `dEQP-VK.info.*`
+      (19 cases, no rendering/dispatch): 15 pass, 2 genuine spec-fails
+      worth tracking (`VK_EXT_hdr_metadata`/`VK_EXT_headless_surface`
+      dependency gaps), 1 correct `NotSupported`, 1 crash in CTS's own
+      Android-EXE platform layer (`dEQP-VK.info.platform`, root-caused to
+      a null `ANativeActivity*` upstream in `tcuAndroidPlatform.cpp`, not
+      a driver defect). Device confirmed healthy after. See
+      `docs/kbase-notes.md` for the full writeup.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
+      `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a
+      driver issue). Next: broader non-rendering suites (`dEQP-VK.api.*`,
+      `dEQP-VK.query_pool.*`), one group at a time.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is

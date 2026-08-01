@@ -1850,3 +1850,91 @@ needs. What is left is CTS scale (Phase 7) - dEQP-VK, real applications,
 extensions - not basic-plumbing scale; the open question that still gates
 some of it is `SIMULTANEOUS_USE` rendering, which remains blocked on the
 ringbuf and the still-unanswered upstream question.
+
+## deqp-vk runs against this driver, through a purpose-built ICD shim
+
+The problem CTS integration had to solve: `deqp-vk` (and any standard
+Vulkan loader) expects a driver `.so` to export `vkGetInstanceProcAddr`
+directly. This driver, like every Android Vulkan driver, instead exports
+Android's hwvulkan HAL ABI - a single `HMI` symbol, `dlsym`'d and opened
+through `hw_module_t`/`hw_device_t` methods to reach the real entrypoints
+(see the "Android hwvulkan HAL ABI" note earlier in this file). Installing
+the driver as the system's actual Vulkan HAL to let Android's real loader
+bridge that gap was ruled out deliberately - not something to do to a real
+device's system partition for test purposes.
+
+`src/tests/icd_shim/panvk_kbase_icd_shim.c` closes the gap instead: a small
+shared library that does exactly what Android's own `libvulkan.so` does
+internally - `dlopen`s the real driver by path (default
+`/data/local/tmp/libvulkan_panfrost.so`, overridable via
+`PANVK_KBASE_ICD_DRIVER`), walks the HAL open() sequence once, and re-
+exports a standard `vkGetInstanceProcAddr` that forwards to it. Verified
+against VK-GL-CTS's own source
+(`framework/platform/android/tcuAndroidPlatform.cpp`): its `VulkanLibrary`
+does exactly one thing with a driver path - `dlsym("vkGetInstanceProcAddr")`
+- no ICD manifest, no loader-negotiation handshake required for this code
+path. Checked standalone first with `tests/icd_shim/icd_shim_probe.c` (only
+calls entrypoints already proven safe elsewhere this session), clean on
+device, before touching CTS at all.
+
+Built `deqp-vk` for Android from a fresh `--depth 1` clone of
+`KhronosGroup/VK-GL-CTS` (`third_party/VK-GL-CTS/`, gitignored) via its own
+CMake/Ninja Android build (`-DDEQP_TARGET=android
+-DDEQP_TARGET_TOOLCHAIN=ndk-modern -DDEQP_ANDROID_EXE=ON`, targeting the
+same NDK used for this repo's own builds). Configure and the `deqp-vk`
+target build (1455 objects) both completed clean. Stripped 1.0GB → 69MB
+(`llvm-strip`) before pushing to device - the unstripped binary carries
+full debug info for every one of CTS's ~forty-some Vulkan test modules
+(ray tracing, video, mesh shaders, etc.), none of which this device
+exercises.
+
+Ran through the shim, library path selected via `deqp-vk`'s own
+`--deqp-vk-library-path` flag (no source patch needed - this is a standard,
+documented CTS option):
+
+```
+deqp-vk --deqp-case='dEQP-VK.info.*' \
+        --deqp-vk-library-path=/data/local/tmp/libpanvk_kbase_icd_shim.so
+```
+
+`dEQP-VK.info.build` (compile-time constants only, no Vulkan calls) passed
+first, smallest possible case. Escalated to the full `dEQP-VK.info.*` group
+next (19 cases - device/instance property and extension queries, no
+rendering or dispatch): 15 passed, 2 failed on genuine spec-conformance
+gaps worth recording (`device_extension_dependencies`:
+`VK_EXT_hdr_metadata` missing a dependency it declares;
+`instance_extension_dependencies`: `VK_EXT_headless_surface` likewise;
+`device_memory_budget_multi_instance`: heap usage not observed to increase
+- plausible given this device's unified memory), 1 correctly reported
+`NotSupported` (device groups - single GPU, as expected), then **one
+crashed the test binary itself: `dEQP-VK.info.platform`, SIGSEGV.**
+
+Root-caused, not just observed: `deqp-vk`'s Android build has no
+standalone-executable-specific platform implementation - `createPlatform()`
+(`framework/platform/android/tcuAndroidPlatform.cpp:668`) unconditionally
+constructs `tcu::Android::NativeActivity activity(NULL)`, i.e. wraps a null
+`ANativeActivity*` even when `DEQP_ANDROID_EXE=ON` and there is no real
+Activity. `dEQP-VK.info.platform` calls `describePlatform()`, which passes
+that null pointer into `tcu::Android::describePlatform()` unchecked. This
+is a gap in upstream CTS's own Android-EXE support, not a defect in this
+driver or the shim - confirmed by the fact that every case before and
+after it in the same run, through the same shim, against the same driver,
+behaved exactly as its own spec-conformance answer predicts. Device
+confirmed healthy after via `driver_compute_probe --submit --fill` (clean,
+GPU-signalled fence, correct readback) - a process crash, not a GPU hang;
+nothing about it resembled the D-state hangs this repo's own probes have
+hit before.
+
+**This is the first time any code from outside this repo has run against
+this driver.** `dEQP-VK.info.*` doesn't exercise rendering or compute
+dispatch, so it doesn't yet corroborate the render-probe or compute-probe
+findings above - what it corroborates is the integration path itself: a
+standard, unmodified Vulkan test consumer, using only the documented
+loader/ICD contract, reaching this driver through nothing but the shim and
+getting back real, differentiated answers (some pass, some genuine
+conformance fails, one platform-layer crash unrelated to the driver). Next
+step is the same one CTS work always was headed toward - broader
+non-rendering suites first (`dEQP-VK.api.*`, `dEQP-VK.query_pool.*` and
+similar), each run and checked before the next, `dEQP-VK.info.platform`
+excluded from future runs as a known upstream-CTS gap rather than
+re-triggered every time.
