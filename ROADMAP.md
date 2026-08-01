@@ -1106,6 +1106,26 @@ Tools worth knowing about before touching any of this:
       What remains for a conformance-shaped shader: multiple draws in one
       render pass. Everything past that is CTS scale (Phase 7), not
       basic-plumbing scale.
+- [x] **Multiple draws in one render pass — done, same session, clean on
+      the first attempt. The last item on this list.**
+      `tests/render_multidraw_probe`: two non-overlapping triangles, one
+      render pass, one bound vertex buffer and pipeline, a different
+      push-constant colour before each `vkCmdDraw`. Reproduced twice:
+      184 clear + 66 triangle-A (the exact baseline every probe on this
+      geometry has produced, unaffected by a second draw following it) +
+      6 triangle-B (present, correctly coloured, non-overlapping) + 0
+      other (draw 2's state change did not corrupt draw 1's already-shaded
+      pixels).
+      **Eight hardware-risk probes run this session: seven clean on first
+      attempt, one (texture sampling) fixed with a documented,
+      partially-understood workaround.** Every basic Vulkan plumbing
+      mechanism a real, conformance-shaped shader needs is now proven:
+      render-pass entry, a full draw, vertex fetch, push constants,
+      descriptor sets, texture sampling, depth test/write, multiple draws
+      per pass. What remains is CTS scale (Phase 7) — dEQP-VK, real
+      applications, extensions — not basic-plumbing scale.
+      `SIMULTANEOUS_USE` rendering is the one thing still genuinely
+      blocked, on the ringbuf and the unanswered upstream question.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process

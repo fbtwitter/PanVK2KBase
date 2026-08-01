@@ -246,6 +246,21 @@ render_depth_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py depth_frag.spv \
 	    depth_frag_spv.h render_depth_probe_frag
 
+# Two draws in one render pass, state (a push constant) changed between
+# them - the last basic plumbing mechanism this session's probes had not
+# exercised. Same --i-know-it-hangs gate.
+render_multidraw_probe: ./src/tests/render_multidraw_probe/render_multidraw_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_multidraw_probe -o ./build/render_multidraw_probe $<
+
+render_multidraw_probe_shaders:
+	cd ./src/tests/render_multidraw_probe && \
+	  glslangValidator -V multidraw.vert -o multidraw_vert.spv && \
+	  glslangValidator -V multidraw.frag -o multidraw_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py multidraw_vert.spv \
+	    multidraw_vert_spv.h render_multidraw_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py multidraw_frag.spv \
+	    multidraw_frag_spv.h render_multidraw_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's

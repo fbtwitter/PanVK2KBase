@@ -1808,6 +1808,45 @@ Device confirmed healthy after via `driver_compute_probe --fill` and
 attempt, one (texture sampling) genuinely wrong on the first attempt and
 fixed with a documented, only-partially-understood change.** Between them:
 render-pass entry, a full draw, vertex fetch, push constants, descriptor
-sets, texture sampling, depth test/write. What is left for a
-conformance-shaped shader: multiple draws in one render pass, and
-everything CTS-scale (Phase 7) rather than basic-plumbing-scale.
+sets, texture sampling, depth test/write.
+
+## Multiple draws in one render pass work - the basic-plumbing list is now empty
+
+Eighth probe, same session, and the last item on the list above:
+`tests/render_multidraw_probe` draws two non-overlapping triangles in one
+render pass with one `vkCmdBeginRendering`/`vkCmdEndRendering` pair - one
+bound vertex buffer holding both triangles' vertices, one bound pipeline,
+two `vkCmdPushConstants`/`vkCmdDraw` pairs with a different colour pushed
+before each. Built entirely from two already-proven mechanisms (vertex
+buffers, push constants) combined in a shape neither earlier probe tested:
+twice, with a state change in between.
+
+What this isolates: does pipeline/vertex-buffer binding state persist
+correctly across two separate `vkCmdDraw` calls, does a state change
+between draws (the push constant) actually take effect for the second draw
+rather than leaking the first draw's value or failing to apply, and does a
+non-zero `firstVertex` on the second draw correctly fetch its own vertices
+rather than reusing the first draw's.
+
+Clean on the first attempt, reproduced twice. Both runs: **184 clear + 66
+triangle-A + 6 triangle-B + 0 other.** Triangle A's count is the exact
+66-pixel baseline every probe on this geometry has produced since
+`render_vbo_probe` - present here as a cross-check that the first draw's
+result is completely unaffected by a second draw following it in the same
+pass. Triangle B - new geometry, in the opposite corner, a sixth distinct
+colour from every earlier probe's - came out present, correctly coloured,
+and non-overlapping with A. Zero pixels held anything else, meaning
+draw 2's push constant did not bleed backward into draw 1's already-shaded
+pixels. Device confirmed healthy after via `driver_compute_probe --fill`
+and `render_depth_probe`, both clean.
+
+**Eight hardware-risk probes run this session: seven clean on the first
+attempt, one (texture sampling) genuinely wrong on the first attempt and
+fixed with a documented, only-partially-understood change.** Between them:
+render-pass entry, a full draw, vertex fetch, push constants, descriptor
+sets, texture sampling, depth test/write, multiple draws per pass. That is
+every basic Vulkan plumbing mechanism a real, conformance-shaped shader
+needs. What is left is CTS scale (Phase 7) - dEQP-VK, real applications,
+extensions - not basic-plumbing scale; the open question that still gates
+some of it is `SIMULTANEOUS_USE` rendering, which remains blocked on the
+ringbuf and the still-unanswered upstream question.
