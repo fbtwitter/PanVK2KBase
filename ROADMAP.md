@@ -1239,6 +1239,27 @@ Tools worth knowing about before touching any of this:
       sharing one device, not each owning its own), and probe
       `VK_EXT_private_data` with real slot requests directly. See
       `docs/kbase-notes.md` for the full log excerpt and reasoning.
+- [x] **Root-cause dig, fourth pass: both candidates also ruled out**
+      (2026-08-01). Replicated `VK_EXT_private_data` device creation
+      exactly (checked the CTS source first: the actual failing case uses
+      zero requested slots, not the heaviest config) — 1000 iterations in
+      one process, clean, byte-identical BO pattern to the plain
+      baseline. Replicated `multithreaded_shared_resources`'s actual
+      shape — N threads concurrently creating/destroying buffers on *one
+      shared* device with CTS's own barrier-sync pattern, then checking
+      whether a fresh unrelated device still works afterward — 60 rounds
+      × 8 threads × 200 iterations (96,000 concurrent cycles), clean.
+      **Four full passes now with no synthetic reproduction.** Remaining
+      open hypotheses: the failure needs the exact cumulative sequence of
+      every preceding CTS group (not any single isolated pattern), or —
+      not yet checked — genuine Android-level system memory pressure
+      unrelated to this driver, indistinguishable from a driver leak
+      without sampling `/proc/meminfo` during a real run. Recommendation:
+      next attempt should instrument and re-run the real caselist with
+      memory sampling added, rather than inventing a fifth synthetic
+      pattern; otherwise treat this as a well-characterized, deliberately
+      set-aside finding and prioritize broader CTS coverage. See
+      `docs/kbase-notes.md` for full reasoning.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

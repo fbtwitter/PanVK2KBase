@@ -2344,3 +2344,89 @@ The `PANVK_KBASE_DEBUG_COUNTERS` instrumentation is committed and stays
 in the tree (silent by default) - re-running the caselist against
 whichever of the two candidates above is tried next will show the same
 level of detail without re-adding logging from scratch.
+
+## Root-cause dig, fourth pass: both specific candidates also ruled out
+
+Tested both candidates from the third pass directly, in isolation, at
+large scale, with the same instrumentation on.
+
+**`VK_EXT_private_data`, replicated exactly:** added
+`device_churn_probe --private-data` / `--private-data-slots N M`,
+matching `SingletonDevice::createPrivateDataDevice`
+(`vktApiObjectManagementTests.cpp`) precisely - the same
+`VkDevicePrivateDataCreateInfoEXT` chain, the same
+`VkPhysicalDevicePrivateDataFeaturesEXT` struct, the extension named, and
+`pEnabledFeatures` populated from a real `vkGetPhysicalDeviceFeatures`
+query (a device-creation shape nothing tested before this pass had used -
+every earlier probe left `pNext`/extensions/features untouched). Checked
+the CTS source first rather than guessing which slot config the actual
+failing case uses: `createPrivateDataTest` loops through all 5
+`SingletonDevice` instances *on the first test case that runs in the
+group*, but the instrumented log showed only **one** `dev_create` before
+failure - meaning it failed on the very first
+(`SingletonDevice` index 0, `requestedSlots[0] = {0, 0}`), which requests
+**zero** actual private-data slots. Ran 1000 iterations of exactly that
+`{0,0}` configuration in one process (2000 cumulative counting the
+instance-probe device too, past the real failure's cumulative count of
+792): **clean, 1000/1000.** The BO allocation pattern was byte-for-byte
+identical to the plain baseline probe - enabling the extension with zero
+slots doesn't even allocate anything extra at the kbase level. This
+candidate is ruled out.
+
+**`multithreaded_shared_resources`'s actual shape:** added
+`device_churn_probe --shared-threads N --shared-iters M`, matching
+`multithreadedCreateSharedResourcesTest` structurally: N threads (real
+CTS clamps to `[2, 8]` logical cores) all create+destroy buffers on **one
+already-existing shared device** concurrently - not each thread owning
+its own device, which is what `--threads` tests and had already come up
+clean. Included the same synchronization CTS uses: a spin barrier every
+`iterations / 5` operations "to make entering driver at the same time
+more likely" (CTS's own comment), maximizing the odds of concurrent
+`kbase_kmod_bo_alloc`/`_free` calls actually overlapping in the kernel,
+not just in userspace scheduling. After each round, immediately tried
+creating one more, completely unrelated fresh device as a direct check:
+does *this* pattern leave the kind of residue that breaks a later,
+unrelated device creation, matching what the real run showed. Ran 60
+rounds × 8 threads × 200 iterations (96,000 concurrent buffer
+create/destroy cycles, cumulative `bo_alloc` count past 96,800): **clean,
+60/60**, the post-round fresh-device check never failed once. This
+candidate is ruled out too.
+
+**Both specific, well-reasoned candidates from the third pass came up
+empty.** Four full passes now: fd leak, every device/queue/buffer/
+pipeline churn pattern this session could construct (single-threaded and
+multi-threaded, sequential and many-simultaneous), and both specific
+hypotheses the instrumented real-driver log directly suggested. None
+reproduce the failure in isolation.
+
+**What that leaves open, honestly:** the failure may need the *exact*
+cumulative sequence of everything that runs before it in the real
+caselist - `alloc_callback_fail*`, `max_concurrent.*`,
+`multiple_shared_resources`, `multiple_unique_resources`,
+`multithreaded_per_thread_device`, `multithreaded_per_thread_resources`,
+*then* `multithreaded_shared_resources`, all in that specific order,
+touching many different object types (not just buffers, which is all
+every probe here has stressed at scale) - not any single isolated
+pattern repeated on its own, however large. It's also worth naming a
+hypothesis outside this driver entirely, not yet checked: real system
+memory pressure on the Android device itself, from something unrelated
+to this driver's own resource accounting (background processes, memory
+fragmentation from a long-running `deqp-vk` process, an Android-level
+cgroup limit) - `KBASE_IOCTL_MEM_ALLOC_EX` returning genuine `ENOMEM`
+would look identical either way from userspace, and nothing captured so
+far distinguishes "this driver leaked something" from "the system was
+genuinely low on memory at that moment for unrelated reasons." Sampling
+`/proc/meminfo` (or `dumpsys meminfo`) alongside the instrumented log
+during a real caselist run would distinguish the two directly and is the
+cheapest next check, if this is picked up again.
+
+Given four passes of directed, hypothesis-driven testing have not
+reproduced this outside the real CTS run itself, further work here should
+either (a) instrument and re-run the *real* caselist rather than inventing
+a fifth synthetic pattern, watching `/proc/meminfo` this time, or (b) be
+treated as a known, precisely-characterized-but-unresolved finding and
+set aside in favor of broader CTS coverage - the mechanism (kernel
+`ENOMEM` on a first post-creation buffer allocation, unrelated to
+live-device count, following the `multithreaded_*`/`private_data` region
+of the caselist) is now well enough understood to recognize immediately
+if it recurs elsewhere.

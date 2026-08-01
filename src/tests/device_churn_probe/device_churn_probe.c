@@ -35,6 +35,16 @@
 //                device creation - what dEQP-VK.api.object_management's
 //                multithreaded_* groups do - is part of the ~307-case
 //                ceiling documented in docs/kbase-notes.md.
+//   --private-data / --private-data-slots N M: churn devices with
+//                VK_EXT_private_data enabled exactly the way
+//                dEQP-VK.api.object_management.private_data.* does
+//                (vktApiObjectManagementTests.cpp's SingletonDevice) -
+//                the group that actually fails in the real run. Plain
+//                --private-data uses {0,0} (no slots), matching the
+//                actual failing case (buffer_storage_large, index 0);
+//                --private-data-slots N M requests N first-level and M
+//                chained second-level slots, up to {1,100} (the
+//                heaviest config any SingletonDevice index uses).
 //   --many-objects N: per device, allocate N 64KB buffers (each with its
 //                own real memory allocation, bound) all SIMULTANEOUSLY
 //                ALIVE, only freeing them once all N exist (or creation
@@ -59,6 +69,7 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -256,6 +267,388 @@ run_threaded(const char *shim_path, int iterations, int nthreads)
    return any_failed;
 }
 
+/* Matches dEQP-VK.api.object_management.private_data.* exactly - the
+ * group that actually fails in the real run (docs/kbase-notes.md,
+ * "root-cause dig, third pass"). slot_count/slot_count2 mirror
+ * SingletonDevice::createPrivateDataDevice's requestedSlots table
+ * (vktApiObjectManagementTests.cpp): {0,0} is what the failing case
+ * (buffer_storage_large, SingletonDevice index 0) actually uses - the
+ * private data FEATURE is requested and the extension enabled, but no
+ * slots. {1,100} is the heaviest config any other SingletonDevice index
+ * uses, included for comparison.
+ */
+static int
+run_private_data(const char *shim_path, int iterations, int slot_count,
+                 int slot_count2)
+{
+   void *h = dlopen(shim_path, RTLD_NOW | RTLD_LOCAL);
+   if (!h) {
+      printf("dlopen(%s) failed: %s\n", shim_path, dlerror());
+      return 1;
+   }
+   PFN_vkGetInstanceProcAddr gipa =
+      (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+   if (!gipa) {
+      printf("dlsym(vkGetInstanceProcAddr) failed: %s\n", dlerror());
+      return 1;
+   }
+   PFN_vkCreateInstance create_instance =
+      (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+   if (!create_instance) {
+      printf("missing pre-instance entrypoints through the shim\n");
+      return 1;
+   }
+
+   printf("private-data mode: iterations=%d slots=%d,%d\n", iterations,
+          slot_count, slot_count2);
+
+   int completed = 0;
+   for (int i = 0; i < iterations; i++) {
+      VkApplicationInfo app = {
+         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+         .pApplicationName = "device-churn-probe-privdata",
+         .apiVersion = VK_API_VERSION_1_3,
+      };
+      VkInstanceCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+         .pApplicationInfo = &app,
+      };
+      VkInstance inst = VK_NULL_HANDLE;
+      VkResult r = create_instance(&ici, NULL, &inst);
+      if (r != VK_SUCCESS) {
+         printf("iteration %d: vkCreateInstance -> %d, stopping\n", i, r);
+         break;
+      }
+
+#define PGIPA(name) (PFN_##name)gipa(inst, #name)
+      PFN_vkEnumeratePhysicalDevices enum_pd = PGIPA(vkEnumeratePhysicalDevices);
+      PFN_vkGetPhysicalDeviceFeatures get_features =
+         PGIPA(vkGetPhysicalDeviceFeatures);
+      PFN_vkCreateDevice create_dev = PGIPA(vkCreateDevice);
+      PFN_vkDestroyDevice destroy_dev = PGIPA(vkDestroyDevice);
+      PFN_vkDestroyInstance destroy_inst = PGIPA(vkDestroyInstance);
+
+      uint32_t count = 1;
+      VkPhysicalDevice pd = VK_NULL_HANDLE;
+      r = enum_pd(inst, &count, &pd);
+      if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || count == 0) {
+         printf("iteration %d: vkEnumeratePhysicalDevices -> %d, "
+                "stopping\n",
+                i, r);
+         destroy_inst(inst, NULL);
+         break;
+      }
+
+      VkPhysicalDeviceFeatures enabled_features;
+      get_features(pd, &enabled_features);
+
+      /* Mirrors SingletonDevice::createPrivateDataDevice exactly: a
+       * VkDevicePrivateDataCreateInfoEXT chain (only built if slots are
+       * requested - the failing case requests none), then the feature
+       * struct, then the device create info with the extension named
+       * and pEnabledFeatures set - all of which this repo's other probes
+       * leave untouched (no pNext, no extensions, no explicit features).
+       */
+      VkDevicePrivateDataCreateInfoEXT pdci0 = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO_EXT,
+         .privateDataSlotRequestCount = (uint32_t)slot_count,
+      };
+      VkDevicePrivateDataCreateInfoEXT pdci1 = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO_EXT,
+         .privateDataSlotRequestCount = (uint32_t)slot_count2,
+      };
+      void *pnext = NULL;
+      if (slot_count) {
+         pnext = &pdci0;
+         if (slot_count2)
+            pdci0.pNext = &pdci1;
+      }
+
+      VkPhysicalDevicePrivateDataFeaturesEXT priv_features = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES_EXT,
+         .pNext = pnext,
+         .privateData = VK_TRUE,
+      };
+
+      const char *ext_name = "VK_EXT_private_data";
+      float prio = 1.0f;
+      VkDeviceQueueCreateInfo qci = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = 0,
+         .queueCount = 1,
+         .pQueuePriorities = &prio,
+      };
+      VkDeviceCreateInfo dci = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+         .pNext = &priv_features,
+         .queueCreateInfoCount = 1,
+         .pQueueCreateInfos = &qci,
+         .enabledExtensionCount = 1,
+         .ppEnabledExtensionNames = &ext_name,
+         .pEnabledFeatures = &enabled_features,
+      };
+      VkDevice dev = VK_NULL_HANDLE;
+      r = create_dev(pd, &dci, NULL, &dev);
+      if (r != VK_SUCCESS) {
+         printf("iteration %d: vkCreateDevice (VK_EXT_private_data) -> "
+                "%d, stopping\n",
+                i, r);
+         destroy_inst(inst, NULL);
+         break;
+      }
+
+      destroy_dev(dev, NULL);
+      destroy_inst(inst, NULL);
+      completed = i + 1;
+
+      if (i % 20 == 0 || i == iterations - 1)
+         printf("iteration %d ok\n", i);
+   }
+
+   printf("\n=== summary ===\n");
+   printf("completed %d/%d private-data device cycles\n", completed,
+          iterations);
+   return completed == iterations ? 0 : 1;
+}
+
+/* Matches dEQP-VK.api.object_management.multithreaded_shared_resources
+ * exactly in shape (vktApiObjectManagementTests.cpp's
+ * multithreadedCreateSharedResourcesTest): N threads all create+destroy
+ * objects on ONE ALREADY-EXISTING shared device concurrently, synced with
+ * a barrier every few iterations "to make entering driver at the same
+ * time more likely" (CTS's own comment) - not each thread owning its own
+ * device, which is what device_churn_probe's --threads mode tests and
+ * already came up clean. This is the one pattern from the real failing
+ * run nothing so far has replicated: concurrent kbase_kmod_bo_alloc/free
+ * on the SAME device's VA heap (protected only by kbase_dev->va.lock
+ * around the userspace bookkeeping - the underlying ioctls' own
+ * concurrency safety on one fd is untested). If a race there leaks real
+ * kernel/GPU memory rather than just corrupting this backend's own VA
+ * heap tracking, that would explain why a LATER, completely unrelated
+ * device's allocation fails afterward - the shared device stays alive the
+ * whole time, so any corruption confined to its own state wouldn't
+ * explain a fresh device failing, but a real leaked kernel resource
+ * would.
+ */
+struct shared_ctx {
+   PFN_vkCreateBuffer create_buf;
+   PFN_vkDestroyBuffer destroy_buf;
+   PFN_vkGetBufferMemoryRequirements get_reqs;
+   PFN_vkAllocateMemory alloc_mem;
+   PFN_vkFreeMemory free_mem;
+   PFN_vkBindBufferMemory bind_mem;
+   VkDevice dev;
+   uint32_t mem_type;
+   int iters_per_thread;
+   int iters_between_syncs;
+   atomic_int barrier_count;
+   atomic_int barrier_gen;
+   int nthreads;
+};
+
+static void
+shared_barrier(struct shared_ctx *ctx)
+{
+   int gen = atomic_load(&ctx->barrier_gen);
+   int reached = atomic_fetch_add(&ctx->barrier_count, 1) + 1;
+   if (reached == ctx->nthreads) {
+      atomic_store(&ctx->barrier_count, 0);
+      atomic_fetch_add(&ctx->barrier_gen, 1);
+   } else {
+      while (atomic_load(&ctx->barrier_gen) == gen)
+         ; /* spin - this is a diagnostic probe, not production code */
+   }
+}
+
+static void *
+shared_thread(void *arg)
+{
+   struct shared_ctx *ctx = arg;
+
+   for (int i = 0; i < ctx->iters_per_thread; i++) {
+      if (i % ctx->iters_between_syncs == 0)
+         shared_barrier(ctx);
+
+      VkBufferCreateInfo bci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = 65536,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      VkBuffer buf = VK_NULL_HANDLE;
+      if (ctx->create_buf(ctx->dev, &bci, NULL, &buf) != VK_SUCCESS)
+         return NULL;
+
+      VkMemoryRequirements reqs;
+      ctx->get_reqs(ctx->dev, buf, &reqs);
+
+      VkMemoryAllocateInfo mai = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = reqs.size,
+         .memoryTypeIndex = ctx->mem_type,
+      };
+      VkDeviceMemory mem = VK_NULL_HANDLE;
+      if (ctx->alloc_mem(ctx->dev, &mai, NULL, &mem) != VK_SUCCESS) {
+         ctx->destroy_buf(ctx->dev, buf, NULL);
+         return NULL;
+      }
+
+      ctx->bind_mem(ctx->dev, buf, mem, 0);
+      ctx->free_mem(ctx->dev, mem, NULL);
+      ctx->destroy_buf(ctx->dev, buf, NULL);
+   }
+   return NULL;
+}
+
+static int
+run_shared_threads(const char *shim_path, int outer_iterations, int nthreads,
+                   int iters_per_thread)
+{
+   void *h = dlopen(shim_path, RTLD_NOW | RTLD_LOCAL);
+   if (!h) {
+      printf("dlopen(%s) failed: %s\n", shim_path, dlerror());
+      return 1;
+   }
+   PFN_vkGetInstanceProcAddr gipa =
+      (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+   PFN_vkCreateInstance create_instance =
+      (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+   if (!create_instance) {
+      printf("missing pre-instance entrypoints through the shim\n");
+      return 1;
+   }
+
+   printf("shared-threads mode: outer_iterations=%d nthreads=%d "
+          "iters_per_thread=%d\n",
+          outer_iterations, nthreads, iters_per_thread);
+
+   int completed = 0;
+   for (int outer = 0; outer < outer_iterations; outer++) {
+      VkApplicationInfo app = {
+         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+         .pApplicationName = "device-churn-probe-shared",
+         .apiVersion = VK_API_VERSION_1_3,
+      };
+      VkInstanceCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+         .pApplicationInfo = &app,
+      };
+      VkInstance inst = VK_NULL_HANDLE;
+      if (create_instance(&ici, NULL, &inst) != VK_SUCCESS) {
+         printf("outer %d: vkCreateInstance failed, stopping\n", outer);
+         break;
+      }
+
+#define SGIPA(name) (PFN_##name)gipa(inst, #name)
+      PFN_vkEnumeratePhysicalDevices enum_pd = SGIPA(vkEnumeratePhysicalDevices);
+      PFN_vkCreateDevice create_dev = SGIPA(vkCreateDevice);
+      PFN_vkDestroyDevice destroy_dev = SGIPA(vkDestroyDevice);
+      PFN_vkDestroyInstance destroy_inst = SGIPA(vkDestroyInstance);
+      PFN_vkGetPhysicalDeviceMemoryProperties get_mem_props =
+         SGIPA(vkGetPhysicalDeviceMemoryProperties);
+
+      uint32_t count = 1;
+      VkPhysicalDevice pd = VK_NULL_HANDLE;
+      enum_pd(inst, &count, &pd);
+
+      float prio = 1.0f;
+      VkDeviceQueueCreateInfo qci = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = 0,
+         .queueCount = 1,
+         .pQueuePriorities = &prio,
+      };
+      VkDeviceCreateInfo dci = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+         .queueCreateInfoCount = 1,
+         .pQueueCreateInfos = &qci,
+      };
+      VkDevice dev = VK_NULL_HANDLE;
+      VkResult r = create_dev(pd, &dci, NULL, &dev);
+      if (r != VK_SUCCESS) {
+         printf("outer %d: vkCreateDevice (the shared device) -> %d, "
+                "stopping\n",
+                outer, r);
+         destroy_inst(inst, NULL);
+         break;
+      }
+
+      VkPhysicalDeviceMemoryProperties mem_props;
+      get_mem_props(pd, &mem_props);
+      VkMemoryRequirements dummy_reqs = {.memoryTypeBits = ~0u};
+      uint32_t mem_type = 0;
+      for (uint32_t m = 0; m < mem_props.memoryTypeCount; m++) {
+         if (dummy_reqs.memoryTypeBits & (1u << m)) {
+            mem_type = m;
+            break;
+         }
+      }
+
+      struct shared_ctx ctx = {
+         .create_buf = SGIPA(vkCreateBuffer),
+         .destroy_buf = SGIPA(vkDestroyBuffer),
+         .get_reqs = SGIPA(vkGetBufferMemoryRequirements),
+         .alloc_mem = SGIPA(vkAllocateMemory),
+         .free_mem = SGIPA(vkFreeMemory),
+         .bind_mem = SGIPA(vkBindBufferMemory),
+         .dev = dev,
+         .mem_type = mem_type,
+         .iters_per_thread = iters_per_thread,
+         .iters_between_syncs = iters_per_thread / 5 > 0 ? iters_per_thread / 5 : 1,
+         .nthreads = nthreads,
+      };
+      atomic_init(&ctx.barrier_count, 0);
+      atomic_init(&ctx.barrier_gen, 0);
+
+      pthread_t *tids = calloc(nthreads, sizeof(*tids));
+      for (int t = 0; t < nthreads; t++)
+         pthread_create(&tids[t], NULL, shared_thread, &ctx);
+      for (int t = 0; t < nthreads; t++)
+         pthread_join(tids[t], NULL);
+      free(tids);
+
+      destroy_dev(dev, NULL);
+      destroy_inst(inst, NULL);
+      completed = outer + 1;
+
+      printf("outer %d: shared-threads round done (all_fds=%d "
+             "mali0_fds=%d)\n",
+             outer, count_all_fds(), count_mali_fds());
+
+      /* The actual test being run: after this shared-device round tears
+       * down, does a completely fresh, unrelated device still work?
+       */
+      VkInstance inst2 = VK_NULL_HANDLE;
+      if (create_instance(&ici, NULL, &inst2) != VK_SUCCESS) {
+         printf("outer %d: POST-CHECK vkCreateInstance failed\n", outer);
+         break;
+      }
+      PFN_vkEnumeratePhysicalDevices enum_pd2 = SGIPA(vkEnumeratePhysicalDevices);
+      PFN_vkCreateDevice create_dev2 = SGIPA(vkCreateDevice);
+      PFN_vkDestroyDevice destroy_dev2 = SGIPA(vkDestroyDevice);
+      PFN_vkDestroyInstance destroy_inst2 = SGIPA(vkDestroyInstance);
+      VkPhysicalDevice pd2 = VK_NULL_HANDLE;
+      uint32_t count2 = 1;
+      enum_pd2(inst2, &count2, &pd2);
+      VkDevice dev2 = VK_NULL_HANDLE;
+      r = create_dev2(pd2, &dci, NULL, &dev2);
+      if (r != VK_SUCCESS) {
+         printf("outer %d: POST-CHECK fresh device creation -> %d "
+                "<<<<<< REPRODUCED\n",
+                outer, r);
+         destroy_inst2(inst2, NULL);
+         break;
+      }
+      destroy_dev2(dev2, NULL);
+      destroy_inst2(inst2, NULL);
+   }
+
+   printf("\n=== summary ===\n");
+   printf("completed %d/%d shared-threads rounds\n", completed,
+          outer_iterations);
+   return completed == outer_iterations ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -277,6 +670,11 @@ main(int argc, char **argv)
    int nthreads = 0;
    int many_objects = 0;
    int many_pipelines = 0;
+   bool private_data = false;
+   int private_data_slots = 0;
+   int private_data_slots2 = 0;
+   int shared_threads_n = 0;
+   int shared_iters_per_thread = 100;
    for (int i = 3; i < argc; i++) {
       if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc)
          delay_ms = atoi(argv[++i]);
@@ -290,7 +688,25 @@ main(int argc, char **argv)
          many_objects = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--many-pipelines") && i + 1 < argc)
          many_pipelines = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--private-data"))
+         private_data = true;
+      else if (!strcmp(argv[i], "--private-data-slots") && i + 2 < argc) {
+         private_data = true;
+         private_data_slots = atoi(argv[++i]);
+         private_data_slots2 = atoi(argv[++i]);
+      } else if (!strcmp(argv[i], "--shared-threads") && i + 1 < argc)
+         shared_threads_n = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--shared-iters") && i + 1 < argc)
+         shared_iters_per_thread = atoi(argv[++i]);
    }
+
+   if (private_data)
+      return run_private_data(shim_path, iterations, private_data_slots,
+                              private_data_slots2);
+
+   if (shared_threads_n > 0)
+      return run_shared_threads(shim_path, iterations, shared_threads_n,
+                                shared_iters_per_thread);
 
    if (nthreads > 0)
       return run_threaded(shim_path, iterations, nthreads);
