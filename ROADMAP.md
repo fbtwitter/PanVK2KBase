@@ -1201,8 +1201,23 @@ Tools worth knowing about before touching any of this:
       source (which would show the real GPL kbase driver for this device)
       is not yet published by Xiaomi, and the one other kbase-based
       community project found (Panfork-derived, OpenGL/Gallium only) has
-      no record of this either. See `docs/kbase-notes.md` for the full
-      writeup and the concrete next test to run.
+      no record of this either.
+- [x] **Root-cause dig, second pass** (2026-08-01): tested the "many
+      simultaneously-live objects" candidate directly — 250 devices ×
+      500 simultaneous buffers (125,000 cumulative allocations) and 350
+      devices × 20 simultaneous compute pipelines (7,000 cumulative) both
+      came up clean. A 1,000-pipelines-on-one-device test also passed but
+      completed suspiciously fast (0.04s), likely an internal pipeline
+      cache deduplicating identical compiles rather than a genuine
+      independent-`EXEC_VA`-allocation stress test — flagged as
+      inconclusive, not counted as ruling anything out. **Every
+      synthetic reproduction attempt across both passes has come up
+      clean.** Changing approach: the recommended next step is
+      instrumenting the real driver (`src/mesa/pan_kmod_kbase.c`) with
+      temporary counters/logging and re-running the actual failing
+      `object_management` caselist against that build, rather than
+      continuing to guess the reproduction shape with hand-written
+      probes. See `docs/kbase-notes.md` for the full writeup.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

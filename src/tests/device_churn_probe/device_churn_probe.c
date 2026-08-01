@@ -35,6 +35,27 @@
 //                device creation - what dEQP-VK.api.object_management's
 //                multithreaded_* groups do - is part of the ~307-case
 //                ceiling documented in docs/kbase-notes.md.
+//   --many-objects N: per device, allocate N 64KB buffers (each with its
+//                own real memory allocation, bound) all SIMULTANEOUSLY
+//                ALIVE, only freeing them once all N exist (or creation
+//                fails) - unlike --alloc-buffer, which creates and frees
+//                one at a time. This is architecturally what
+//                dEQP-VK.api.object_management's max_concurrent.*/
+//                multiple_* groups actually do (stress the concurrent
+//                limit on one device).
+//   --many-pipelines N: per device, compile one shader module (reusing
+//                driver_pipeline_probe's shader_spv.h) and create N compute
+//                pipelines from it, all simultaneously alive before
+//                destroying them. Pipelines are executable BOs, allocated
+//                in kbase's EXEC_VA zone with a kernel-chosen address -
+//                kbase_kmod_bo_free (src/mesa/pan_kmod_kbase.c) explicitly
+//                does NOT return their address to this backend's own VA
+//                heap tracking the way ordinary buffers are, since the
+//                kernel picked it. That asymmetry is the leading untested
+//                candidate for the ~307-case ceiling: --many-objects (all
+//                ordinary buffers) stayed clean at 125,000 cumulative
+//                allocations, but nothing so far has stressed repeated
+//                executable-BO alloc/free specifically.
 #include <dlfcn.h>
 #include <dirent.h>
 #include <pthread.h>
@@ -47,6 +68,8 @@
 #include <unistd.h>
 
 #include <vulkan/vulkan_core.h>
+
+#include "shader_spv.h"
 
 static int
 count_mali_fds(void)
@@ -252,6 +275,8 @@ main(int argc, char **argv)
    bool use_queue = false;
    bool alloc_buffer = false;
    int nthreads = 0;
+   int many_objects = 0;
+   int many_pipelines = 0;
    for (int i = 3; i < argc; i++) {
       if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc)
          delay_ms = atoi(argv[++i]);
@@ -261,6 +286,10 @@ main(int argc, char **argv)
          alloc_buffer = true;
       else if (!strcmp(argv[i], "--threads") && i + 1 < argc)
          nthreads = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--many-objects") && i + 1 < argc)
+         many_objects = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--many-pipelines") && i + 1 < argc)
+         many_pipelines = atoi(argv[++i]);
    }
 
    if (nthreads > 0)
@@ -491,6 +520,218 @@ main(int argc, char **argv)
          bind_mem(dev, buf, mem, 0);
          free_mem(dev, mem, NULL);
          destroy_buf(dev, buf, NULL);
+      }
+
+      if (many_objects > 0) {
+         PFN_vkCreateBuffer create_buf = GIPA(vkCreateBuffer);
+         PFN_vkDestroyBuffer destroy_buf = GIPA(vkDestroyBuffer);
+         PFN_vkGetBufferMemoryRequirements get_reqs =
+            GIPA(vkGetBufferMemoryRequirements);
+         PFN_vkAllocateMemory alloc_mem = GIPA(vkAllocateMemory);
+         PFN_vkFreeMemory free_mem = GIPA(vkFreeMemory);
+         PFN_vkBindBufferMemory bind_mem = GIPA(vkBindBufferMemory);
+         PFN_vkGetPhysicalDeviceMemoryProperties get_mem_props =
+            GIPA(vkGetPhysicalDeviceMemoryProperties);
+
+         if (!create_buf || !destroy_buf || !get_reqs || !alloc_mem ||
+             !free_mem || !bind_mem || !get_mem_props) {
+            printf("iteration %d: missing memory-related entrypoint, "
+                   "stopping\n",
+                   i);
+            destroy_dev(dev, NULL);
+            destroy_inst(inst, NULL);
+            break;
+         }
+
+         VkPhysicalDeviceMemoryProperties mem_props;
+         get_mem_props(pd, &mem_props);
+
+         VkBuffer *bufs = calloc(many_objects, sizeof(*bufs));
+         VkDeviceMemory *mems = calloc(many_objects, sizeof(*mems));
+         int live = 0;
+         VkResult stop_result = VK_SUCCESS;
+
+         for (int n = 0; n < many_objects; n++) {
+            VkBufferCreateInfo bci = {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+               .size = 65536,
+               .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+               .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            };
+            r = create_buf(dev, &bci, NULL, &bufs[n]);
+            if (r != VK_SUCCESS) {
+               stop_result = r;
+               printf("iteration %d: vkCreateBuffer failed at object %d/%d "
+                      "-> %d\n",
+                      i, n, many_objects, r);
+               break;
+            }
+
+            VkMemoryRequirements reqs;
+            get_reqs(dev, bufs[n], &reqs);
+            uint32_t mem_type = UINT32_MAX;
+            for (uint32_t m = 0; m < mem_props.memoryTypeCount; m++) {
+               if (reqs.memoryTypeBits & (1u << m)) {
+                  mem_type = m;
+                  break;
+               }
+            }
+            VkMemoryAllocateInfo mai = {
+               .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+               .allocationSize = reqs.size,
+               .memoryTypeIndex = mem_type,
+            };
+            r = alloc_mem(dev, &mai, NULL, &mems[n]);
+            if (r != VK_SUCCESS) {
+               stop_result = r;
+               printf("iteration %d: vkAllocateMemory failed at object "
+                      "%d/%d -> %d (all_fds=%d mali0_fds=%d)\n",
+                      i, n, many_objects, r, count_all_fds(),
+                      count_mali_fds());
+               destroy_buf(dev, bufs[n], NULL);
+               break;
+            }
+            bind_mem(dev, bufs[n], mems[n], 0);
+            live = n + 1;
+         }
+
+         if (i % 5 == 0 || live < many_objects) {
+            printf("iteration %d: held %d/%d buffers simultaneously alive "
+                   "(64KB each = %.1fMB), all_fds=%d mali0_fds=%d\n",
+                   i, live, many_objects, live * 65536.0 / (1024 * 1024),
+                   count_all_fds(), count_mali_fds());
+         }
+
+         for (int n = 0; n < live; n++) {
+            free_mem(dev, mems[n], NULL);
+            destroy_buf(dev, bufs[n], NULL);
+         }
+         free(bufs);
+         free(mems);
+
+         if (stop_result != VK_SUCCESS) {
+            destroy_dev(dev, NULL);
+            destroy_inst(inst, NULL);
+            break;
+         }
+      }
+
+      if (many_pipelines > 0) {
+         PFN_vkCreateShaderModule create_module = GIPA(vkCreateShaderModule);
+         PFN_vkDestroyShaderModule destroy_module = GIPA(vkDestroyShaderModule);
+         PFN_vkCreateDescriptorSetLayout create_dsl =
+            GIPA(vkCreateDescriptorSetLayout);
+         PFN_vkDestroyDescriptorSetLayout destroy_dsl =
+            GIPA(vkDestroyDescriptorSetLayout);
+         PFN_vkCreatePipelineLayout create_pl = GIPA(vkCreatePipelineLayout);
+         PFN_vkDestroyPipelineLayout destroy_pl = GIPA(vkDestroyPipelineLayout);
+         PFN_vkCreateComputePipelines create_pipelines =
+            GIPA(vkCreateComputePipelines);
+         PFN_vkDestroyPipeline destroy_pipeline = GIPA(vkDestroyPipeline);
+
+         if (!create_module || !destroy_module || !create_dsl ||
+             !destroy_dsl || !create_pl || !destroy_pl || !create_pipelines ||
+             !destroy_pipeline) {
+            printf("iteration %d: missing pipeline-related entrypoint, "
+                   "stopping\n",
+                   i);
+            destroy_dev(dev, NULL);
+            destroy_inst(inst, NULL);
+            break;
+         }
+
+         VkShaderModuleCreateInfo smci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = sizeof(pipeline_probe_shader),
+            .pCode = pipeline_probe_shader,
+         };
+         VkShaderModule module = VK_NULL_HANDLE;
+         r = create_module(dev, &smci, NULL, &module);
+         if (r != VK_SUCCESS) {
+            printf("iteration %d: vkCreateShaderModule -> %d, stopping\n", i,
+                   r);
+            destroy_dev(dev, NULL);
+            destroy_inst(inst, NULL);
+            break;
+         }
+
+         VkDescriptorSetLayoutBinding binding = {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         };
+         VkDescriptorSetLayoutCreateInfo dslci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &binding,
+         };
+         VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+         create_dsl(dev, &dslci, NULL, &dsl);
+
+         VkPushConstantRange pcr = {
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = sizeof(uint32_t),
+         };
+         VkPipelineLayoutCreateInfo plci = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1,
+            .pSetLayouts = &dsl,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &pcr,
+         };
+         VkPipelineLayout layout = VK_NULL_HANDLE;
+         create_pl(dev, &plci, NULL, &layout);
+
+         VkPipeline *pipelines = calloc(many_pipelines, sizeof(*pipelines));
+         int live = 0;
+         VkResult stop_result = VK_SUCCESS;
+
+         for (int n = 0; n < many_pipelines; n++) {
+            VkComputePipelineCreateInfo cpci = {
+               .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+               .stage = {
+                  .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = module,
+                  .pName = "main",
+               },
+               .layout = layout,
+            };
+            r = create_pipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL,
+                                  &pipelines[n]);
+            if (r != VK_SUCCESS) {
+               stop_result = r;
+               printf("iteration %d: vkCreateComputePipelines failed at "
+                      "pipeline %d/%d -> %d (all_fds=%d mali0_fds=%d)\n",
+                      i, n, many_pipelines, r, count_all_fds(),
+                      count_mali_fds());
+               break;
+            }
+            live = n + 1;
+         }
+
+         if (i % 5 == 0 || live < many_pipelines) {
+            printf("iteration %d: held %d/%d compute pipelines "
+                   "simultaneously alive, all_fds=%d mali0_fds=%d\n",
+                   i, live, many_pipelines, count_all_fds(),
+                   count_mali_fds());
+         }
+
+         for (int n = 0; n < live; n++)
+            destroy_pipeline(dev, pipelines[n], NULL);
+         free(pipelines);
+
+         destroy_pl(dev, layout, NULL);
+         destroy_dsl(dev, dsl, NULL);
+         destroy_module(dev, module, NULL);
+
+         if (stop_result != VK_SUCCESS) {
+            destroy_dev(dev, NULL);
+            destroy_inst(inst, NULL);
+            break;
+         }
       }
 
       destroy_dev(dev, NULL);

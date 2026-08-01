@@ -2175,3 +2175,64 @@ buffers on one device without freeing them until the end, N large enough
 to bracket where `max_concurrent.buffer_storage_large` itself would stop)
 rather than continuing to vary the create/destroy-churn pattern, which is
 now well-covered ground.
+
+## Root-cause dig, second pass: many-simultaneous-objects also comes up clean
+
+Extended `device_churn_probe` with `--many-objects N` (N buffers, each
+with its own real memory allocation, all held alive at once per device
+before freeing) and `--many-pipelines N` (N compute pipelines from one
+shader module, all held alive at once). Both ran well past any scale
+`object_management`'s own stress tests plausibly reach:
+
+- **250 devices × 500 simultaneous buffers = 125,000 cumulative
+  allocations.** Clean, 250/250, no fd growth, no failure.
+- **350 devices × 20 simultaneous compute pipelines = 7,000 cumulative
+  pipeline creations.** Clean, 350/350.
+- **1 device × 1,000 simultaneous compute pipelines.** Clean - but
+  completed in 0.04s, which is far too fast for 1,000 independent
+  NIR→Bifrost compiles. This probe reuses one shader module and one
+  pipeline layout for every pipeline in the loop (only the source's own
+  choice to keep the test simple), so this result is likely showing an
+  internal pipeline/shader cache deduplicating identical compiles rather
+  than genuinely exercising 1,000 independent `EXEC_VA` allocations.
+  **Flagged honestly rather than counted as a clean result** - this
+  specific test doesn't prove what it set out to prove, and would need
+  per-iteration shader/layout variation (or an explicit disabled
+  `VkPipelineCache`) to actually stress independent executable-BO
+  allocation at scale.
+
+Pipelines were the leading candidate going into this pass specifically
+because `kbase_kmod_bo_free`'s own comment calls out that executable BOs
+(kbase's `EXEC_VA` zone, kernel-chosen address) are freed differently
+from ordinary buffers - not returned to this backend's VA heap tracking
+the way a fixed-address buffer is. That asymmetry is still real and still
+unverified at scale, just not disproven or confirmed by this pass.
+
+**State after two passes: every controlled, synthetic reproduction
+attempt has come up clean**, including patterns that structurally match
+what `object_management`'s own groups do (many-simultaneous-objects,
+many-simultaneous-pipelines, concurrent multi-threaded device creation,
+real memory alloc/free churn). Two explanations remain open, and neither
+is confirmed:
+
+1. The trigger needs the *specific mix* CTS produces - many different
+   object types, extensions, and `pNext` chains varying test-to-test in
+   one process - not any single repeated pattern a synthetic probe can
+   easily produce.
+2. The trigger needs something no probe here has replicated at all, e.g.
+   different queue-family/queue-count combinations per device,
+   `VK_EXT_private_data`'s slot-request `pNext` chain specifically (the
+   case that actually failed), or genuinely defeating any internal
+   pipeline cache the way case 1's caching artifact above suggests may be
+   needed.
+
+**Recommended next step, changing approach rather than trying more
+synthetic variants:** instrument the real driver directly (temporary
+`mesa_logi`/counter prints in `kbase_kmod_dev_create`/`_destroy`,
+`kbase_init_va_heap`, and `kbase_kmod_bo_alloc`/`_free` in
+`src/mesa/pan_kmod_kbase.c`) and re-run the actual failing
+`object_management` caselist against that instrumented build, rather than
+continuing to guess the reproduction shape with hand-written probes. The
+real run already reliably reproduces the failure at a known, fixed point
+(case 307/308) - instrumenting it directly will show what's actually
+happening there far faster than further synthetic reproduction attempts.
