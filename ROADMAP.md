@@ -1183,12 +1183,26 @@ Tools worth knowing about before touching any of this:
       `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Confirmed twice, landing on the
       identical 307-case count both times regardless of which specific
       case was next — points to a fixed-size resource table/slot count
-      being exhausted (kbase context slots and fd `RLIMIT`s are the
-      leading suspects), not a variable-rate leak. Not yet root-caused.
-      Device/GPU confirmed unaffected (fresh probe processes stay clean).
-      **Follow-up task: instrument `/proc/<pid>/fd` and kbase context
-      ioctls across a `deqp-vk` run to find exactly what's not being
-      released.** See `docs/kbase-notes.md` for the full writeup.
+      being exhausted, not a variable-rate leak. Device/GPU confirmed
+      unaffected (fresh probe processes stay clean).
+- [x] **Root-cause dig, first pass** (2026-08-01): built
+      `tests/device_churn_probe` and ruled out, each tested well past 307
+      iterations with zero failures: a plain fd leak (mali0 fd count
+      stayed flat), bare instance/device create-destroy churn (500x),
+      device+queue+command-pool churn (400x), real buffer+memory
+      alloc/free churn (400x), and 8-thread concurrent device creation
+      (400x, matching `multithreaded_per_thread_device`). Leading
+      remaining candidate: **many simultaneously-live objects on one
+      device** (what `max_concurrent.*`/`multiple_*` actually stress),
+      architecturally different from every pattern ruled out so far —
+      not yet tested. Web research confirms this is unexplored territory:
+      no upstream Mesa kbase backend exists to compare against (this
+      repo's `pan_kmod_kbase.c` is the first), the Poco X8 Pro's kernel
+      source (which would show the real GPL kbase driver for this device)
+      is not yet published by Xiaomi, and the one other kbase-based
+      community project found (Panfork-derived, OpenGL/Gallium only) has
+      no record of this either. See `docs/kbase-notes.md` for the full
+      writeup and the concrete next test to run.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

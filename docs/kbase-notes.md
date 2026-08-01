@@ -2080,3 +2080,98 @@ routing), 1 boundary case left aborting the tail of the run** - the
 remaining ~145 untested `object_management` cases are simply past where
 the ceiling bites, not independently interesting until the ceiling itself
 is understood.
+
+## Root-cause dig: what the ~307-case ceiling is NOT
+
+Built `tests/device_churn_probe` to isolate the create/destroy cycle from
+everything else `deqp-vk`'s `object_management` cases do, and tested each
+suspect mechanism in controlled isolation, well past 307 each time. All
+of the following completed clean, with no `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+and no fd growth:
+
+- **500 bare `vkCreateInstance`→`vkCreateDevice`→`vkDestroyDevice`→
+  `vkDestroyInstance` cycles, sequential.** `mali0` fd count stayed at 0
+  throughout (this minimal device never even opens a persistently-visible
+  `/dev/mali0` handle by the time `readlink` samples it - the fd is short-
+  lived within `pan_kmod_dev_create`/`dev_destroy`, not held open the way
+  the earlier live-sampled CTS run showed 2-18 held `mali0` fds - itself
+  a useful data point that a "thin" device leaves less resident state
+  than the real CTS ones).
+- **400 cycles adding `vkGetDeviceQueue` + create/destroy a command pool
+  and a primary command buffer each cycle** (`--use-queue`) - the first
+  place kbase-specific CSF group/queue allocation could plausibly happen
+  even without a submit. Clean.
+- **400 cycles adding a real `vkCreateBuffer`→`vkAllocateMemory`→
+  `vkBindBufferMemory`→free round trip** (`--alloc-buffer`, combined with
+  `--use-queue`) - a genuine `KBASE_IOCTL_MEM_ALLOC_EX`/`MEM_FREE` pair
+  through `kbase_kmod_bo_alloc`/`kbase_kmod_bo_free`
+  (`src/mesa/pan_kmod_kbase.c`), not just the FIXED_VA probe device
+  creation itself already does. Clean.
+- **8 threads × 50 devices concurrently** (`--threads 8`), matching what
+  `object_management`'s `multithreaded_per_thread_device` group actually
+  stresses (many threads each creating their own device at the same
+  time). Clean, 400/400 - once the test harness's own bug was fixed (see
+  below).
+
+One genuine bug found and fixed along the way, in the *test probe*, not
+the driver: the ICD shim's (`tests/icd_shim/`) lazy `init_once()` has no
+locking around its first-caller-wins guard. Multiple threads racing to
+call `vkGetInstanceProcAddr(NULL, ...)` as their simultaneous first call
+hit a real `g_hwdevice` torn-write race and SIGSEGV'd immediately. Real
+`deqp-vk` never hits this - it bootstraps the loader once, single-
+threaded, before any test spawns worker threads - so the probe was fixed
+to pre-warm the shim from the main thread before spawning workers, which
+correctly matches real CTS behavior rather than mistaking a test-harness
+artifact for a driver finding. (The shim itself was left as-is: every
+prior probe using it was single-threaded by design, so hardening its
+init for concurrent first-callers isn't warranted just for this one
+diagnostic tool - noted here so it isn't mistaken for a live issue if
+this file is read out of context.)
+
+**What none of this rules out yet:** every scenario above repeats the
+*same small pattern* many times, always freeing before moving on. The
+CTS groups that actually precede the failure - `max_concurrent.*` and
+`multiple_*` - do something structurally different: they hold **many
+objects simultaneously alive on one device** (e.g.
+`max_concurrent.buffer_storage_large` allocates buffers in a loop until
+it finds the practical concurrent limit, then frees them all at the
+end), not one object created and freed before the next begins. That
+pattern - sustained high live-object count, not creation *count* over
+time - is the leading remaining candidate and hasn't been tested in
+isolation yet.
+
+**Open-source research (asked for explicitly): this is not a previously-
+solved problem.** Searched for prior art on three fronts:
+
+1. Whether Mesa/PanVK upstream has ever dealt with this: no - upstream
+   PanVK only targets the DRM-based `panfrost`/`panthor` kernel drivers.
+   Arm's kbase is Arm's out-of-tree, non-DRM proprietary driver; there is
+   no upstream Mesa kbase backend to compare against, because this repo's
+   `pan_kmod_kbase.c` *is* that backend, written from scratch this
+   project. There is nothing to diff against.
+2. Whether the Poco X8 Pro's own kernel source (which would let this be
+   checked against the actual GPL-licensed kbase kernel driver for this
+   exact device/firmware) is available: as of this session, no - Xiaomi
+   has not yet published kernel sources for this device
+   (`MiCode/Xiaomi_Kernel_OpenSource` issue #40922 is an open request for
+   exactly this). Public Mali kbase kernel source confirms Bifrost/Valhall
+   GPUs multiplex many contexts (`kctx`) onto a small number of hardware
+   address spaces (historically up to 16) via context scheduling - a real
+   kbase concept, but it doesn't line up numerically with a ~307-case
+   ceiling (16 vs. 307 is too large a gap to be the same limit unless
+   something is also failing to release AS slots on a very slow leak,
+   which is speculative, not confirmed).
+3. Whether other community kbase-based driver projects have hit this: the
+   one found (`SolDev69/panfrost-gallium-mesa`, Panfork-derived, "works on
+   the kbase driver") is Gallium/OpenGL only, not Vulkan/PanVK - a
+   different userspace code path against the same kernel driver, and its
+   documentation has no mention of context-churn limits either.
+
+Conclusion: this is genuinely unexplored territory, not a known-and-fixed
+issue elsewhere to port a fix in from. The next concrete step is testing
+the "many simultaneously-live objects on one device" pattern directly
+(extend `device_churn_probe` or write a new probe that allocates N
+buffers on one device without freeing them until the end, N large enough
+to bracket where `max_concurrent.buffer_storage_large` itself would stop)
+rather than continuing to vary the create/destroy-churn pattern, which is
+now well-covered ground.
