@@ -3,7 +3,10 @@
 Translation layer for PanVK (Mesa's open-source Vulkan driver for Arm
 Mali GPUs) to run on **kbase**, Arm's out-of-tree/vendor kernel driver —
 instead of the upstream `panfrost`/`panthor` DRM drivers PanVK currently
-requires. Target device: Mali-G615-MC2, kbase r44p0 / UK interface 1.20 (CSF).
+requires. Original target: Mali-G615-MC2, kbase r44p0 / UK interface 1.20
+(CSF). Everything below has actually been verified on a second device, a
+Poco X8 Pro (Mali-G720, kbase r49p1 / UK 1.30) — both header sets are
+vendored, see `docs/kbase-notes.md`.
 
 **Motivating end-state:** essentially every shipping Android phone with a
 Mali GPU runs kbase, not panthor/panfrost — so PanVK cannot run on real
@@ -18,8 +21,22 @@ that is (Turnip took years of investment to get where it is; PanVK's own
 Vulkan maturity on Mali is not there yet independent of the kbase problem
 this repo solves).
 
-**Status: pre-alpha.** Standalone device probing works (see below);
-nothing wires into Mesa/PanVK yet.
+**Status (2026-08-01): a real Vulkan driver, wired into Mesa/PanVK, running
+real work on real hardware.** This line used to say "pre-alpha... nothing
+wires into Mesa/PanVK yet" — true for a long stretch of this project's
+history, and wrong since well before this update. What's actually
+verified on-device: compute pipelines built from application SPIR-V
+(`vkCmdDispatch`, GPU-signalled fences, 2000 back-to-back submits with no
+failures), binary and timeline semaphores, and — as of today — rendering:
+a real triangle (vertex shader → IDVS → tiling → fragment shader), vertex
+buffers, push constants, descriptor sets, texture sampling, depth
+test/write, and multiple draws in one render pass, each proven with its
+own hardware probe in `src/tests/render_*_probe/`. See "Where this
+actually is" under Phase 4, and Phase 5's checkboxes, in `ROADMAP.md` for
+the full account — including what's *not* yet proven (anything requiring
+`VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT`, which is still genuinely
+blocked and the subject of an open upstream question) so this line doesn't
+become the next stale claim.
 
 ## Repo layout
 
@@ -47,7 +64,12 @@ ROADMAP.md                     phased plan from here to a working PanVK
 3. Run it on the target device (as a user that can open `/dev/mali0`) to
    confirm the probe/decode still works before touching anything else.
 4. See `docs/architecture.md` for the core problem (kbase is not a DRM
-   device) that has to be solved before Mesa integration can start.
+   device) that had to be solved before Mesa integration could start —
+   solved; see `src/mesa/` for the backend and `src/tests/driver_*_probe/`
+   and `src/tests/render_*_probe/` for the on-device proof.
+5. `src/mesa/README.md` has the actual Mesa build steps (WSL, an NDK
+   cross-compile) — a normal Linux build does not exercise the kbase
+   backend at all.
 
 ## Vendored headers
 
