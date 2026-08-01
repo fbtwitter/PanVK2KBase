@@ -45,10 +45,13 @@ same outcome for Mali, not at replacing panthor.
 Where it actually is: compute works end to end on real hardware - a
 pipeline built from application SPIR-V, vkCmdDispatch, a VkFence signalled
 by the GPU, correct results read back, stable across 2000 back-to-back
-submits. Binary and timeline semaphores work. The tiler heap and the
-kbase-specific queue/group integration are both done. Rendering is blocked
-on one thing, which is the subject of my other message here - the render
-descriptor ringbuf's double mapping doesn't have an equivalent on kbase.
+submits. Binary and timeline semaphores work. Rendering works too, for
+command buffers that don't use SIMULTANEOUS_USE - real triangles, vertex
+buffers, push constants, descriptor sets, texture sampling, and depth
+test/write have all rendered correctly on real hardware. What's still
+blocked is SIMULTANEOUS_USE rendering specifically, which is the subject
+of my other message here - the render descriptor ringbuf's double mapping
+doesn't have an equivalent on kbase.
 
 I know kbase support isn't a stated priority - Panthor and now Tyr are
 where the energy is, for good reasons I'm not contesting. So the actual
