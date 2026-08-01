@@ -1407,10 +1407,23 @@ Tools worth knowing about before touching any of this:
       needs something this probe didn't replicate: draw volume (CTS issues
       4096 indirect draws, this probe issued 1), point-list topology
       (vs. triangle list), or target size (64×64 vs. 16×16). Device
-      confirmed healthy after. Next step, not attempted this pass: scale
-      the same probe's cold round toward CTS's actual shape to isolate
-      which factor is load-bearing. See `docs/kbase-notes.md` for full
-      detail.
+      confirmed healthy after.
+- [x] **Draw-call count also ruled out** (2026-08-01). Added an
+      `indirect-repeat-count` argument and re-ran with CTS's exact value —
+      4096 separate `vkCmdDrawIndirect` calls recorded into one secondary
+      buffer (matching CTS's actual shape: many separate calls, not one
+      call with a high `drawCount`). **Both cold and warm rounds passed
+      cleanly again.** Two independent, exact-value negative results now:
+      neither a single indirect draw nor 4096 of them (CTS's real count)
+      reproduces the failure. The two remaining candidates — point-list
+      topology and 64×64 target size — are very likely entangled in CTS's
+      test (4096 draws = 64×64 pixels, suggesting one point per pixel, a
+      full-coverage test, not draws piled on one spot). Testing that
+      properly means reproducing per-draw varying pixel-targeted
+      positions — substantially closer to reimplementing CTS's own test
+      than the two cheap isolations already done. Stopped here
+      deliberately rather than escalating further without a check-in. See
+      `docs/kbase-notes.md` for full detail.
 - [ ] dEQP-VK in stages: smoke → rendering → sync → compute → multisample
       → extensions. Keep an xfail list. Land fixes in small batches.
       `dEQP-VK.info.platform` excluded (known CTS-Android-EXE gap, not a

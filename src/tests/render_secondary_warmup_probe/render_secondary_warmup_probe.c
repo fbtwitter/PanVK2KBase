@@ -49,6 +49,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <vulkan/vulkan.h>
@@ -279,7 +280,7 @@ make_target(struct ctx *c, struct target *t)
  * checks the actual pixels separately.
  */
 static bool
-run_round(struct ctx *c, struct target *t, bool use_indirect,
+run_round(struct ctx *c, struct target *t, bool use_indirect, int repeat_count,
          const char *label)
 {
    printf("\n=== round: %s ===\n", label);
@@ -350,11 +351,21 @@ run_round(struct ctx *c, struct target *t, bool use_indirect,
    VkDeviceSize vbo_offset = 0;
    c->cmd_bind_vbos(secondary, 0, 1, &c->vbo, &vbo_offset);
 
+   /* CTS's many_indirect_draws_on_secondary records 4096 SEPARATE
+    * vkCmdDrawIndirect(drawCount=1) calls, not one call with a high
+    * drawCount - each is its own CS-stream-building call. repeat_count
+    * matches that shape: N separate recorded calls, same geometry/target
+    * every time, to isolate whether recorded-call COUNT itself (not
+    * rendered pixel volume, not topology, not target size) is what
+    * triggers the failure the single-draw cold round didn't reproduce.
+    */
    if (use_indirect) {
-      c->cmd_draw_indirect(secondary, c->indirect_buf, 0, 1,
-                           sizeof(VkDrawIndirectCommand));
-      printf("  recorded vkCmdDrawIndirect(drawCount=1) into the "
-             "secondary\n");
+      for (int i = 0; i < repeat_count; i++)
+         c->cmd_draw_indirect(secondary, c->indirect_buf, 0, 1,
+                              sizeof(VkDrawIndirectCommand));
+      printf("  recorded %d x vkCmdDrawIndirect(drawCount=1) into the "
+             "secondary\n",
+             repeat_count);
    } else {
       c->cmd_draw(secondary, 3, 1, 0, 0);
       printf("  recorded vkCmdDraw(3, 1, 0, 0) into the secondary\n");
@@ -519,10 +530,20 @@ main(int argc, char **argv)
               "without hanging - only ever wrong pixels - but this probe's\n"
               "specific three-round sequence has not itself run before.\n"
               "\n"
-              "If you really mean it: %s <path-to-.so> --i-know-it-hangs\n",
+              "If you really mean it: %s <path-to-.so> --i-know-it-hangs "
+              "[indirect-repeat-count]\n",
               argv[0]);
       return 2;
    }
+
+   /* Defaults to 1 (the original single-draw cold/warm test, already run
+    * and passed cleanly both cold and warm). CTS's own
+    * many_indirect_draws_on_secondary records 4096 separate
+    * vkCmdDrawIndirect calls - pass that (or an intermediate value) here
+    * to test whether recorded-call COUNT specifically is what the
+    * single-draw test didn't reproduce.
+    */
+   int indirect_repeat_count = argc > 3 ? atoi(argv[3]) : 1;
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -827,23 +848,26 @@ main(int argc, char **argv)
 
    /* --------------------------------------------------------------- rounds */
    printf("\n########################################################\n");
-   printf("# round 1: COLD - indirect draw, first secondary op ever\n");
+   printf("# round 1: COLD - %d x indirect draw, first secondary op ever\n",
+          indirect_repeat_count);
    printf("########################################################\n");
-   bool cold_submitted = run_round(&c, &cold_target, true, "cold indirect");
+   bool cold_submitted =
+      run_round(&c, &cold_target, true, indirect_repeat_count, "cold indirect");
    bool cold_ok = cold_submitted && check_pixels(&cold_target, "cold indirect result");
 
    printf("\n########################################################\n");
    printf("# round 2: WARM-UP - ordinary draw, throwaway target\n");
    printf("########################################################\n");
    bool warmup_submitted =
-      run_round(&c, &warmup_target, false, "warm-up plain draw");
+      run_round(&c, &warmup_target, false, 1, "warm-up plain draw");
    check_pixels(&warmup_target, "warm-up result (informational)");
    (void)warmup_submitted;
 
    printf("\n########################################################\n");
    printf("# round 3: WARM - indirect draw, after warm-up\n");
    printf("########################################################\n");
-   bool warm_submitted = run_round(&c, &warm_target, true, "warm indirect");
+   bool warm_submitted =
+      run_round(&c, &warm_target, true, indirect_repeat_count, "warm indirect");
    bool warm_ok = warm_submitted && check_pixels(&warm_target, "warm indirect result");
 
    printf("\n=== %d failure(s) (excluding the two summary lines below) "

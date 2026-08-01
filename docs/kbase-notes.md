@@ -3005,3 +3005,47 @@ directly by scaling this same probe's cold round up toward CTS's actual
 topology, or size) is load-bearing, rather than guessing further. Not
 attempted in this pass - the probe and its clean negative result are the
 deliverable, not a full re-investigation.
+
+## Scaling the probe: draw COUNT alone also ruled out
+
+Added an `indirect-repeat-count` argument to `render_secondary_warmup_probe`
+(defaults to 1, matching the original run) so the indirect draw could be
+issued as **N separate `vkCmdDrawIndirect` calls** recorded into the same
+secondary buffer - matching CTS's actual shape exactly (`many_indirect_draws_on_secondary`
+records 4096 separate calls, each `drawCount=1`, not one call with a high
+`drawCount` - each is its own CS-stream-building call, which is why draw
+*count* specifically, not just rendered pixel volume, was worth isolating
+as its own variable).
+
+Ran with `indirect-repeat-count=4096`, CTS's exact value, same three-round
+cold/warm-up/warm structure, same 16x16 triangle-list target as before
+(everything held constant except call count):
+
+```
+[cold indirect result] 190 clear, 66 triangle, 0 other (of 256 total)
+[warm indirect result] 190 clear, 66 triangle, 0 other (of 256 total)
+```
+
+**Both rounds passed cleanly again**, including cold, with all 4096 calls
+recorded and executed. This rules out draw-call *count* alone as the
+trigger too, at exactly the value CTS itself uses - not an approximation.
+Device confirmed healthy after via `driver_compute_probe --submit --fill`.
+
+**Two clean, independently-verified negative results now**: neither "a
+single indirect draw from a secondary buffer while cold" nor "4096 separate
+indirect draws from a secondary buffer, cold or warm" reproduces the
+failure. The two remaining untested variables - point-list topology and
+64x64 target size - are very likely *entangled* in CTS's actual test, not
+independent: 4096 draws exactly equals 64x64 pixels, strongly suggesting
+each of the 4096 separate indirect draws places one point at a distinct
+pixel coordinate (a full-coverage test: every pixel must end up written),
+not 4096 draws piled on the same location the way this probe's repeat-count
+does. Properly testing that would mean reproducing the per-draw varying
+position logic (point list topology, `gl_PointSize`, and per-draw vertex
+data addressing a specific target pixel) - substantially closer to
+reimplementing CTS's own test than the two clean, cheap isolations already
+done. Stopping here rather than continuing to escalate the probe further
+without a check-in: the volume/count hypothesis is now thoroughly ruled
+out through two independent, exact-value tests, and the remaining
+candidate (point-list full-coverage) is a bigger, more speculative next
+step worth a deliberate decision rather than silent continuation.
