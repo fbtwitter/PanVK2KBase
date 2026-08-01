@@ -466,5 +466,17 @@ mesa-backend-check: mesa-backend-sync
 	@echo "pan_kmod_kbase.c: compiles clean against real Mesa + kbase headers"
 	@echo "defines: $$($(NM) --defined-only -g build/mesa-backend/pan_kmod_kbase.o | awk '{print $$NF}' | tr '\n' ' ')"
 
+# Bridges standard-Vulkan-loader-ABI tools (deqp-vk, in particular) to this
+# repo's driver, which speaks Android's hwvulkan HAL ABI instead - see the
+# file header for why that gap exists and why this is the safe way to
+# close it (not installing the driver as the system Vulkan HAL). Needs the
+# Vulkan headers, which is why this links against -Ithird_party/mesa/
+# include if present, falling back to the NDK's own <vulkan/vulkan_core.h>.
+# Cross-compile with the NDK, same as the driver_*/render_*_probe targets -
+# this is not a native/WSL build.
+icd_shim: ./src/tests/icd_shim/panvk_kbase_icd_shim.c
+	$(CC) $(CFLAGS) -shared -fPIC \
+	  -o ./build/libpanvk_kbase_icd_shim.so $< -ldl
+
 clean:
 	rm -f first_test
