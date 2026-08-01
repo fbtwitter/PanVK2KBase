@@ -1702,3 +1702,76 @@ specifically and multi-attachment/depth state. Still unexercised: textures
 (a `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` binding, not fundamentally
 different from what this probe just proved, but untested), depth/stencil,
 multiple draws in one render pass.
+
+## Texture sampling works, but only through TRANSFER_SRC_OPTIMAL - and one part of this is still unexplained
+
+Sixth probe, same session: `tests/render_texture_probe` swaps
+`render_ubo_probe`'s uniform buffer for a combined image sampler bound to
+a real 1x1 texture. This is the first probe this session that did **not**
+pass on the first attempt, and the honest account of both the failure and
+the fix - including the part that is still not understood - is worth
+having in full.
+
+### First attempt: a clean failure, not a hang
+
+Upload sequence was `UNDEFINED -> TRANSFER_DST_OPTIMAL` (copy in) `->
+SHADER_READ_ONLY_OPTIMAL`, a spec-legal single-step transition. No hang,
+no fault, `vkQueueSubmit` accepted, the fence signalled - but the readback
+came back **190 clear-colour, 0 texture-colour, 66 "other," all zero**
+(`00000000`). Confirmed device health immediately after
+(`driver_compute_probe --fill` and `render_ubo_probe`, both clean) and
+checked `adb logcat -d -s MESA` for any driver warning - none. The
+operation completed successfully by the driver's own accounting and
+produced a wrong answer, which is a different and in some ways more
+concerning class of result than anything else this session: every earlier
+failure mode in this repo has either hung the device or been refused
+outright. A silent wrong answer is the one a test suite can miss.
+
+### The fix
+
+Added an intermediate `TRANSFER_SRC_OPTIMAL` stage between the upload and
+the shader-read transition - `TRANSFER_DST_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+-> SHADER_READ_ONLY_OPTIMAL`, an extra `vkCmdPipelineBarrier` that has no
+obvious reason to be required by the Vulkan spec. With it: **190
+clear-colour, 66 texture-colour, 0 other - an exact match with every
+earlier probe, reproduced twice.** The texture's specific uploaded colour
+(`e63399ff`) came back correctly through the shader both times.
+
+### What is still not understood
+
+The intermediate stage was added alongside a diagnostic - copying the
+texture straight back out to a host-visible buffer immediately after
+upload, before it is ever sampled, to bisect "the upload did not reach the
+image" from "sampling is wrong." That diagnostic **still reads back
+`00000000` on every run**, even in the passing version where the shader
+correctly samples `e63399ff` moments later in the same command buffer.
+
+So there are, reproducibly, two different answers to "what does the
+texture hold" depending on which GPU path asks: `vkCmdCopyImageToBuffer`
+says zero, the fragment shader's `texture()` sampler says correct. Both
+read the same image, same layout at time of read
+(`TRANSFER_SRC_OPTIMAL`/`SHADER_READ_ONLY_OPTIMAL` respectively, each
+reached by its own correctly-ordered barrier from the same upload). This
+was not chased to a root cause - the primary result (real shader sampling
+is correct and reproducible) was the thing worth having, and further
+device-side iteration to fully explain a secondary diagnostic anomaly
+is exactly the kind of open-ended debugging this repo's own history
+warns against doing live without a specific reason to keep going.
+
+Two live hypotheses, neither confirmed: a cache/coherency gap specific to
+reading a just-written image back through the transfer-copy path on this
+device (as opposed to the texture-sampling path, which may go through
+different cache handling), or a bug in the diagnostic itself unrelated to
+the real fix. Worth revisiting if a future texture probe needs the
+transfer-readback path to work (e.g. reading a render target back as a
+texture within the same command buffer) rather than only the
+sample-in-a-shader path this probe actually needed.
+
+**Six hardware-risk probes run this session; five clean on the first
+attempt, one (this one) genuinely wrong on the first attempt and fixed
+with a specific, reproducible, but not fully explained change.** Recorded
+as found rather than smoothed over, because "add a barrier that
+shouldn't be necessary" is exactly the kind of workaround that needs to
+stay visible if it turns out to matter for the render descriptor ringbuf
+work or anything else that moves data between transfer and shader access
+on this device.

@@ -1072,6 +1072,23 @@ Tools worth knowing about before touching any of this:
       last basic plumbing mechanism a graphics pipeline needs, proven.
       What's left (textures, depth/stencil, multi-draw) is variation on
       this and the earlier probes, not a new mechanism.
+- [x] **Textures — done, same session, but not clean on the first try.**
+      `tests/render_texture_probe`: a real 1x1 texture through a combined
+      image sampler. First attempt genuinely failed — no hang, no fault,
+      but the sampled colour read back as `00000000` instead of the
+      uploaded texel. Fixed by inserting an intermediate
+      `TRANSFER_SRC_OPTIMAL` stage between upload and the shader-read
+      transition, which the Vulkan spec does not obviously require.
+      Reproduced clean twice after the fix: 190/66/0, exact match, correct
+      colour. **One part is still unexplained:** a diagnostic added
+      alongside the fix — reading the texture straight back via
+      `vkCmdCopyImageToBuffer` before it's ever sampled — reads `00000000`
+      on every run, even though the shader samples the correct colour
+      moments later in the same command buffer. Not chased to a root
+      cause; see `docs/kbase-notes.md`'s full account, including the two
+      live hypotheses. **First probe this session not clean on the first
+      attempt** — worth remembering that the five-clean streak before it
+      was real progress, not proof the next thing will also just work.
 - [x] Render to a buffer, dump to PNG, diff pixels. No WSI, no display.
       Substance done by the two probes above (render to a buffer, diff
       pixels programmatically); no PNG dump exists, since the in-process

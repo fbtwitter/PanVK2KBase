@@ -215,6 +215,22 @@ render_ubo_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py ubo_frag.spv \
 	    ubo_frag_spv.h render_ubo_probe_frag
 
+# One variable changed from render_ubo_probe: the descriptor is a combined
+# image sampler bound to a real 1x1 texture, instead of a uniform buffer -
+# a genuinely different hardware path (image sampling). Same
+# --i-know-it-hangs gate.
+render_texture_probe: ./src/tests/render_texture_probe/render_texture_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_texture_probe -o ./build/render_texture_probe $<
+
+render_texture_probe_shaders:
+	cd ./src/tests/render_texture_probe && \
+	  glslangValidator -V texture.vert -o texture_vert.spv && \
+	  glslangValidator -V texture.frag -o texture_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py texture_vert.spv \
+	    texture_vert_spv.h render_texture_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py texture_frag.spv \
+	    texture_frag_spv.h render_texture_probe_frag
+
 # Semaphores: creation, a binary chain between two submits, and a timeline
 # value the GPU has to write exactly. vkCreateSemaphore used to fail outright,
 # so nothing before this could order any work. Reuses driver_pipeline_probe's
