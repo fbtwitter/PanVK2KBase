@@ -921,7 +921,28 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       assumes doesn't exist on this kernel driver at all."
 - [ ] Budget the most time here. This was the long pole for kgsl too.
 
-## Where this actually is (2026-07-31)
+## Where this actually is (2026-08-02)
+
+**Short version.** Compute and rendering work and are pixel-exact. dma-buf
+import works, including a real AHardwareBuffer — the memory path a swapchain
+image takes. Sync-fd semaphores work, so both halves of the Android
+acquire/release handshake exist. The driver loads rootlessly through a
+custom linker namespace. A present-shaped frame costs ~15ms (64 fps) at
+720p with trivial GPU work.
+
+**What has never run: an actual swapchain.** Every piece of the presentation
+handshake is proven individually, but only from a shell binary. Driving
+`vkAcquireImageANDROID`/`vkQueueSignalReleaseImageANDROID` against a real
+`ANativeWindow` needs an APK, which is a different kind of work from
+anything in `src/tests/` and is the single largest remaining unknown.
+
+**Verification.** `make regress` runs 30 probes across three tiers
+(`tools/run-probes.sh`); all pass. CTS: `api.smoke` 6/6, `api.command_buffers`
+130/131 with one known failure, and sampled sweeps of `copy_and_blit` and
+`image_clearing` — see `docs/kbase-notes.md`.
+
+The rest of this section is the 2026-07-31 write-up, still accurate except
+where noted inline.
 
 Working end to end on the Poco X8 Pro (Mali-G720 MC8, kbase r49p1):
 `vkCreateDevice` → command buffer → compute pipeline from application

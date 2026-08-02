@@ -3788,3 +3788,140 @@ unattended runs. And the ability to run a health probe against the device
 *while* a CTS process is stalled remains the cheapest way to tell "the
 driver is wedged" from "something else is slow" — worth reaching for first,
 because the two look identical from the test runner's point of view.
+
+## CTS: the deferred sweeps, sampled — and `vkCmdClearColorImage` is broken
+
+`copy_and_blit`, `image_clearing` and `query_pool` were deferred as "huge
+sweeps". Enumerating them shows why, and settles how they can be run at all:
+
+```
+api.copy_and_blit   201,346 cases
+api.image_clearing   45,636 cases
+query_pool           18,880 cases
+```
+
+~266,000 cases. At the rate `command_buffers` ran (~2 s/case for GPU-heavy
+ones) that is days of wall time, so running them whole is not a thing that
+happens. Instead each was sampled with a **uniform stride over the
+alphabetically-sorted caselist** (`--deqp-runmode=stdout-caselist`, then
+`awk 'NR % stride == 1'`), giving ~400 cases per group. A uniform stride
+hits every subgroup rather than clustering in whichever one sorts first,
+which a `head -400` would not.
+
+### `copy_and_blit` — 401 sampled: 181 pass, 1 fail, 219 not supported
+
+One failure:
+`core.use_after_copy.r32g32b32_sfloat.transfer_dst_optimal.32x32x1_regions_3d_img_linear`
+— "Unexpected output in color buffer". A single case in a
+copy-then-reuse-the-image path, not obviously a family. Worth a look, not
+alarming.
+
+### `image_clearing` — 401 sampled: 152 pass, **106 fail**, 143 not supported
+
+**This is a real driver bug and the most valuable thing the sweeps found.**
+103 of the 106 failures are `clear_color_image`; 3 are
+`clear_depth_stencil_image`. Of 272 `clear_color_image` cases sampled, 103
+failed.
+
+The signature is identical everywhere: the readback is **(0,0,0,x)** — the
+clear simply did not happen — across a wide spread of formats
+(`r8g8b8a8_unorm`, `r8g8b8a8_uint`, `r5g6b5_unorm_pack16`,
+`b4g4r4a4_unorm_pack16`, `b10g11r11_ufloat_pack32`, `r16g16_unorm`,
+`r16g16_uint`, ...):
+
+```
+Fail (Color value mismatch! Ref:(0.1, 0.5, 0.3, 0.9) Mask:(1,1,1,1)
+      Threshold:(0.0039,...) Color:(0, 0, 0, 0))
+```
+
+It is **not** confined to any axis that would suggest a narrow edge case:
+
+```
+1d.linear 20   1d.optimal 18
+2d.linear 28   2d.optimal 20
+3d.linear  4   3d.optimal 13
+
+single_layer 45  multiple_layers 21  remaining_array_layers 25
+                                     remaining_array_layers_twostep 12
+```
+
+**Why no probe caught this.** Every render probe in `src/tests/` clears via
+`VK_ATTACHMENT_LOAD_OP_CLEAR` — a render-pass clear, which works and is
+pixel-exact. `vkCmdClearColorImage` is a different entry point: a standalone
+clear outside a render pass. Nothing in this repo exercised it, so a whole
+code path was unverified while the probes all passed. That is the case for
+running CTS rather than trusting a hand-written suite, and it is worth
+remembering the next time coverage looks complete.
+
+`r8g8b8a8_unorm` failing matters: that is the most ordinary format there is,
+so this is not an exotic-format problem. Anything that clears an image
+outside a render pass — which includes plenty of real application and
+emulator code — gets black.
+
+Not yet root-caused. It is squarely in the area the recently-rewritten
+`pan_fb` framebuffer abstraction and AFBC-by-default both touch, which makes
+`PANVK_DEBUG=noafbc` the obvious first experiment.
+
+### `query_pool` — see below
+
+### Method note worth keeping
+
+Sampling by stride makes a 200k-case group answerable in ~20 minutes, and
+the failure grouping (`sed`/`cut`/`uniq -c` over the failing case names) is
+what turned 106 individual failures into one sentence. Do that before
+reading any individual log.
+
+### `query_pool` — blocked by the resource ceiling, not by query support
+
+Of 401 sampled cases, **56 ran**: 8 pass, 1 fail, 47 not supported. The run
+aborted three times, and each abort is the same thing:
+
+```
+ResourceError (vk.createDevice(...): VK_ERROR_OUT_OF_DEVICE_MEMORY
+               at vkRefUtilImpl.inl:347)
+```
+
+CTS treats a `ResourceError` as fatal and stops the whole run, so one such
+case costs every case after it.
+
+Two distinct cases trigger it reproducibly:
+
+- `query_pool.maintenance7.query_32b_wrap_required` — aborted at case 2 on
+  two consecutive fresh processes, so it is that case rather than
+  accumulated state.
+- `query_pool.statistics_query.compute_shader_invocations.32bits_dstoffset_cmdcopyquerypoolresults_stride_zero_primary_cq`
+  — aborted at case 56 once the first was excluded.
+
+Excluding the first took the run from 2 cases to 56, which is what
+establishes these as specific cases rather than a cumulative wall.
+
+This is the **known resource-ceiling family** (Phase 7, closed as downstream
+kbase pool/shrinker behaviour rather than a bug in this port), and the
+device was healthy throughout: no `D`-state process, `driver_compute_probe
+--submit --fill` clean afterwards, and `MemAvailable` 4.6 GB with
+`CmaFree` 108 MB — so system memory is not exhausted, which matches the
+earlier finding that this ceiling is invisible to `/proc/meminfo`.
+
+Worth separating two things that look alike: `vkCreateDevice` returning
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` here is *not* the same as the feature being
+unsupported — CTS reports genuinely unsupported features as `NotSupported`
+and carries on, as it did for 47 cases in this very run. So these two cases
+are asking for a device configuration that makes creation fail rather than
+one the driver declines, and that distinction is where a root-cause attempt
+should start.
+
+**Practical consequence:** `query_pool` cannot be swept without an exclusion
+list built by bisection, one aborting case at a time. Both cases above go on
+it alongside `trim_command_pool`.
+
+### Item 2 summary
+
+| group | sampled | pass | fail | notsupported | notes |
+|---|---|---|---|---|---|
+| `command_buffers` | 131 (all) | 57 | 1 | 71 | 1 known failure; `trim_command_pool` stalled |
+| `copy_and_blit` | 401 / 201,346 | 181 | 1 | 219 | one `use_after_copy` failure |
+| `image_clearing` | 401 / 45,636 | 152 | **106** | 143 | **`vkCmdClearColorImage` broken** |
+| `query_pool` | 56 / 18,880 | 8 | 1 | 47 | aborted by the resource ceiling |
+
+The headline is `vkCmdClearColorImage`. Everything else is either a known
+issue or a single case.
