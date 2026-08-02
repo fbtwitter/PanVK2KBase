@@ -1,0 +1,17 @@
+# This repo is developed on Windows (core.autocrlf=true) but every script in
+# it runs under WSL, Git Bash, or on the Android device. Without this file,
+# checkout rewrites shell scripts to CRLF and `bash` then fails on the
+# shebang line - `#!/usr/bin/env bash\r` is not a program.
+#
+# That is not hypothetical: docs/kbase-notes.md records having to work around
+# exactly this on src/mesa/wsl-build*.sh with `tr -d '\r' | bash`.
+*.sh text eol=lf
+
+# Same reasoning for anything else that is read by a POSIX tool rather than
+# by a Windows one.
+makefile   text eol=lf
+*.py       text eol=lf
+*.cross    text eol=lf
+
+# SPIR-V modules are binary; never let them near line-ending translation.
+*.spv binary

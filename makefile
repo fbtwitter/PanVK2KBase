@@ -50,12 +50,32 @@ MESA_INCLUDES := -I$(STUB_INCLUDE_DIR) -I$(MESA_DIR) -I$(MESA_GENXML_DIR) \
 INCLUDES := -I$(KBASE_UAPI_DIR) -Isrc/utils -include src/utils/kconfig_shim.h \
             $(MESA_INCLUDES)
 
-.PHONY: all clean list-kbase-versions
+.PHONY: all clean list-kbase-versions regress regress-render regress-list
 
 all: first_test
 
 list-kbase-versions:
 	@ls -1 third_party | sed -n 's/^kbase-uapi-//p'
+
+# Build, push (md5-verified) and run the known-good probe set against the
+# attached device, with per-probe timeouts and interleaved health checks.
+# The logic lives in tools/run-probes.sh rather than here - it needs state
+# that does not read well as Make. See that file's header, especially the
+# part about why tests/alias_cs_probe is never run by it.
+#
+#   make regress          raw + driver tiers (default, unattended-safe)
+#   make regress-render   also the render tier (passes --i-know-it-hangs)
+#   make regress-list     print the manifest without running anything
+#
+# Pass extra flags with ARGS=, e.g.  make regress ARGS=--only=first_test
+regress:
+	@bash tools/run-probes.sh $(ARGS)
+
+regress-render:
+	@bash tools/run-probes.sh --with-render $(ARGS)
+
+regress-list:
+	@bash tools/run-probes.sh --list
  
 first_test: ./src/tests/first_test/first_test.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) $(MESAFLAGS) -o ./build/first_test $<
