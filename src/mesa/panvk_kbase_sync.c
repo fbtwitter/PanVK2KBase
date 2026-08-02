@@ -64,8 +64,16 @@
  *   owner of the fd's event stream rather than a read() per waiter.
  */
 
+#include <poll.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+/* How long export_sync_file() will wait for the payload before giving up.
+ * Nothing in this driver blocks forever; see the timeout inventory in
+ * panvk_vX_kbase_queue.c.
+ */
+#define PANVK_KBASE_EXPORT_TIMEOUT_NS (5ull * 1000 * 1000 * 1000)
 
 #include "util/os_time.h"
 #include "util/u_math.h"
@@ -155,6 +163,8 @@ panvk_kbase_sync_init(struct vk_device *device, struct vk_sync *sync,
    }
 
    s->slot = slot;
+   s->sync_fd = -1;
+   s->imported = false;
 
    volatile uint64_t *v = slot_value(type, s->slot);
    v[0] = initial_value;
@@ -164,12 +174,28 @@ panvk_kbase_sync_init(struct vk_device *device, struct vk_sync *sync,
    return VK_SUCCESS;
 }
 
+/* Discard an imported sync_file payload, returning the sync to its slot.
+ *
+ * Called from every operation that replaces the payload - signal, reset and
+ * move - because after any of those the slot is the truth again and a stale
+ * imported fd would keep answering waits with someone else's completion.
+ */
+static void
+drop_imported(struct panvk_kbase_sync *s)
+{
+   if (s->sync_fd >= 0)
+      close(s->sync_fd);
+   s->sync_fd = -1;
+   s->imported = false;
+}
+
 static void
 panvk_kbase_sync_finish(struct vk_device *device, struct vk_sync *sync)
 {
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
 
+   drop_imported(s);
    free_slot(type, s->slot);
 }
 
@@ -179,6 +205,11 @@ panvk_kbase_sync_signal(struct vk_device *device, struct vk_sync *sync,
 {
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
+
+   /* A CPU signal replaces whatever the payload was, including an imported
+    * fence.
+    */
+   drop_imported(s);
 
    /* vk_sync passes value == 0 for binary syncs, meaning "signalled". */
    if (!(sync->flags & VK_SYNC_IS_TIMELINE))
@@ -227,6 +258,19 @@ panvk_kbase_sync_move(struct vk_device *device, struct vk_sync *dst,
    s->slot = d->slot;
    d->slot = moved;
 
+   /* The imported payload moves with the slot, for the same reason: it *is*
+    * the payload when set. dst inherits it; src is left with dst's old one,
+    * which is then dropped below so src reads as unsignalled.
+    */
+   int moved_fd = s->sync_fd;
+   bool moved_imported = s->imported;
+   s->sync_fd = d->sync_fd;
+   s->imported = d->imported;
+   d->sync_fd = moved_fd;
+   d->imported = moved_imported;
+
+   drop_imported(s);
+
    /* src must read as unsignalled afterwards. The slot it now holds is dst's
     * old one, which is usually a freshly created temporary and already zero,
     * but the contract is that this function leaves src reset rather than that
@@ -258,6 +302,8 @@ panvk_kbase_sync_reset(struct vk_device *device, struct vk_sync *sync)
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
 
+   drop_imported(s);
+
    volatile uint64_t *v = slot_value(type, s->slot);
    v[0] = 0;
    v[1] = 0;
@@ -270,7 +316,24 @@ static bool
 wait_satisfied(struct panvk_kbase_sync_type *type,
                const struct vk_sync_wait *wait)
 {
-   uint64_t have = *slot_value(type, to_kbase_sync(wait->sync)->slot);
+   struct panvk_kbase_sync *s = to_kbase_sync(wait->sync);
+
+   /* An imported sync_file replaces the slot as the payload. Waiting on it
+    * is poll(): a sync_file becomes readable when its fence signals, which
+    * is standard kernel behaviour and needs nothing from kbase.
+    *
+    * sync_fd < 0 here is the "imported -1" case - the compositor had
+    * nothing outstanding - and is satisfied immediately.
+    */
+   if (s->imported) {
+      if (s->sync_fd < 0)
+         return true;
+
+      struct pollfd pfd = {.fd = s->sync_fd, .events = POLLIN};
+      return poll(&pfd, 1, 0) == 1;
+   }
+
+   uint64_t have = *slot_value(type, s->slot);
 
    /* A binary sync is signalled at any non-zero value; a timeline is
     * satisfied once it reaches the requested point. A timeline wait_value
@@ -349,6 +412,100 @@ panvk_kbase_sync_wait_many(struct vk_device *device, uint32_t wait_count,
    }
 }
 
+/* Android acquire: take ownership of a sync_file and make it the payload.
+ *
+ * The runtime hands this in from vkAcquireImageANDROID, which owns the fd it
+ * got from the compositor and transfers that ownership to us on success.
+ *
+ * fd < 0 is legal and common - it means the compositor had nothing
+ * outstanding, i.e. "already signalled" - so it is recorded as an imported
+ * payload that is immediately satisfied rather than rejected.
+ */
+static VkResult
+panvk_kbase_sync_import_sync_file(struct vk_device *device,
+                                  struct vk_sync *sync, int sync_file)
+{
+   struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
+   struct panvk_kbase_sync *s = to_kbase_sync(sync);
+
+   if (sync_file >= 0) {
+      /* KBASE_IOCTL_FENCE_VALIDATE is a real type check, not a rubber stamp
+       * - tests/sync_fd_probe confirmed it rejects an eventfd and a kbase
+       * sync-stream fd alike. Checking here refuses a bogus import at the
+       * point the mistake was made, rather than letting a poll() on
+       * something that is not a fence quietly never complete.
+       */
+      if (!pan_kmod_kbase_fence_validate(type->fd, sync_file)) {
+         return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                          "fd %d is not a fence (FENCE_VALIDATE rejected it)",
+                          sync_file);
+      }
+   }
+
+   /* Only now that the import cannot fail: the Vulkan spec requires the fd
+    * to be left alone on failure, so nothing above may have consumed it.
+    */
+   drop_imported(s);
+
+   s->sync_fd = sync_file;
+   s->imported = true;
+
+   return VK_SUCCESS;
+}
+
+/* Android release: hand back a fence the compositor can wait on.
+ *
+ * kbase cannot produce one. KBASE_IOCTL_STREAM_CREATE yields what its header
+ * calls a timeline, but it is not a userspace-drivable sw_sync timeline -
+ * SW_SYNC_IOC_CREATE_FENCE gives ENOTTY, because in kbase that stream is
+ * driven by JM-era job atoms with no CSF equivalent. There is no ioctl that
+ * says "signal this fence now", so userspace cannot manufacture a fence tied
+ * to GPU completion. Measured by tests/sync_fd_probe.
+ *
+ * The Vulkan spec provides the way out: exporting SYNC_FD may return -1,
+ * meaning the payload is already signalled. That is legal and honest
+ * *provided we actually wait first* - which is what this does. It costs a
+ * CPU block per present instead of letting the compositor wait, and that is
+ * the real price of this backend, not a shortcut.
+ */
+static VkResult
+panvk_kbase_sync_export_sync_file(struct vk_device *device,
+                                  struct vk_sync *sync, int *sync_file)
+{
+   /* If the payload is itself an imported fence, hand back a dup of it
+    * rather than blocking - it is already exactly the fence being asked
+    * for, and passing it along is both cheaper and more useful than
+    * collapsing it to -1.
+    */
+   struct panvk_kbase_sync *s = to_kbase_sync(sync);
+   if (s->imported) {
+      *sync_file = s->sync_fd >= 0 ? dup(s->sync_fd) : -1;
+      return VK_SUCCESS;
+   }
+
+   const struct vk_sync_wait wait = {
+      .sync = sync,
+      .wait_value = (sync->flags & VK_SYNC_IS_TIMELINE) ? 1 : 0,
+   };
+
+   VkResult result = panvk_kbase_sync_wait_many(
+      device, 1, &wait, 0,
+      os_time_get_absolute_timeout(PANVK_KBASE_EXPORT_TIMEOUT_NS));
+
+   if (result == VK_TIMEOUT) {
+      return vk_errorf(device, VK_ERROR_DEVICE_LOST,
+                       "timed out after %ums waiting to export a sync file",
+                       (unsigned)(PANVK_KBASE_EXPORT_TIMEOUT_NS / 1000000));
+   }
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* -1: "already signalled", which it now is. */
+   *sync_file = -1;
+
+   return VK_SUCCESS;
+}
+
 VkResult
 panvk_kbase_sync_type_init(struct panvk_kbase_sync_type *type, int fd)
 {
@@ -384,6 +541,11 @@ panvk_kbase_sync_type_init(struct panvk_kbase_sync_type *type, int fd)
       .move = panvk_kbase_sync_move,
       .get_value = panvk_kbase_sync_get_value,
       .reset = panvk_kbase_sync_reset,
+      /* Android acquire/release. The runtime keys off these pointers being
+       * non-NULL; there is no feature bit for sync files.
+       */
+      .import_sync_file = panvk_kbase_sync_import_sync_file,
+      .export_sync_file = panvk_kbase_sync_export_sync_file,
       .wait_many = panvk_kbase_sync_wait_many,
    };
 

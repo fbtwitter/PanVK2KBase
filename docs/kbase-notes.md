@@ -3492,3 +3492,58 @@ Mali support", but "when loading a non-Adreno driver, put `/system/lib64`
 and `/vendor/lib64` on the namespace search path and link `libvndksupport`
 and `libdl_android` from the default namespace". That is a much easier
 conversation than the one this repo thought it was going to have.
+
+## Sync-fd semaphores implemented — the last driver-side presentation blocker
+
+Implements what the previous section measured. `panvk_kbase_sync.c` gains
+`import_sync_file` / `export_sync_file`, and with them the Android
+acquire/release handshake has both halves it needs.
+
+**No patch script was required**, which is worth recording because the plan
+assumed one. `vk_sync_semaphore_import_types()` derives `SYNC_FD` support
+directly from `type->export_sync_file != NULL` (for binary semaphores), so
+adding the ops is sufficient — the runtime advertises the capability by
+itself. Confirmed on device: `SYNC_FD semaphore features = 0x3` (import and
+export both set).
+
+**Import** takes ownership of the fd and makes it the payload. `fd == -1`
+is legal and common — it is what `vkAcquireImageANDROID` passes whenever the
+compositor has nothing outstanding — so it is recorded as an imported
+payload that is immediately satisfied, not rejected. A real fd is validated
+with `KBASE_IOCTL_FENCE_VALIDATE` first (via
+`pan_kmod_kbase_fence_validate()`, which lives in `pan_kmod_kbase.c` because
+that is the only TU with the kbase UAPI headers), so a non-fence is refused
+at the point the mistake was made rather than becoming a `poll()` that never
+completes. Waiting is then `poll()` on the fd.
+
+**Export** waits for the payload and returns -1, the spec's "already
+signalled". If the payload is *itself* an imported fence it hands back a
+`dup()` of it instead, which is both cheaper and more useful than collapsing
+a perfectly good fence to -1.
+
+**The bookkeeping that is easy to get wrong**: an imported fence *replaces*
+the slot as the payload, so `signal`, `reset` and `move` all have to drop it
+— otherwise a stale fd keeps answering waits with someone else's
+completion. `move` swaps the imported state along with the slot index, for
+the same reason it swaps the slot rather than copying its contents.
+
+**Verified on hardware** (`tests/driver_android_wsi_probe`, now covering
+this):
+
+```
+SYNC_FD semaphore features = 0x3 (import=1 export=1)
+vkImportSemaphoreFdKHR(fd=-1, "already signalled") -> 0
+vkGetSemaphoreFdKHR -> 0, fd=-1
+```
+
+**One trap worth the ink**: the extension must be *enabled* on the device,
+not merely supported by it. Without `VK_KHR_external_semaphore_fd` in
+`ppEnabledExtensionNames`, `vkImportSemaphoreFdKHR`/`vkGetSemaphoreFdKHR`
+do not resolve at all — which reads as "the driver does not implement this"
+when it does. That cost a cycle here.
+
+**The cost, restated because it is real**: export blocks the calling thread
+until the GPU finishes, instead of handing the compositor a fence to wait
+on. On top of the ~12 ms idle-GPU kick already measured, an application that
+presents every frame pays both. Correct, not fast, and it is what kbase
+allows.

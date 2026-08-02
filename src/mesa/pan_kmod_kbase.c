@@ -1478,6 +1478,14 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
  * be assumed to behave the same way. Confirmed on hardware by
  * tests/event_slot_probe - see docs/kbase-notes.md "Finding 2".
  */
+bool
+pan_kmod_kbase_fence_validate(int fd, int fence_fd)
+{
+   struct kbase_ioctl_fence_validate v = { .fd = fence_fd };
+
+   return ioctl(fd, KBASE_IOCTL_FENCE_VALIDATE, &v) == 0;
+}
+
 void *
 pan_kmod_kbase_alloc_event_mem(int fd, size_t size, uint64_t *gpu_va)
 {

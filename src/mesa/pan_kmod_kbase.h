@@ -54,6 +54,25 @@ bool pan_kmod_fd_is_kbase(int fd, uint16_t *uk_major, uint16_t *uk_minor);
 void *pan_kmod_kbase_alloc_event_mem(int fd, size_t size, uint64_t *gpu_va);
 
 /**
+ * pan_kmod_kbase_fence_validate() - Is this fd really a fence?
+ * @fd: kbase device fd.
+ * @fence_fd: The fd to check.
+ *
+ * Wraps KBASE_IOCTL_FENCE_VALIDATE, which is a genuine type check rather
+ * than a rubber stamp - tests/sync_fd_probe measured it rejecting both an
+ * eventfd and a kbase sync-stream fd. Used to refuse a bogus SYNC_FD import
+ * at the point the mistake is made, instead of leaving a poll() on something
+ * that is not a fence to never complete.
+ *
+ * Lives here rather than in panvk_kbase_sync.c because this is the only
+ * translation unit built with the kbase UAPI headers, the same reason
+ * pan_kmod_kbase_alloc_event_mem() does.
+ *
+ * Return: true if the kernel recognises @fence_fd as a fence.
+ */
+bool pan_kmod_kbase_fence_validate(int fd, int fence_fd);
+
+/**
  * pan_kmod_kbase_free_event_mem() - Release CSF event memory.
  * @fd: kbase device fd.
  * @cpu: Pointer returned by pan_kmod_kbase_alloc_event_mem().

@@ -31,9 +31,18 @@
 //   2. can a device be created with the AHardwareBuffer extension enabled?
 //   3. does vkGetAndroidHardwareBufferPropertiesANDROID work on a real AHB?
 //   4. can that AHB be imported as VkDeviceMemory?
+//   5. do SYNC_FD semaphores import and export, which acquire/release needs?
 //
-// (4) is the one that matters: it is the same memory path a swapchain image
-// takes, and it runs through the dma-buf import this port just gained.
+// (4) is the one that matters for memory: it is the same path a swapchain
+// image takes, and it runs through the dma-buf import this port gained.
+// (5) is the other half - vkAcquireImageANDROID imports a sync fd and
+// vkQueueSignalReleaseImageANDROID exports one, and without both the
+// compositor handshake cannot happen at all.
+//
+// Note on (5): the extension has to be *enabled* on the device, not merely
+// supported by it, or vkImportSemaphoreFdKHR/vkGetSemaphoreFdKHR do not
+// resolve even though the capability is advertised. That cost a cycle here
+// and reads as "the feature is missing" when it is not.
 //
 // No --i-know-it-hangs gate: no render pass, no draw.
 //
@@ -46,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <android/hardware_buffer.h>
 #include <vulkan/vulkan.h>
@@ -196,11 +206,20 @@ int main(int argc, char **argv) {
       VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
       VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
       VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+      /* Without these the vkImportSemaphoreFdKHR / vkGetSemaphoreFdKHR
+       * entrypoints do not resolve, even though the capability is
+       * advertised - the extension has to be enabled on the device, not
+       * merely supported by it.
+       */
+      VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,
    };
    /* Only ask for the ones this driver actually has, so a missing optional
     * dependency reports as itself rather than as a device-creation failure.
     */
-   const char *enable[8];
+   const char *enable[16];
    uint32_t n_enable = 0;
    for (size_t w = 0; w < sizeof(want) / sizeof(want[0]); w++) {
       for (uint32_t i = 0; i < n; i++) {
@@ -306,6 +325,89 @@ int main(int argc, char **argv) {
    }
 
    AHardwareBuffer_release(ahb);
+
+   /* ------------------------------- 5. the sync-fd half of acquire/release */
+   printf("\n=== sync fds: what Android acquire/release needs ===\n");
+   {
+      PFN_vkGetPhysicalDeviceExternalSemaphoreProperties get_sem_props =
+         (PFN_vkGetPhysicalDeviceExternalSemaphoreProperties)
+            vk->GetInstanceProcAddr(
+               inst, "vkGetPhysicalDeviceExternalSemaphoreProperties");
+
+      VkPhysicalDeviceExternalSemaphoreInfo sem_info = {
+         .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      VkExternalSemaphoreProperties sem_props = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+      };
+      get_sem_props(pd, &sem_info, &sem_props);
+      printf("  SYNC_FD semaphore features = 0x%x (import=%d export=%d)\n",
+             sem_props.externalSemaphoreFeatures,
+             !!(sem_props.externalSemaphoreFeatures &
+                VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT),
+             !!(sem_props.externalSemaphoreFeatures &
+                VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT));
+      check(sem_props.externalSemaphoreFeatures != 0,
+            "SYNC_FD semaphores are advertised");
+
+      PFN_vkCreateSemaphore create_sem =
+         (PFN_vkCreateSemaphore) gdpa(device, "vkCreateSemaphore");
+      PFN_vkDestroySemaphore destroy_sem =
+         (PFN_vkDestroySemaphore) gdpa(device, "vkDestroySemaphore");
+      PFN_vkImportSemaphoreFdKHR import_sem =
+         (PFN_vkImportSemaphoreFdKHR) gdpa(device, "vkImportSemaphoreFdKHR");
+      PFN_vkGetSemaphoreFdKHR get_sem_fd =
+         (PFN_vkGetSemaphoreFdKHR) gdpa(device, "vkGetSemaphoreFdKHR");
+
+      check(import_sem && get_sem_fd,
+            "vkImportSemaphoreFdKHR / vkGetSemaphoreFdKHR resolved");
+
+      if (import_sem && get_sem_fd) {
+         VkSemaphoreCreateInfo sci = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+         };
+         VkSemaphore sem = VK_NULL_HANDLE;
+         r = create_sem(device, &sci, NULL, &sem);
+         check(r == VK_SUCCESS, "created a binary semaphore");
+
+         /* fd == -1 is what vkAcquireImageANDROID passes whenever the
+          * compositor has nothing outstanding, so it is the common case
+          * rather than an edge case.
+          */
+         VkImportSemaphoreFdInfoKHR imp = {
+            .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+            .semaphore = sem,
+            .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            .fd = -1,
+         };
+         r = import_sem(device, &imp);
+         printf("  vkImportSemaphoreFdKHR(fd=-1, \"already signalled\") -> %d\n",
+                r);
+         check(r == VK_SUCCESS, "imported an already-signalled sync fd");
+
+         /* Export it straight back. The payload is an already-signalled
+          * import, so this must not block and must hand back -1.
+          */
+         VkSemaphoreGetFdInfoKHR gfd = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+            .semaphore = sem,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+         };
+         int out_fd = -2;
+         r = get_sem_fd(device, &gfd, &out_fd);
+         printf("  vkGetSemaphoreFdKHR -> %d, fd=%d\n", r, out_fd);
+         check(r == VK_SUCCESS, "exported a sync fd");
+         check(out_fd == -1,
+               "exported fd is -1 (the spec's \"already signalled\")");
+         if (out_fd >= 0)
+            close(out_fd);
+
+         destroy_sem(device, sem, NULL);
+      }
+   }
 
    printf("\n=== %d failure(s) ===\n", failures);
    if (failures == 0)

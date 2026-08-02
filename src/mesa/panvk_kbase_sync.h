@@ -38,6 +38,21 @@ struct panvk_kbase_sync_type {
 struct panvk_kbase_sync {
    struct vk_sync base;
    uint32_t slot;
+
+   /* An imported sync_file payload, for Android acquire/release.
+    *
+    * When @imported is set the payload is NOT the slot: it is whatever the
+    * imported fence says, and the slot is ignored until the payload is
+    * replaced (signal/reset/move). @sync_fd < 0 with @imported set is the
+    * legal "fd was -1, i.e. already signalled" case, which
+    * vkAcquireImageANDROID passes whenever the compositor has nothing to
+    * wait for.
+    *
+    * Owned: the runtime hands ownership to the driver on a successful
+    * import, so finish() closes it.
+    */
+   int sync_fd;
+   bool imported;
 };
 
 /**
