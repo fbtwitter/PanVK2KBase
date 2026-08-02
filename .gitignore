@@ -4,6 +4,7 @@
 /third_party/PANFORK
 /third_party/mesa
 /third_party/VK-GL-CTS
+/third_party/AzaharPlus
 
 # Left behind by python -m py_compile when syntax-checking the patch scripts.
 __pycache__/

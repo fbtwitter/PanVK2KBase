@@ -242,15 +242,62 @@ int main(int argc, char **argv) {
 
    /* --------------------------------------------- 2. build the namespace */
    printf("\n=== create a namespace that can see the vendor libs ===\n");
+
+   /* PANVK_NS_STOCK reproduces libadrenotools as it ships: the driver
+    * directory alone on the search path, and only libandroid.so linked over.
+    *
+    * It was added to show the patch is necessary, and it does not - it
+    * SUCCEEDS here, and that result is worth keeping precisely because it is
+    * misleading. A shell process sits in the default namespace, which can
+    * already see /system/lib64 and /vendor/lib64, and
+    * ANDROID_NAMESPACE_TYPE_SHARED inherits that. So in a shell the extra
+    * search paths are redundant and their absence costs nothing.
+    *
+    * An app is the restricted case, and that is the one that matters. A
+    * shell binary structurally cannot tell the two apart, so "stock mode
+    * passed" must not be read as "the search path is unnecessary" - only as
+    * "this test cannot answer that question". Answering it needs an APK.
+    *
+    * What IS measured here: run without PANVK_NS_SHAPE (the ISOLATED shape),
+    * where the default namespace is cut off, and the extra paths and the
+    * libvndksupport/libdl_android links are load-bearing - dropping them
+    * fails with a dlopen error naming libdl_android.so.
+    */
+   const bool stock = getenv("PANVK_NS_STOCK") != NULL;
+
    char search_path[1024];
-   snprintf(search_path, sizeof(search_path),
-            "%s:/system/lib64:/vendor/lib64:/vendor/lib64/hw", dir);
-   printf("  search path: %s\n", search_path);
+   if (stock)
+      snprintf(search_path, sizeof(search_path), "%s", dir);
+   else
+      snprintf(search_path, sizeof(search_path),
+               "%s:/system/lib64:/vendor/lib64:/vendor/lib64/hw", dir);
+   printf("  search path: %s%s\n", search_path,
+          stock ? "   (stock libadrenotools)" : "");
+
+   /* Two shapes are worth testing, and they are not interchangeable.
+    *
+    * "isolated" is what a standalone loader would build: SHARED|ISOLATED
+    * with no parent, so it must be told everything.
+    *
+    * "adrenotools" is what libadrenotools' hook actually builds when it
+    * substitutes a custom driver - ANDROID_NAMESPACE_TYPE_SHARED only, with
+    * the Vulkan loader's own namespace as parent. That is the shape a patch
+    * to that project has to work in, so testing the other one and calling it
+    * verified would be checking the wrong thing.
+    */
+   const bool adreno_shape = (getenv("PANVK_NS_SHAPE") != NULL &&
+                              !strcmp(getenv("PANVK_NS_SHAPE"), "adrenotools"));
+   printf("  shape: %s\n",
+          adreno_shape ? "adrenotools (SHARED, parented)" : "isolated");
 
    struct android_namespace_t *ns =
-      create_ns("panvk-kbase", search_path, NULL,
-                ANDROID_NAMESPACE_TYPE_SHARED | ANDROID_NAMESPACE_TYPE_ISOLATED,
-                "/system/lib64:/vendor/lib64:/data/local/tmp", NULL);
+      adreno_shape
+         ? create_ns("panvk-kbase-adrenotools", search_path, NULL,
+                     ANDROID_NAMESPACE_TYPE_SHARED, NULL, NULL)
+         : create_ns("panvk-kbase", search_path, NULL,
+                     ANDROID_NAMESPACE_TYPE_SHARED |
+                        ANDROID_NAMESPACE_TYPE_ISOLATED,
+                     "/system/lib64:/vendor/lib64:/data/local/tmp", NULL);
 
    printf("  android_create_namespace -> %p\n", (void *)ns);
    sum_ns = ns ? "ok" : "failed";
@@ -258,7 +305,7 @@ int main(int argc, char **argv) {
    if (!ns)
       goto summary;
 
-   bool linked = link_ns(ns, NULL, PUBLIC_SONAMES);
+   bool linked = link_ns(ns, NULL, stock ? "libandroid.so" : PUBLIC_SONAMES);
    printf("  android_link_namespaces(default) -> %s\n",
           linked ? "true" : "false");
    sum_link = linked ? "ok" : "failed";

@@ -3547,3 +3547,56 @@ until the GPU finishes, instead of handing the compositor a fence to wait
 on. On top of the ~12 ms idle-GPU kick already measured, an application that
 presents every frame pays both. Correct, not fast, and it is what kbase
 allows.
+
+### Follow-up: what an emulator actually has to change, and what a shell cannot prove
+
+Investigated against a real emulator (Azahar/AzaharPlus, a Citra fork) since
+"the ask is small" is worth checking rather than asserting. Recorded here
+because the clone itself is gitignored.
+
+**There are two blockers, not one, and only one of them is libadrenotools'.**
+
+1. **The emulator's own gate.** `SupportsCustomDriver()` in
+   `src/android/app/src/main/jni/native.cpp` is
+   `android_get_device_api_level() >= 28 && CheckKgslPresent()`, where
+   `CheckKgslPresent()` is `access("/dev/kgsl-3d0", F_OK) == 0` — Qualcomm's
+   kernel driver. On a Mali device that is false, so the custom-driver UI is
+   never offered no matter what the driver can do. The check conflates
+   "which GPU is this" with "can drivers be loaded without root"; the API
+   level is about the namespace APIs and is not GPU-specific. Accepting
+   `/dev/mali0` alongside KGSL is the whole fix.
+
+2. **The driver namespace**, in `libadrenotools`
+   (`src/hook/hook_impl.cpp`). The hook intercepts the Vulkan loader's
+   `android_dlopen_ext` and builds a namespace for the custom driver with
+   only `customDriverDir` on its search path and only `libandroid.so`
+   linked over. A Mesa driver needs `/system/lib64` and `/vendor/lib64` on
+   the path (for `libdrm.so`, `libhardware.so`) and needs
+   `libvndksupport.so`/`libdl_android.so` linked in.
+
+**The honest limit of the local verification.** Running the same namespace
+construction from a shell binary passes *whether or not* the extra paths and
+links are present, so a shell process cannot demonstrate that the change is
+needed. The reason is worth internalising: a shell sits in the default
+namespace, which already sees `/system/lib64` and `/vendor/lib64`, and
+`ANDROID_NAMESPACE_TYPE_SHARED` inherits that. An app's namespace is the
+restricted one.
+
+What *is* measured, by `tests/driver_namespace_probe` under its ISOLATED
+shape (which cuts the default namespace off and so models the restricted
+case):
+
+```
+stock config    -> dlopen failed: library "libdl_android.so" needed or
+                   dlopened by "/system/lib64/libvndksupport.so" is not
+                   accessible for the namespace
+with the paths  -> loads, enumerates Mali-G720 MC8
+```
+
+So the change is demonstrably necessary under isolation and demonstrably
+sufficient in both shapes. Whether an app's namespace is restrictive enough
+to require it is a reasonable inference, not a measurement — settling that
+needs an APK, which is the same gap that blocks the swapchain work.
+
+Both patches are written and committed on branches in the local clone.
+**Deliberately not proposed upstream yet** — the priority is this repo.
