@@ -1228,10 +1228,27 @@ Tools worth knowing about before touching any of this:
       Fixed by `src/mesa/patch-panvk-android-gralloc-fd.py`; verified by
       `tests/driver_android_wsi_probe`. Full writeup in
       `docs/kbase-notes.md`.
-      **Still open before anything is on screen:** sync-fd
-      import/export on semaphores (`vk_common_AcquireImageANDROID` needs it;
-      `KBASE_IOCTL_STREAM_CREATE` is an unexplored lead), and a way to load
-      the ICD without root.
+- [x] **Sync-fd semaphores — done** (2026-08-02). `panvk_kbase_sync.c`
+      implements `import_sync_file`/`export_sync_file`, so
+      `vkAcquireImageANDROID` and `vkQueueSignalReleaseImageANDROID` both
+      have what they need. No patch script was needed: the runtime derives
+      `SYNC_FD` support from the ops being present.
+      Import is `poll()` on the fd (`-1` means already-signalled, which is
+      the common case); export waits and returns `-1`, the spec's "already
+      signalled". A real exportable fence is **not possible** here —
+      `KBASE_IOCTL_STREAM_CREATE` yields a timeline userspace cannot drive
+      (`SW_SYNC_IOC_CREATE_FENCE` → `ENOTTY`), measured by
+      `tests/sync_fd_probe`. Cost: a CPU block per present.
+- [x] **Rootless ICD loading — solved** (2026-08-02). libadrenotools' "no
+      Mali support" is about that library, not the platform: its
+      Adreno-specific parts are file-redirect hooks and bcenabler, neither
+      of which a Mesa driver needs. The namespace mechanism itself works
+      unchanged — `tests/driver_namespace_probe` loads this driver through
+      a custom linker namespace and enumerates Mali-G720 MC8.
+      Needed because `libdrm.so`/`libhardware.so` are not Android public
+      libraries. Recipe (both halves non-obvious) in `docs/kbase-notes.md`;
+      `tools/package-driver.sh` produces the Adrenotools-convention zip.
+      **Caveat:** demonstrated from a shell process, not from inside an app.
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
       targeting phones, or DRM/kmsro if targeting an embedded board still
       on kbase.
