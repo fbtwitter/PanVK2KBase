@@ -3878,16 +3878,47 @@ format:
 2d.optimal.single_layer.r32_uint
 ```
 
-So the live hypothesis is **1D images, linear tiling, and less-common
-formats** — three plausible axes — rather than "the entry point is broken".
-That is a materially different bug and a materially lower priority: the
-configuration an application is most likely to use works.
+### The actual finding: the non-AFBC clear path is broken
 
-**Not yet confirmed**, because the isolation runs that would separate the
-three axes have not been done. Until they are, treat the axis list as the
-next experiment rather than as the finding. What *is* established: 103 of
-272 sampled cases fail, the failures are real (readback is black), and the
-common case is not among them.
+The "three axes" reading above was also wrong — or rather, it was three
+symptoms of one cause. Isolating each axis with the format held constant,
+then re-running the same eight cases with `PANVK_DEBUG=noafbc`:
+
+| case | default | `noafbc` |
+|---|---|---|
+| `2d.optimal.single_layer.r8g8b8a8_unorm` | **Pass** | **Fail** |
+| `2d.optimal.multiple_layers.r8g8b8a8_unorm` | **Pass** | **Fail** |
+| `2d.optimal.single_layer.r16_sfloat` | **Pass** | **Fail** |
+| `2d.optimal.single_layer.r8g8b8_srgb` | **Pass** | **Fail** |
+| `1d.optimal.single_layer.r8g8b8a8_unorm` | Fail | Fail |
+| `3d.optimal.single_layer.r8g8b8a8_unorm` | Fail | Fail |
+| `2d.linear.single_layer.r8g8b8a8_unorm` | Fail | Fail |
+| `2d.optimal.single_layer.r32_uint` | Fail | Fail |
+
+**Disabling AFBC makes it worse, not better: 4/8 failing becomes 8/8.** So
+AFBC is not the cause — it is the thing making the passing cases pass. Every
+data point collapses into one statement:
+
+> `vkCmdClearColorImage` works on AFBC surfaces and fails on everything else.
+
+And that explains the apparent axes without needing three separate bugs.
+1D images, 3D images, linear tiling and formats like `r32_uint` are all
+cases where AFBC does not apply, so they take the uncompressed path and get
+black. Array layers were never an axis, which is why `multiple_layers`
+passed.
+
+This is a better bug report than "the entry point is broken", and it is also
+a **worse** bug than the correction above suggested: it is not confined to
+odd configurations, it is the entire uncompressed clear path. It only looks
+narrow because AFBC-by-default hides it for the most common surfaces.
+
+**Probably not a kbase-port bug.** Everything this hinges on — image layout,
+AFBC eligibility, the framebuffer descriptors `vk_meta`'s render pass writes
+— is upstream PanVK code that this port does not touch, and the kbase submit
+gate is demonstrably not involved (no refusal appears in logcat for a
+failing case; the stream runs and produces black). Not provable from here
+without panthor hardware, but it is where the evidence points, and it means
+the fix belongs upstream rather than in `src/mesa/`.
 
 **Why no probe caught this.** Every render probe in `src/tests/` clears via
 `VK_ATTACHMENT_LOAD_OP_CLEAR` — a render-pass clear, which works and is
