@@ -138,6 +138,14 @@ driver_extmem_probe: ./src/tests/driver_extmem_probe/driver_extmem_probe.c
 # Drives the kbase event-memory vk_sync through the real Vulkan API:
 # timeline semaphore signal/get/wait and binary fence status/reset. Proves
 # the sync type works, not merely that it registered.
+# The other half of tests/dmabuf_import_probe: the same import, but through
+# the real Vulkan entry points with the GPU doing the writing. Reads back
+# through an independent mmap of the dma-buf rather than vkMapMemory, which
+# is what makes it proof rather than a tautology. Shares the fd-source code
+# with dmabuf_import_probe so there is one place that knows how to get an fd.
+driver_dmabuf_probe: ./src/tests/driver_dmabuf_probe/driver_dmabuf_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/dmabuf_import_probe -o ./build/driver_dmabuf_probe $<
+
 driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_sync_probe $<
 
@@ -490,6 +498,8 @@ mesa-backend-sync:
 	@echo "  - src/mesa/patch-panthor-csif-dispatch.py   <mesa-dir>  (csif props)"
 	@echo "  - src/mesa/patch-panvk-kbase-queue.py       <mesa-dir>  (GPU queue)"
 	@echo "  - src/mesa/patch-panvk-kbase-subqueue-init.py <mesa-dir> (subqueue init)"
+	@echo "  - src/mesa/patch-pan-kmod-import-fd.py      <mesa-dir>  (dma-buf import hook)"
+	@echo "  - src/mesa/patch-panvk-kbase-external-memory.py <mesa-dir> (import/export capability)"
 	@echo "  - src/mesa/patch-panvk-null-device-destroy.py <mesa-dir> (null-handle vkDestroyDevice, not kbase-specific)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes

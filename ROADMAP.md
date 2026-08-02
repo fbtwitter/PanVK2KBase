@@ -611,7 +611,31 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       already gone by then, so it's `munmap()`-only. Wired into
       `memory2.c` and `queue_group.c`'s teardown.
 - [x] mmap — confirmed working (see above).
-- [ ] **dma-buf import — needs a shared-code change, like the ringbuf.**
+- [x] **dma-buf import — DONE, verified end to end on hardware**
+      (2026-08-02). The reasoning below was right about the obstacle and is
+      kept as history; what changed is that the shared-code change was
+      written rather than only scoped.
+      `src/mesa/patch-pan-kmod-import-fd.py` adds an optional
+      `ops->bo_import_fd(dev, fd, size)` to `pan_kmod`, dispatched *before*
+      `drmPrimeFDToHandle()`. Backends that do not set it (panthor,
+      panfrost) are untouched. `kbase_kmod_bo_import_fd()` then runs
+      `KBASE_IOCTL_MEM_IMPORT` with `BASE_MEM_IMPORT_TYPE_UMM`.
+      Measured properties the implementation had to respect, none of them
+      guessable: `in.phandle` is a pointer *to* the fd; `out.gpu_va` is a
+      `NEED_MMAP` cookie that `mmap()` resolves; the cookie is single-use so
+      the mapping must be kept and `bo_get_mmap_offset()` must refuse;
+      `munmap()` is the free and `MEM_FREE` returns `EINVAL`; and the
+      imported VA lands outside the `util_vma_heap` range (checked at
+      runtime, not assumed).
+      **Proven, not merely wired:** `tests/driver_dmabuf_probe` has the GPU
+      write into imported memory and reads it back through an *independent*
+      mmap of the dma-buf — a `vkMapMemory` readback would be satisfied by a
+      driver that imported nothing. 50/50 rounds clean on a dma-heap buffer,
+      and **a real AHardwareBuffer works too**, which is the actual WSI case.
+      On the cache-sync trap that cost a debugging cycle, and the three
+      presentation blockers still ahead of this, see `docs/kbase-notes.md`.
+- [ ] **(superseded, kept for the reasoning) dma-buf import — needs a
+      shared-code change, like the ringbuf.**
       Scoped 2026-08-01; it is not backend-local work, which is what it
       looked like. kbase can import: `KBASE_IOCTL_MEM_IMPORT` with
       `BASE_MEM_IMPORT_TYPE_UMM` takes a dma-buf fd, and Panfork's
@@ -635,7 +659,22 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       because there is no primitive to build one from. Anything needing to
       hand a PanVK allocation to another process or device is out of scope
       on this driver.
-- [ ] **Consequence, and the actionable part: stop advertising both.**
+- [x] **Advertise import, keep export false — done** (2026-08-02).
+      `patch-panvk-kbase-external-memory.py` now splits the single predicate
+      into `panvk_supports_external_import(phys_dev, handle_type)` and
+      `panvk_supports_dma_buf_export(phys_dev)`, applied at three call sites
+      rather than two — the third being `exportFromImportedHandleTypes`,
+      which claimed "you can re-export what you imported" and is false here.
+      Import is advertised for `DMA_BUF` only, not `OPAQUE_FD`: the only way
+      to obtain a PanVK opaque fd is to export one, so advertising it would
+      be a promise with no producer.
+      `tests/driver_extmem_probe` was updated in the same change and is the
+      reason this is trustworthy — it had been asserting the *old* contract
+      (no feature bits at all) and so failed on success the moment import
+      started working. A probe pinned to a stale contract is worse than no
+      probe; its header now says so.
+- [ ] **(superseded) Consequence, and the actionable part: stop advertising
+      both.**
       `panvk_physical_device.c:1427` unconditionally reports
       `OPAQUE_FD | DMA_BUF` with `EXPORTABLE | IMPORTABLE`. On kbase that
       is untrue in both directions today, so an application that believes

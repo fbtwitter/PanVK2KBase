@@ -31,12 +31,33 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+/* CPU access to a dma-buf has to be bracketed, and on this device it is not
+ * optional: kbase grants imported regions CACHED_CPU, so without the
+ * invalidate that DMA_BUF_SYNC_START performs, a CPU read after a GPU write
+ * can return stale cache lines - which looks exactly like "the import did
+ * not work" and is the reason this helper exists rather than being inlined
+ * at one call site.
+ *
+ * Best-effort: an exporter with no begin/end_cpu_access returns an error,
+ * which is informational rather than fatal.
+ */
+static inline int dmabuf_cpu_sync(int fd, uint64_t flags) {
+   struct dma_buf_sync s = {.flags = flags};
+   return ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
+#define dmabuf_cpu_read_begin(fd) dmabuf_cpu_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
+#define dmabuf_cpu_read_end(fd) dmabuf_cpu_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ)
+#define dmabuf_cpu_write_begin(fd) dmabuf_cpu_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE)
+#define dmabuf_cpu_write_end(fd) dmabuf_cpu_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE)
 
 /* Mirrored locally rather than pulled from <cutils/native_handle.h>, the
  * same way driver_extmem_probe mirrors the libhardware structs: it keeps

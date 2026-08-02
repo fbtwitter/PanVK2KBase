@@ -1,25 +1,37 @@
-// Does the driver still claim it can share dma-bufs?
+// Does the driver report external-memory capability truthfully on kbase?
 //
-// It should not, on kbase. Neither direction works there:
+// The two directions are NOT symmetric, and this probe exists to make sure
+// the driver says so:
 //
-//   import - kbase itself can do it (KBASE_IOCTL_MEM_IMPORT), but
-//            pan_kmod_bo_import() turns the fd into a GEM handle with
-//            drmPrimeFDToHandle() *before* dispatching to the backend, and
-//            that fails on a misc device. The backend hook is unreachable.
+//   import - WORKS, for dma-bufs. pan_kmod_ops::bo_import_fd dispatches to
+//            the backend before any DRM call (patch-pan-kmod-import-fd.py),
+//            and kbase_kmod_bo_import_fd() runs KBASE_IOCTL_MEM_IMPORT with
+//            BASE_MEM_IMPORT_TYPE_UMM. Measured end to end by
+//            tests/dmabuf_import_probe and tests/driver_dmabuf_probe.
 //
-//   export - kbase has no export path at all. Nothing in the UAPI turns an
-//            allocation into an fd.
+//   export - IMPOSSIBLE. Nothing in kbase's UAPI turns an allocation into an
+//            fd: no PRIME, no dmabuf-out. Not "not yet".
 //
-// PanVK advertises OPAQUE_FD and DMA_BUF as EXPORTABLE|IMPORTABLE for every
-// device, which on kbase is a promise it cannot keep: an application that
-// believes the query gets VK_ERROR_OUT_OF_DEVICE_MEMORY out of
-// vkGetMemoryFdKHR() instead of a clean refusal at query time.
-// patch-panvk-kbase-external-memory.py gates that on the backend, and this
-// probe is what says whether the gate actually took effect.
+// So the expected report on kbase is:
 //
-// Checks vkGetPhysicalDeviceExternalBufferProperties for both handle types
-// and expects an empty feature mask. Exits non-zero if the driver is still
-// claiming a capability it does not have.
+//   DMA_BUF    IMPORTABLE set, EXPORTABLE clear,
+//              exportFromImportedHandleTypes == 0
+//   OPAQUE_FD  nothing at all - an OPAQUE_FD import is a promise with no
+//              producer, since the only way to get a PanVK opaque fd is to
+//              export one, and this driver cannot.
+//
+// Getting either direction wrong costs an application real debugging time.
+// Claiming export it does not have turns a clean query-time refusal into a
+// VK_ERROR_OUT_OF_DEVICE_MEMORY from vkGetMemoryFdKHR(); denying import it
+// does have silently gives up the path Android WSI needs.
+//
+// NOTE: this probe previously asserted the opposite - that NO feature bit
+// was set, which was correct when import was unreachable. It failed on
+// success the day import started working, which is exactly what a probe
+// pinned to a stale contract does. Kept as a reminder to update the probe
+// with the behaviour, not after it.
+//
+// Usage: driver_extmem_probe /data/local/tmp/libvulkan_panfrost.so
 //
 // Usage: driver_extmem_probe /data/local/tmp/libvulkan_panfrost.so
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -120,19 +132,46 @@ probe_handle_type(PFN_vkGetPhysicalDeviceExternalBufferProperties fn,
 
    VkExternalMemoryFeatureFlags f =
       props.externalMemoryProperties.externalMemoryFeatures;
+   VkExternalMemoryHandleTypeFlags from_imported =
+      props.externalMemoryProperties.exportFromImportedHandleTypes;
 
    printf("\n  %s: externalMemoryFeatures = 0x%x%s%s\n", handle_type_name(type),
           f, (f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) ? " EXPORTABLE" : "",
           (f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ? " IMPORTABLE" : "");
+   printf("  %s: exportFromImportedHandleTypes = 0x%x\n",
+          handle_type_name(type), from_imported);
 
-   char msg[128];
+   const bool want_import =
+      (type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+
+   char msg[160];
+
+   /* Export is impossible on kbase in every case - no PRIME, no dmabuf-out. */
    snprintf(msg, sizeof(msg), "%s: not advertised as EXPORTABLE",
             handle_type_name(type));
    check(!(f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT), msg);
 
-   snprintf(msg, sizeof(msg), "%s: not advertised as IMPORTABLE",
+   /* Import: expected for dma-bufs, and expected ABSENT for OPAQUE_FD, where
+    * no application could ever obtain a matching fd from this driver.
+    */
+   if (want_import) {
+      snprintf(msg, sizeof(msg), "%s: advertised as IMPORTABLE (it works)",
+               handle_type_name(type));
+      check((f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0, msg);
+   } else {
+      snprintf(msg, sizeof(msg),
+               "%s: not advertised as IMPORTABLE (no producer for it)",
+               handle_type_name(type));
+      check(!(f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT), msg);
+   }
+
+   /* "You can re-export what you imported" is false here in both cases, and
+    * is the kind of claim that fails at vkGetMemoryFdKHR() rather than at
+    * query time.
+    */
+   snprintf(msg, sizeof(msg), "%s: exportFromImportedHandleTypes is empty",
             handle_type_name(type));
-   check(!(f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT), msg);
+   check(from_imported == 0, msg);
 }
 
 int
@@ -216,11 +255,15 @@ main(int argc, char **argv)
 
    printf("\n=== verdict ===\n");
    if (failures == 0)
-      printf("  The driver no longer claims dma-buf sharing it cannot do.\n");
+      printf("  The driver reports external memory truthfully: dma-buf\n"
+             "  import yes, export no, no re-export of imports, and no\n"
+             "  OPAQUE_FD import it could never receive.\n");
    else
-      printf("  %d check(s) FAILED - still advertising an unsupported\n"
-             "  capability. An app trusting this query will fail at\n"
-             "  vkGetMemoryFdKHR() instead of here.\n",
+      printf("  %d check(s) FAILED - the driver's external-memory report and\n"
+             "  what it can actually do have diverged. Either it claims a\n"
+             "  capability that will fail at vkAllocateMemory/\n"
+             "  vkGetMemoryFdKHR(), or it denies one that works and an\n"
+             "  application will route around a path it did not need to.\n",
              failures);
 
    return failures ? 1 : 0;

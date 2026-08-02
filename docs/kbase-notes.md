@@ -3211,3 +3211,58 @@ Note `lseek` on the gralloc fd is not a reliable size either — use
 `/dev/ion` does not exist on this device (dma-heaps only), and `/dev/ashmem`
 is 0666 but ashmem is not a dma-buf, so `dma_buf_get()` rejects it — neither
 is worth retrying.
+
+## dma-buf import works end to end through Vulkan, including a gralloc buffer
+
+The Mesa-side half of the previous section. `tests/driver_dmabuf_probe`
+imports a dma-buf as a `VkDeviceMemory`, binds it to a `VkBuffer`, has the
+GPU write a pattern into it, and reads that pattern back **through an
+independent `mmap()` of the dma-buf fd** — deliberately not through
+`vkMapMemory`, which a driver that imported nothing and quietly allocated
+fresh memory would also satisfy.
+
+Confirmed on the Poco X8 Pro (Mali-G720, r49p1):
+
+- `/dev/dma_heap/system` buffer: **50/50 rounds clean** (the loop exists so a
+  leaked kernel region per import is visible rather than invisible).
+- **AHardwareBuffer — the real Android WSI case — works too.**
+
+The path is `vkAllocateMemory(VkImportMemoryFdInfoKHR{DMA_BUF})` →
+`pan_kmod_bo_import()` → `ops->bo_import_fd` (new, added by
+`src/mesa/patch-pan-kmod-import-fd.py`) → `kbase_kmod_bo_import_fd()` →
+`KBASE_IOCTL_MEM_IMPORT`. Confirmed running, not merely linked, via
+`PANVK_KBASE_DEBUG_COUNTERS=1`:
+
+```
+MESA: kbase-dbg: bo_import_fd gpu_va=0x707922c000, size=4096, cookie=0x41000
+MESA: kbase-dbg: bo_free (imported) gpu_va=0x707922c000
+```
+
+**The one thing that cost a debugging cycle, and would cost anyone else the
+same: CPU access to an imported dma-buf must be bracketed with
+`DMA_BUF_IOCTL_SYNC`.** The first run of this probe reported the GPU write
+had not landed — the readback still held the CPU's pre-import pattern —
+while the import itself had demonstrably succeeded. kbase grants imported
+regions `CACHED_CPU`, so the readback was returning stale cache lines. With
+`DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ` before the read, the same code
+passes. Worth internalising: on this device *a missing cache sync is
+indistinguishable from a broken import*, and the failure points at the wrong
+layer. `dmabuf_cpu_read_begin()`/`_end()` in
+`src/tests/dmabuf_import_probe/dmabuf_source.h` exist so there is one place
+that gets this right.
+
+**What this does and does not unblock.** It closes the import half of the
+Android presentation chain, which was its first link. Still open, in the
+order they will be hit:
+
+1. The Android build uses `-Dandroid-stub=true`, so `hw_get_module()` is a
+   stub returning 0 *without writing `*module`* and `vk_android_get_ugralloc()`
+   cannot succeed — so `VK_ANDROID_native_buffer` is never advertised.
+2. `panvk_android.c` reads `handle->data[0]` as the dma-buf. On this device
+   that is not the dma-buf (`data[1]` is), so even with gralloc initialised
+   the import would be handed the wrong fd. Shared PanVK code; plausibly an
+   upstream fix rather than a local one.
+3. Android acquire/release needs sync-fd import/export on semaphores, which
+   `panvk_kbase_sync.c` does not implement.
+4. There is still no Mali equivalent of `libadrenotools` for loading a
+   custom ICD without root.

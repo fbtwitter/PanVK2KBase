@@ -65,15 +65,23 @@ Mali-G720, kbase r49p1) by this repo's standalone probes:
   (for SAME_VA regions `munmap` *is* the free; a follow-up `MEM_FREE`
   returns `EINVAL`).
 
+- `bo_import_fd` — **dma-buf in, working end to end.** The handle-taking
+  `bo_import` hook is still unreachable (the common `pan_kmod_bo_import()`
+  gets there only after `drmPrimeFDToHandle()` succeeds, which a misc device
+  cannot do), so `patch-pan-kmod-import-fd.py` adds an optional fd-taking
+  hook dispatched *before* any DRM call, and this backend implements it with
+  `MEM_IMPORT` / `BASE_MEM_IMPORT_TYPE_UMM`. Verified on hardware by
+  `tests/dmabuf_import_probe` and `tests/driver_dmabuf_probe`, including
+  with a real AHardwareBuffer. Four measured properties it depends on -
+  `phandle` is a pointer to the fd, `out.gpu_va` is a single-use
+  `NEED_MMAP` cookie, `munmap` is the free, and the VA lands outside the
+  `util_vma_heap` range - are documented in `docs/kbase-notes.md`.
+
 Deliberately **not** implemented, and returning explicit errors rather
 than plausible-looking fakes:
 
 - `bo_wait` — needs a working fence mechanism; none is known to work on
   kbase (see `docs/kbase-notes.md`).
-- `bo_import` — dma-buf in. kbase can do it (`MEM_IMPORT` /
-  `BASE_MEM_IMPORT_TYPE_UMM`), but the common `pan_kmod_bo_import()` calls
-  `drmPrimeFDToHandle()` on `dev->fd` before dispatching to the backend, so
-  this hook is never reached. Needs a change above the backend.
 - `bo_export` — dma-buf out. Not "not yet": kbase has no export path at
   all, and `pan_kmod_bo_export()` is a `static inline` that calls
   `drmPrimeHandleToFD()` itself. See ROADMAP Phase 3.
@@ -133,10 +141,11 @@ instead. When upstream grows the real thing, the tag is the delete list.
 
 | where | owner | what |
 |---|---|---|
-| `pan_kmod_kbase.c` `bo_import` | `pan_kmod` | an fd-taking import entry point that dispatches to the backend before any DRM call |
+| `patch-pan-kmod-import-fd.py` | `pan_kmod` | the fd-taking import hook itself. Written here rather than only scoped, because import is the first link in the Android presentation chain — but it is a change to shared code and belongs upstream. See `docs/upstream-import-question.md` |
 | `pan_kmod_kbase.c` `bo_export` | `kernel` | kbase has no dma-buf export; nothing to build on |
 | `panvk_vX_kbase_queue.c` render ringbuf | `panvk` | a ring discipline that does not need one BO at two adjacent VAs — asked upstream, see `docs/upstream-ringbuf-question.md` |
-| external-memory capability gating | `panvk` | `panvk_physical_device.c` advertises dma-buf import/export unconditionally; it should ask the backend |
+| external-memory capability gating | `panvk` | `panvk_physical_device.c` decides import/export capability by asking `is_kbase`; it should ask `pan_kmod` whether the backend can do each direction |
+| `panvk_android.c` `handle->data[0]` | `panvk` | the gralloc dma-buf is not always at index 0 — on MediaTek it is `data[1]`. PanVK should locate the dma-buf in the handle rather than assume. Not yet fixed; blocks the AHardwareBuffer path once gralloc is initialised |
 
 
 ## Building

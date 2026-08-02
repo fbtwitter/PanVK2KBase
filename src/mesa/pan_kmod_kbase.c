@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include "util/macros.h"
+#include "util/os_file.h" /* os_dupfd_cloexec, for the dma-buf import */
 #include "util/os_misc.h"
 #include "util/simple_mtx.h"
 #include "util/u_memory.h"
@@ -130,8 +131,23 @@ struct kbase_kmod_bo {
     * real by MEM_ALLOC_EX + BASE_MEM_FIXED. Unlike the old SAME_VA model,
     * this is NOT the CPU address: pan_kmod_bo_mmap() maps it separately
     * and lands wherever the kernel puts it.
+    *
+    * For an imported BO this is instead the address that mmap() resolved
+    * the import's NEED_MMAP cookie to - see kbase_kmod_bo_import_fd().
     */
    uint64_t gpu_va;
+
+   /* Imported (dma-buf) BOs only; NULL and 0 for everything else.
+    *
+    * MEM_IMPORT hands back an mmap cookie rather than an address, so the
+    * mapping below is what turned it into one. It has to be kept: the
+    * cookie is single-use (a second mmap of it fails EINVAL, measured by
+    * tests/dmabuf_import_probe), so the address cannot be re-derived, and
+    * the region dies with this munmap exactly like a SAME_VA allocation.
+    */
+   void *import_map;
+   size_t import_map_size;
+   int import_dmabuf_fd; /* our dup; -1 when not an import */
 };
 
 struct kbase_kmod_dev {
@@ -1418,6 +1434,9 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    }
 
    bo->gpu_va = va;
+   bo->import_map = NULL;
+   bo->import_map_size = 0;
+   bo->import_dmabuf_fd = -1;
 
    /* No mmap() here. Under SAME_VA the CPU mapping had to happen at alloc
     * time because it was what resolved the cookie into an address; with a
@@ -1512,6 +1531,32 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 
    struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(bo->dev);
 
+   /* An imported region frees the other way round: munmap() *is* the free,
+    * and MEM_FREE on it returns EINVAL - measured by
+    * tests/dmabuf_import_probe (FREE_MODEL=munmap_only). Doing it backwards
+    * would leak a kernel region per imported buffer, which for a swapchain
+    * means per image per resize.
+    */
+   if (bo->flags & PAN_KMOD_BO_FLAG_IMPORTED) {
+      if (kbase_bo->import_map)
+         munmap(kbase_bo->import_map, kbase_bo->import_map_size);
+      if (kbase_bo->import_dmabuf_fd >= 0)
+         close(kbase_bo->import_dmabuf_fd);
+
+      if (kbase_debug_counters_enabled()) {
+         unsigned live = atomic_fetch_sub(&kbase_debug_live_bos, 1) - 1;
+         mesa_logi("kbase-dbg: bo_free (imported) gpu_va=0x%" PRIx64
+                   ", live_bos=%u", kbase_bo->gpu_va, live);
+      }
+
+      /* Its address was never ours to hand out, so it does not go back to
+       * the heap - same reasoning as the executable case below.
+       */
+      pan_kmod_bo_cleanup(bo);
+      pan_kmod_dev_free(bo->dev, kbase_bo);
+      return;
+   }
+
    /* Unlike the old SAME_VA path - where munmap() *was* the free, because
     * kbase tore the region down on vm_close and a following MEM_FREE
     * returned EINVAL - a fixed-address region is an ordinary named
@@ -1553,6 +1598,22 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 static off_t
 kbase_kmod_bo_get_mmap_offset(struct pan_kmod_bo *bo)
 {
+   /* An imported BO cannot serve one. Its cookie was consumed by the mmap
+    * that resolved it (a second mmap of the same cookie fails EINVAL,
+    * measured), and the resolved address is not itself a valid offset. Fail
+    * loudly rather than return something plausible: pan_kmod_bo_mmap() is a
+    * static inline this backend cannot override, so a wrong offset here
+    * would silently map the wrong memory.
+    *
+    * Costs nothing functional - imported memory has no CPU view on this
+    * kernel anyway (touching one takes SIGBUS; see docs/kbase-notes.md).
+    */
+   if (bo->flags & PAN_KMOD_BO_FLAG_IMPORTED) {
+      mesa_loge("kbase: imported BOs have no mmap offset (the import cookie "
+                "is single-use and the region has no CPU view)");
+      return (off_t)-1;
+   }
+
    /* kbase looks a region up by mmap offset >> PAGE_SHIFT, so a region's
     * own GPU address is its mmap offset. Verified for fixed-address
     * allocations by tests/fixed_va_probe, which mmap()s a BASE_MEM_FIXED
@@ -1591,43 +1652,150 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 }
 
 /*
- * BELONGS-UPSTREAM(pan_kmod): pan_kmod needs an import entry point that
- * takes the dma-buf fd and dispatches to the backend *before* any DRM call,
- * so a non-DRM backend can handle it. Until that exists this hook is
- * unreachable and cannot be fixed from here - see below.
+ * The handle-taking import hook. Still unreachable on kbase, and now for a
+ * benign reason: pan_kmod_bo_import() only gets here after
+ * drmPrimeFDToHandle() succeeds, which a misc device cannot do. The live
+ * entry point is kbase_kmod_bo_import_fd() below, which the common layer
+ * calls *instead* when a backend provides it (see
+ * src/mesa/patch-pan-kmod-import-fd.py).
  *
- * dma-buf import. Deliberately left unimplemented, and it is worth being
- * precise about why, because "fill in the stub" does not fix it.
- *
- * kbase can import - KBASE_IOCTL_MEM_IMPORT with BASE_MEM_IMPORT_TYPE_UMM
- * takes a dma-buf fd directly, and Panfork's kbase_import_dmabuf() runs
- * that sequence on real hardware. The problem is that this hook is never
- * reached. The common pan_kmod_bo_import() (lib/kmod/pan_kmod.c) does:
- *
- *     int ret = drmPrimeFDToHandle(dev->fd, fd, &handle);
- *     if (ret)
- *        goto err_unlock;
- *     ...
- *     bo = dev->ops->bo_import(dev, handle, size);
- *
- * so the fd is converted to a GEM handle before any backend dispatch. On
- * /dev/mali0 - a misc device with no DRM ioctls - that fails and the import
- * returns NULL without ever calling this function. Note the hook's signature
- * takes the GEM handle, not the fd, so even reaching it would hand us a
- * number that means nothing here.
- *
- * Making this work needs an fd-taking entry point that dispatches to the
- * backend before touching DRM, which is a change to shared code that panthor
- * also uses - the same shape of problem as the render descriptor ringbuf.
- * See ROADMAP.md Phase 3.
+ * Kept wired rather than left NULL so that a caller reaching it despite all
+ * that fails loudly instead of hitting a NULL function pointer.
  */
 static struct pan_kmod_bo *
 kbase_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size)
 {
-   mesa_loge("kbase: bo_import unreachable (pan_kmod_bo_import() requires "
-             "drmPrimeFDToHandle() on a non-DRM device)");
+   mesa_loge("kbase: handle-taking bo_import is not the kbase path "
+             "(bo_import_fd is); reaching this means the pan_kmod import "
+             "dispatch patch is not applied");
    return NULL;
 }
+
+/*
+ * dma-buf import, the kbase way: take the fd directly, before any DRM call.
+ *
+ * Every constant here was measured by tests/dmabuf_import_probe rather than
+ * assumed, because three of them are counter-intuitive:
+ *
+ *  - in.phandle is a POINTER TO the fd, not the fd. The kernel does a
+ *    get_user() on it for UMM imports.
+ *  - out.gpu_va is an mmap COOKIE, not an address: BASE_MEM_NEED_MMAP comes
+ *    back set. mmap()ing the cookie yields the real address. This is the
+ *    same trap that wedged the device twice via tests/alias_cs_probe, so it
+ *    is checked rather than hoped for.
+ *  - the region frees like a SAME_VA allocation: munmap() is the free and
+ *    MEM_FREE returns EINVAL. See kbase_kmod_bo_free().
+ */
+#ifdef PAN_KMOD_HAS_BO_IMPORT_FD
+static struct pan_kmod_bo *
+kbase_kmod_bo_import_fd(struct pan_kmod_dev *dev, int fd, uint64_t size)
+{
+   struct kbase_kmod_dev *kbase_dev = to_kbase_kmod_dev(dev);
+
+   /* Our own reference. The caller closes the fd it passed once the import
+    * succeeds (panvk_device_memory.c), so borrowing it would leave this BO
+    * holding a stale descriptor - and closing the caller's would corrupt an
+    * fd number it still owns.
+    */
+   int dup_fd = os_dupfd_cloexec(fd);
+   if (dup_fd < 0) {
+      mesa_loge("kbase: dup of dma-buf fd %d failed: %s", fd, strerror(errno));
+      return NULL;
+   }
+
+   union kbase_ioctl_mem_import import = { 0 };
+   import.in.flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+                     BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+   import.in.phandle = (uint64_t)(uintptr_t)&dup_fd;
+   import.in.type = BASE_MEM_IMPORT_TYPE_UMM;
+
+   if (ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &import) < 0) {
+      mesa_loge("kbase: MEM_IMPORT of dma-buf fd %d failed: %s", fd,
+                strerror(errno));
+      close(dup_fd);
+      return NULL;
+   }
+
+   /* out.va_pages is authoritative, not the caller's size: lseek() on a
+    * gralloc buffer can report the whole allocation rather than the
+    * addressable extent, and on some handles fails outright.
+    */
+   uint64_t region_size = (uint64_t)import.out.va_pages * 4096;
+   if (region_size < ALIGN_POT(size, 4096)) {
+      mesa_logw("kbase: imported region is %" PRIu64 " bytes but the caller "
+                "expected %" PRIu64, region_size, ALIGN_POT(size, 4096));
+   }
+
+   void *map = NULL;
+   uint64_t gpu_va;
+
+   if (import.out.flags & BASE_MEM_NEED_MMAP) {
+      map = mmap(NULL, (size_t)region_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 dev->fd, (off_t)import.out.gpu_va);
+      if (map == MAP_FAILED) {
+         mesa_loge("kbase: could not resolve import cookie 0x%" PRIx64
+                   " via mmap: %s", (uint64_t)import.out.gpu_va,
+                   strerror(errno));
+         close(dup_fd);
+         return NULL;
+      }
+      gpu_va = (uint64_t)(uintptr_t)map;
+   } else {
+      /* Not observed on this device, but Panfork handles both, so do too. */
+      gpu_va = import.out.gpu_va;
+   }
+
+   /* The single most important check in this function.
+    *
+    * The imported address is chosen by the kernel, not by our util_vma_heap.
+    * If it ever landed inside the range the heap hands out, the two
+    * allocators would eventually return the same address and the corruption
+    * would surface arbitrarily far away. Measured to land outside on this
+    * device (tests/dmabuf_import_probe reports IMPORT_VA_IN_FIXED_ZONE), but
+    * "measured once" is not "guaranteed", so refuse rather than trust it.
+    */
+   if (gpu_va >= kbase_dev->va.start &&
+       gpu_va < kbase_dev->va.start + kbase_dev->va.size) {
+      mesa_loge("kbase: imported buffer landed at 0x%" PRIx64 ", inside the "
+                "VA heap range [0x%" PRIx64 ", 0x%" PRIx64 ") - refusing, as "
+                "the heap could hand out the same address",
+                gpu_va, kbase_dev->va.start,
+                kbase_dev->va.start + kbase_dev->va.size);
+      if (map)
+         munmap(map, (size_t)region_size);
+      close(dup_fd);
+      return NULL;
+   }
+
+   struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
+   if (!bo) {
+      if (map)
+         munmap(map, (size_t)region_size);
+      close(dup_fd);
+      return NULL;
+   }
+
+   bo->gpu_va = gpu_va;
+   bo->import_map = map;
+   bo->import_map_size = (size_t)region_size;
+   bo->import_dmabuf_fd = dup_fd;
+
+   /* exclusive_vm = NULL: an imported BO is shareable by definition. Matches
+    * what panthor_kmod and panfrost_kmod do for their own imports.
+    */
+   pan_kmod_bo_init(&bo->base, dev, NULL, region_size,
+                    PAN_KMOD_BO_FLAG_IMPORTED, (uint32_t)(gpu_va >> 12));
+
+   if (kbase_debug_counters_enabled()) {
+      unsigned live = atomic_fetch_add(&kbase_debug_live_bos, 1) + 1;
+      mesa_logi("kbase-dbg: bo_import_fd gpu_va=0x%" PRIx64 ", size=%" PRIu64
+                ", cookie=0x%" PRIx64 ", live_bos=%u",
+                gpu_va, region_size, (uint64_t)import.out.gpu_va, live);
+   }
+
+   return &bo->base;
+}
+#endif /* PAN_KMOD_HAS_BO_IMPORT_FD */
 
 /*
  * BELONGS-UPSTREAM(kernel): there is nothing to implement here until kbase
@@ -1797,6 +1965,13 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .bo_alloc = kbase_kmod_bo_alloc,
    .bo_free = kbase_kmod_bo_free,
    .bo_import = kbase_kmod_bo_import,
+   /* The live import path. Only exists once patch-pan-kmod-import-fd.py has
+    * added the hook to struct pan_kmod_ops; guarded so this file still
+    * compiles against an unpatched tree.
+    */
+#ifdef PAN_KMOD_HAS_BO_IMPORT_FD
+   .bo_import_fd = kbase_kmod_bo_import_fd,
+#endif
    .bo_export = kbase_kmod_bo_export,
    .bo_get_mmap_offset = kbase_kmod_bo_get_mmap_offset,
    .bo_wait = kbase_kmod_bo_wait,
