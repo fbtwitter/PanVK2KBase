@@ -261,6 +261,24 @@ render_multidraw_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py multidraw_frag.spv \
 	    multidraw_frag_spv.h render_multidraw_probe_frag
 
+# ROADMAP.md Phase 5: the first probe to touch multisampling/resolve at
+# all. Same triangle as render_vbo_probe, but the colour attachment is
+# multisampled with storeOp=NONE and resolves (VK_RESOLVE_MODE_AVERAGE_BIT)
+# to a second, single-sample image that gets read back - exactly the
+# in-tile-memory resolve path PanVK's rewritten framebuffer abstraction
+# added (see the probe's own header comment). Same --i-know-it-hangs gate.
+render_msaa_probe: ./src/tests/render_msaa_probe/render_msaa_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_msaa_probe -o ./build/render_msaa_probe $<
+
+render_msaa_probe_shaders:
+	cd ./src/tests/render_msaa_probe && \
+	  glslangValidator -V msaa.vert -o msaa_vert.spv && \
+	  glslangValidator -V msaa.frag -o msaa_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py msaa_vert.spv \
+	    msaa_vert_spv.h render_msaa_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py msaa_frag.spv \
+	    msaa_frag_spv.h render_msaa_probe_frag
+
 # Tests whether the cold-start bug found in CTS's
 # record_many_draws_secondary_2 (fails 100% of the time as the FIRST
 # secondary-command-buffer draw in a process, passes after any other

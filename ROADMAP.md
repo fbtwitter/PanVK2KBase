@@ -1133,6 +1133,42 @@ Tools worth knowing about before touching any of this:
       to look at an image. Add a PNG dump only if visual inspection
       becomes useful for a harder case — not needed for what's been
       tested so far.
+- [x] **MSAA — done, clean on the first attempt** (2026-08-02).
+      `tests/render_msaa_probe`: same triangle as `render_vbo_probe`, but
+      the colour attachment is 4x multisampled with `storeOp = NONE` and
+      resolves (`VK_RESOLVE_MODE_AVERAGE_BIT`) to a second, single-sample
+      image that gets read back — the exact in-tile-memory resolve path
+      PanVK's rewritten framebuffer abstraction added (`pan_fb_resolves`,
+      per Collabora's write-up of MR mesa/mesa!39759; confirmed present in
+      the vendored Mesa clone, `third_party/MESA-KMOD` pinned `c439d52c`).
+      Every render probe before this one is single-sample, so nothing had
+      touched this path before.
+      Correctness check is geometry-aware rather than reusing the old
+      exact 190/66/0 split: real antialiasing means edge pixels should
+      resolve to a genuine AVERAGE blend, not snap to clear or triangle
+      colour, so the probe classifies every pixel into clear-exact /
+      triangle-exact / valid-blend (each channel between the two reference
+      colours, alpha exactly 0xff) / corrupt, and treats `blend_px > 0` as
+      the actual positive signal — a resolve that silently no-opped would
+      reproduce the old 190/66/0 split with zero blended pixels, which
+      would have failed this check.
+      Result on the Poco X8 Pro (Mali-G720, r49p1): `152 clear-colour, 66
+      triangle-colour, 38 blended-edge, 0 corrupt (of 256 total)` — every
+      check passed, 0 failures. Device confirmed healthy afterward:
+      `render_vbo_probe` re-run immediately after still gives the exact
+      190/66/0 baseline. `framebufferColorSampleCounts` offered 4x, so
+      that's what ran (probe falls back to 2x, then fails cleanly with a
+      clear message if neither is offered).
+- [ ] **Re-test the unexplained texture-probe anomaly against AFBC.** The
+      same Mesa clone snapshot already has AFBC as PanVK's default
+      compression (`PANVK_DEBUG_NO_AFBC` / `noafbc` in
+      `panvk_instance.c`), which changes image memory layout — exactly what
+      `render_texture_probe` touches. That probe's still-unexplained
+      finding (`vkCmdCopyImageToBuffer` reading `00000000` moments before
+      the shader samples the correct colour, `docs/kbase-notes.md`) was
+      never re-run with `PANVK_DEBUG=noafbc` to see if disabling AFBC
+      changes or removes it — a five-minute check that was not available
+      as a hypothesis when the anomaly was first found.
 
 ## Phase 6 — WSI and Android driver packaging
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
@@ -1431,6 +1467,26 @@ Tools worth knowing about before touching any of this:
       leaves excluded pending the resource-ceiling investigation above.
       Next: the deferred medium/huge sweeps, `command_buffers` to
       completion, and `dEQP-VK.query_pool.*` per the standing plan.
+      **Reprioritize `copy_and_blit`/`image_clearing` above `multisample`
+      when picking the next deferred huge sweep** (checked 2026-08-02): the
+      vendored Mesa clone already ships AFBC-by-default and the new
+      `pan_fb_*` framebuffer/resolve abstraction (see Phase 5's new MSAA
+      and AFBC items above), and `copy_and_blit`/`image_clearing` are
+      exactly the CTS groups that exercise image-copy + compressed-layout
+      interactions together — the same combination behind the still-open
+      texture-probe anomaly.
+      **When the `extensions` stage is eventually reached, expect a known
+      gap list, not driver bugs to chase.** Cross-checked against GitLab
+      work item `panfrost/mesa#125` ("features the Mali DDK implements but
+      PanVK does not"), 49/76 done as of 2026-07-15: `dEQP-VK.*` cases for
+      `VK_EXT_transform_feedback`, `VK_KHR_ray_query`/`ray_tracing_pipeline`,
+      `VK_EXT_fragment_density_map`/`_map2`, `VK_EXT_subpass_merge_feedback`,
+      `VK_EXT_primitives_generated_query`, `VK_EXT_image_compression_control`,
+      `geometryShader`, and `tessellationShader` should correctly report
+      `NotSupported` on this driver — none of them are gated by this
+      repo's target hardware (Mali-G720, v10-class clears every v9+/v10+
+      gate seen in that ticket), they are simply not implemented upstream
+      yet.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is
@@ -1448,6 +1504,16 @@ Tools worth knowing about before touching any of this:
       tail-padding change until there is one** — the whole point of asking
       was to avoid guessing at shared-code behaviour that cannot be tested
       on panthor from here.
+      **Context check, 2026-08-02:** `init_render_desc_ringbuf()` and the
+      ringbuf macros this question is about live in
+      `src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c` — the same file that
+      now pulls `pan_fb_layout`/`pan_fb_load`/`pan_fb_store`/
+      `pan_fb_desc_info` from PanVK's recently-rewritten framebuffer
+      abstraction (Collabora's write-up of MR mesa/mesa!39759). Not the
+      same code path as the ringbuf's double-mapping issue, but close
+      enough in the same file that it is worth re-reading the current tree
+      before acting on any reply, in case the surrounding render-pass code
+      shifted shape since the question was drafted.
 - [x] A first upstream contribution landed alongside it, deliberately
       small: `Joshua-Micheletti/PanVK2KBase#2`, making `kbase_bo_create()`
       treat the CPU pointer as the GPU address only under `SAME_VA`.
