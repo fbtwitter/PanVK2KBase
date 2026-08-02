@@ -24,10 +24,17 @@ which is driver-specific. It diverges at exactly three points:
 So this patches those three points rather than duplicating ~260 lines that
 would immediately start drifting from upstream.
 
-SCOPE: compute subqueue only. PANVK_SUBQUEUE_VERTEX_TILER and _FRAGMENT
-additionally need the tiler heap descriptor, geometry buffer, scratch FBD and
-render descriptor ringbuf; that is the next piece of work. init_queue() only
-loops over PANVK_SUBQUEUE_COMPUTE on kbase for now.
+SCOPE: all three subqueues. An earlier version of this note said "compute
+subqueue only ... that is the next piece of work", which has not been true
+for a while - init_queue() loops over PANVK_SUBQUEUE_COUNT, and the tiler
+heap descriptor, geometry buffer and scratch FBD are all set up (shared with
+panthor's own init_tiler, exported as panvk_per_arch(init_gpu_tiler)).
+
+What is still skipped is init_render_desc_ringbuf(), which maps one BO at two
+adjacent GPU VAs - not expressible on kbase. That restricts command buffers
+carrying VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT, not rendering as such,
+and it is an open upstream question rather than pending local work: see
+docs/upstream-ringbuf-question.md.
 
 Applied as a script rather than a diff because upstream moves. Idempotent.
 Run after patch-panvk-kbase-queue.py.
@@ -318,9 +325,10 @@ panvk_per_arch(cleanup_gpu_tiler)(struct panvk_gpu_queue *queue)
     * subqueue whether the application touched it or not. Leaving the context
     * register at 0 is what made those streams unrunnable, not the ringbuf.
     *
-    * They still cannot *render* - see the req_resource check in
-    * kbase_queue_submit(), which is what refuses work that needs the tiler
-    * or fragment endpoints. */
+    * They render fine. What the req_resource check in kbase_queue_submit()
+    * refuses is narrower than it once was: only streams that need the tiler
+    * or fragment endpoints *and* come from a SIMULTANEOUS_USE command
+    * buffer, which is the case that genuinely needs the ringbuf. */
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       result = init_subqueue(queue, i);
       if (result != VK_SUCCESS)

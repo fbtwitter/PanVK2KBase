@@ -450,9 +450,17 @@ panvk_per_arch(create_kbase_queue)(struct panvk_device *dev,
     * scoreboard slots. Shared with panthor - only the submit at the end of
     * it is ours, via panvk_per_arch(kbase_submit_and_wait) below.
     *
-    * Compute only for now; the render subqueues additionally need the
-    * descriptor ringbuf, which is blocked on BO aliasing - see the comment
-    * on that step in patch-panvk-kbase-subqueue-init.py.
+    * All three subqueues, not just compute - an earlier version of this
+    * comment said "compute only for now", which was wrong and stayed wrong
+    * for a while. VERTEX_TILER and FRAGMENT need their context register
+    * loaded too, because the epilogue vkEndCommandBuffer appends touches
+    * syncobjs/last_error on every subqueue whether the application used it
+    * or not; leaving the register at 0 is a GPU read of address 0.
+    *
+    * What is still skipped is init_render_desc_ringbuf() specifically,
+    * which maps one BO at two adjacent GPU VAs - see the req_resource_mask
+    * check further down. That restricts VK_COMMAND_BUFFER_USAGE_
+    * SIMULTANEOUS_USE_BIT command buffers, not rendering as such.
     */
    result = panvk_per_arch(init_gpu_queue)(&queue->gpu);
    if (result != VK_SUCCESS) {
@@ -1008,15 +1016,23 @@ collect_cmdbuf_calls(struct panvk_device *dev,
           * ringbuf-vs-per-cmdbuf-pool branch, the FBD patch-copy, the
           * producer/consumer release pair), and render.tiler_heap /
           * render.geom_buf / the tiler-OOM scratch FBD are already set
-          * correctly here regardless. So a non-simul_use render stream is
-          * refused by this check today for no reason the hardware actually
-          * needs - see docs/kbase-notes.md's "non-simul_use rendering"
-          * section for the full trace through Mesa's source.
+          * correctly here regardless - see docs/kbase-notes.md's
+          * "non-simul_use rendering" section for the full trace through
+          * Mesa's source.
           *
-          * This is new ground, not a proven-safe path: no VERTEX_TILER or
-          * FRAGMENT stream has ever actually executed on this device in
-          * this repo before. tests/render_clear_probe is the first attempt,
-          * and it is deliberately gated the way tests/alias_cs_probe is.
+          * Hence the "&& simul_use" in the check below. An earlier version
+          * refused every render stream, which was more conservative than
+          * the hardware needs and was what made this look like a total
+          * rendering blocker rather than a SIMULTANEOUS_USE one.
+          *
+          * VERTEX_TILER and FRAGMENT streams now execute routinely and
+          * pixel-exactly on this device: render-pass entry, a full draw,
+          * vertex fetch, push constants, descriptor sets, texture sampling,
+          * depth test/write, multiple draws per pass, and 4x MSAA resolve,
+          * each with its own probe under src/tests/render_*_probe/ and all
+          * of them in tools/run-probes.sh's render tier. The refusal below
+          * still stands and is still correct - it refuses simul_use render
+          * streams only, which genuinely cannot work without the ringbuf.
           */
          bool simul_use =
             cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;

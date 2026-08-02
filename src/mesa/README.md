@@ -283,30 +283,55 @@ dispatch.
 
 ### Not verified
 
-- **The driver still cannot drive the GPU.** Enumeration now reaches the
-  backend, but device creation fails immediately after, at exactly the
-  point `docs/architecture.md` predicted:
+> **This section was materially wrong for a while, and that is worth
+> recording.** It used to say the driver "still cannot drive the GPU", that
+> submission was "untouched", and that "BO/VM ops still never execute" —
+> all three were false by the time anyone read them. Compute, rendering and
+> sync had been working on hardware for some time. If you are reading a
+> claim here and it smells stale, check the code first; this file has
+> already misled once. `tools/run-probes.sh` is the fastest way to find out
+> what actually works right now.
 
-  ```c
-  device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
-  if (!device->drm_syncobj_type.features)
-     return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, ...);
-  ```
+What is genuinely open, as of 2026-08-02:
 
-  `vk_drm_syncobj_get_type()` needs a real DRM fd; `/dev/mali0` is a misc
-  device, so it fails and `vkEnumeratePhysicalDevices` returns `-3`
-  (`VK_ERROR_INITIALIZATION_FAILED`). PanVK's sync model is DRM-syncobj
-  based from the ground up, so this needs a `vk_sync` implementation backed
-  by whatever kbase offers — and *that* is still blocked on the unsolved
-  "queue group never gets scheduled" problem in `docs/kbase-notes.md`.
-- **Submission is untouched.** `panvk_vX_gpu_queue.c` still issues
-  `DRM_IOCTL_PANTHOR_*` directly.
-- **BO/VM ops still never execute.** Initialisation fails before any
-  allocation happens.
+- **`SIMULTANEOUS_USE` rendering.** `init_render_desc_ringbuf()` maps one BO
+  at two adjacent GPU VAs, and kbase cannot express that — every
+  `KBASE_IOCTL_MEM_ALIAS` variant comes back `BASE_MEM_NEED_MMAP`, i.e. a
+  cookie rather than an address. Only command buffers carrying
+  `VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT` are affected; ordinary
+  rendering works. Asked upstream — `docs/upstream-ringbuf-question.md`.
+- **`bo_wait` is unimplemented.** It logs and returns `false` rather than a
+  hopeful `true` (`pan_kmod_kbase.c`). Not hit by anything today because
+  submissions carry explicit fences, but it is where a shared/imported BO
+  with an outside producer would land.
+- **dma-buf export is impossible**, not merely absent: kbase has no export
+  path anywhere in its UAPI — no PRIME, no dmabuf-out ioctl. This is the one
+  item on the list that no amount of userspace work can close.
+- **Android presentation is not implemented**, and it is a chain rather than
+  one gap:
+  - `VK_ANDROID_native_buffer` and the AHardwareBuffer extension are gated on
+    `vk_android_get_ugralloc() != NULL`, but the Android build uses
+    `-Dandroid-stub=true` (`wsl-build-android.sh`), so `hw_get_module()` is a
+    stub that returns 0 *without writing `*module`* and gralloc cannot
+    initialise.
+  - `PANVK_USE_WSI_PLATFORM` does not list Android, so Mesa's own
+    `VK_KHR_swapchain` is compiled out — the Android loader owns the
+    swapchain and talks to the driver through `VK_ANDROID_native_buffer`.
+  - That path binds memory via a dma-buf import (see the `bo_import` row in
+    the BELONGS-UPSTREAM table above).
+  - Android's acquire/release protocol needs sync-fd import/export on
+    semaphores; `panvk_kbase_sync.c` provides no `import_sync_file` /
+    `export_sync_file` ops.
+- **The ~307-case `vkCreateDevice` ceiling** under sustained CTS churn.
+  Characterised across five investigation passes and closed as very likely
+  downstream kbase pool/shrinker behaviour rather than a bug here;
+  `PANVK_KBASE_DEBUG_COUNTERS=1` exists for it.
 - **Not installed as the system driver.** Replacing
   `/vendor/lib64/hw/vulkan.mali.so` needs a writable `/vendor` (root) and
   would break the device's graphics if the driver misbehaves. Deliberately
-  not attempted.
+  not attempted — and no longer necessary for testing, since
+  `src/tests/icd_shim/` lets `deqp-vk` reach the driver through the standard
+  loader ABI without touching `/vendor`.
 
 ### Why Linux (and not Windows)
 
