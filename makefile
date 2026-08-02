@@ -135,9 +135,6 @@ driver_enum_probe: ./src/tests/driver_enum_probe/driver_enum_probe.c
 driver_extmem_probe: ./src/tests/driver_extmem_probe/driver_extmem_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_extmem_probe $<
 
-# Drives the kbase event-memory vk_sync through the real Vulkan API:
-# timeline semaphore signal/get/wait and binary fence status/reset. Proves
-# the sync type works, not merely that it registered.
 # The other half of tests/dmabuf_import_probe: the same import, but through
 # the real Vulkan entry points with the GPU doing the writing. Reads back
 # through an independent mmap of the dma-buf rather than vkMapMemory, which
@@ -146,6 +143,16 @@ driver_extmem_probe: ./src/tests/driver_extmem_probe/driver_extmem_probe.c
 driver_dmabuf_probe: ./src/tests/driver_dmabuf_probe/driver_dmabuf_probe.c
 	$(CC) $(CFLAGS) -I./src/tests/dmabuf_import_probe -o ./build/driver_dmabuf_probe $<
 
+# Is the Android presentation surface actually there? Lists the VK_ANDROID_*
+# device extensions, then tries the thing that matters: importing a real
+# AHardwareBuffer as VkDeviceMemory, which is the memory path a swapchain
+# image takes. Needs -landroid for AHardwareBuffer_*.
+driver_android_wsi_probe: ./src/tests/driver_android_wsi_probe/driver_android_wsi_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_android_wsi_probe $< -landroid
+
+# Drives the kbase event-memory vk_sync through the real Vulkan API:
+# timeline semaphore signal/get/wait and binary fence status/reset. Proves
+# the sync type works, not merely that it registered.
 driver_sync_probe: ./src/tests/driver_sync_probe/driver_sync_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_sync_probe $<
 
@@ -500,6 +507,7 @@ mesa-backend-sync:
 	@echo "  - src/mesa/patch-panvk-kbase-subqueue-init.py <mesa-dir> (subqueue init)"
 	@echo "  - src/mesa/patch-pan-kmod-import-fd.py      <mesa-dir>  (dma-buf import hook)"
 	@echo "  - src/mesa/patch-panvk-kbase-external-memory.py <mesa-dir> (import/export capability)"
+	@echo "  - src/mesa/patch-panvk-android-gralloc-fd.py <mesa-dir> (gralloc handle dma-buf index, NOT kbase-specific)"
 	@echo "  - src/mesa/patch-panvk-null-device-destroy.py <mesa-dir> (null-handle vkDestroyDevice, not kbase-specific)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes

@@ -85,6 +85,7 @@ driver_compute_probe   | driver | driver_compute_probe   | NDK                 |
 driver_pipeline_probe  | driver | driver_pipeline_probe  | NDK                 | @SO@                       | 120
 driver_semaphore_probe | driver | driver_semaphore_probe | NDK                 | @SO@                       | 120
 driver_dmabuf_probe    | driver | driver_dmabuf_probe    | NDK                 | @SO@ --source=heap         | 120
+driver_android_wsi_probe | driver | driver_android_wsi_probe | NDK             | @SO@                       | 120
 render_clear_probe     | render | render_clear_probe     | NDK                 | @SO@ --i-know-it-hangs     | 120
 render_triangle_probe  | render | render_triangle_probe  | NDK                 | @SO@ --i-know-it-hangs     | 120
 render_vbo_probe       | render | render_vbo_probe       | NDK                 | @SO@ --i-know-it-hangs     | 120

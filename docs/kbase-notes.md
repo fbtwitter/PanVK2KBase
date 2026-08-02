@@ -3266,3 +3266,84 @@ order they will be hit:
    `panvk_kbase_sync.c` does not implement.
 4. There is still no Mali equivalent of `libadrenotools` for loading a
    custom ICD without root.
+
+## The Android memory path works — and "gralloc cannot initialise" was wrong
+
+ROADMAP listed `-Dandroid-stub=true` preventing gralloc init as the first
+blocker for Android presentation. **That was wrong**, and it is worth
+recording why, because the reasoning was plausible and still false.
+
+`-Dandroid-stub=true` only affects **link** time. It builds no-op
+`libhardware`/`libnativewindow`/`liblog`/`libsync` shared objects so the
+cross build has something to link against. On the device the loader resolves
+the **real** `libhardware.so`, so `hw_get_module()` is the genuine article.
+Confirmed by which fallback message appears in logcat:
+
+```
+W MESA: Gralloc doesn't support lock_ycbcr (video buffers won't be supported)
+I MESA: Using fallback gralloc implementation
+```
+
+That is the `else if (!gr->gralloc_module->lock_ycbcr)` branch, reachable
+only when `hw_get_module()` returned **0 and a valid module**. And
+`u_gralloc_fallback_create()` never returns NULL anyway — it warns and
+returns a usable object — so `vk_android_get_ugralloc()` was always
+non-NULL. The CrOS backend correctly declined (MediaTek's gralloc is not
+CrOS gralloc) and the fallback took over.
+
+Consequence: `VK_ANDROID_native_buffer` (rev 8) and
+`VK_ANDROID_external_memory_android_hardware_buffer` (rev 5) have been
+advertised all along — 143 device extensions total. Measured by
+`tests/driver_android_wsi_probe`.
+
+### The real blocker: `handle->data[0]` in three places, two of them in
+### Mesa's shared Vulkan runtime
+
+`vkGetAndroidHardwareBufferPropertiesANDROID` failed
+`VK_ERROR_INVALID_EXTERNAL_HANDLE`, and the only clue was one log line —
+`invalid dmabuf size` from `pan_kmod_bo_import`, several layers below the
+actual mistake and pointing at the importer rather than at the handle.
+
+The cause is the `data[0]` convention, which does not hold here (see the
+gralloc-handle section above: MediaTek puts the dma-buf at `data[1]`). It is
+assumed in three places:
+
+| file | what it does | whose code |
+|---|---|---|
+| `src/vulkan/runtime/vk_android.c` | `lseek(handle->data[0], ...)` for `allocationSize`, and passes `data[0]` to `GetMemoryFdPropertiesKHR` | **Mesa's shared Vulkan runtime** — every Mesa Vulkan driver on Android |
+| `src/panfrost/vulkan/panvk_android.c` | `int dma_buf_fd = handle->data[0];` in the AHB allocate path | PanVK |
+| `src/util/u_gralloc/u_gralloc_fallback.c` | `out->fds[0] = hnd->handle->data[0];` | Mesa's gralloc helper |
+
+`src/mesa/patch-panvk-android-gralloc-fd.py` fixes all three: pick the first
+fd in the handle that behaves like a dma-buf (dma-bufs implement `llseek`
+and report their size; metadata and fence fds do not), falling back to the
+historical index so a platform where `data[0]` was always right cannot
+regress.
+
+**Result, on hardware:**
+
+```
+vkGetAndroidHardwareBufferPropertiesANDROID -> 0
+  allocationSize=69632 memoryTypeBits=0x3
+vkAllocateMemory(VkImportAndroidHardwareBufferInfoANDROID) -> 0
+```
+
+A real 64x64 RGBA8 AHardwareBuffer with GPU usage now imports as
+`VkDeviceMemory`. **That is the same memory path a swapchain image takes**,
+and it runs through the dma-buf import this port gained earlier.
+
+None of this is kbase-specific. The `data[0]` assumption would bite any
+Mesa Vulkan driver on a gralloc that orders its handle differently, and the
+runtime sites in particular are a strong upstream bug report.
+
+### What is left for presentation
+
+1. ~~gralloc init~~ — was never broken.
+2. ~~`data[0]`~~ — fixed here, upstreaming candidate.
+3. **sync-fd semaphores.** `vk_common_AcquireImageANDROID` needs
+   `ImportSemaphoreFdKHR`/`ImportFenceFdKHR` with `SYNC_FD`, and
+   `QueueSignalReleaseImageANDROID` needs `GetSemaphoreFdKHR`;
+   `panvk_kbase_sync.c` implements none of them. Unexplored lead:
+   `KBASE_IOCTL_STREAM_CREATE` is a fence-stream ioctl the vendor blob calls.
+4. **Loading the ICD** without root, for which no Mali equivalent of
+   `libadrenotools` exists.

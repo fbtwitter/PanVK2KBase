@@ -1210,6 +1210,28 @@ Tools worth knowing about before touching any of this:
       as a hypothesis when the anomaly was first found.
 
 ## Phase 6 — WSI and Android driver packaging
+- [x] **The Android external-memory path works: an AHardwareBuffer imports
+      as `VkDeviceMemory`** (2026-08-02). That is the same memory path a
+      swapchain image takes, so it is the substantive half of "gralloc
+      support" rather than a preliminary.
+      **Two beliefs recorded here were wrong and are worth not repeating.**
+      First, `-Dandroid-stub=true` was thought to prevent gralloc from
+      initialising; it only affects *link* time, the real `libhardware.so`
+      resolves on device, and `u_gralloc_fallback_create()` never returns
+      NULL anyway - so `VK_ANDROID_native_buffer` (rev 8) and
+      `VK_ANDROID_external_memory_android_hardware_buffer` (rev 5) had been
+      advertised all along. Second, the actual blocker was the
+      `handle->data[0]` convention, which does not hold on this device, in
+      **three** places - and two of them are in Mesa's shared Vulkan runtime
+      (`vk_android.c`), not in PanVK, so they would affect any Mesa Vulkan
+      driver on a gralloc that orders its handle differently.
+      Fixed by `src/mesa/patch-panvk-android-gralloc-fd.py`; verified by
+      `tests/driver_android_wsi_probe`. Full writeup in
+      `docs/kbase-notes.md`.
+      **Still open before anything is on screen:** sync-fd
+      import/export on semaphores (`vk_common_AcquireImageANDROID` needs it;
+      `KBASE_IOCTL_STREAM_CREATE` is an unexplored lead), and a way to load
+      the ICD without root.
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
       targeting phones, or DRM/kmsro if targeting an embedded board still
       on kbase.
