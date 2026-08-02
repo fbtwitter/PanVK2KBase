@@ -3049,3 +3049,153 @@ without a check-in: the volume/count hypothesis is now thoroughly ruled
 out through two independent, exact-value tests, and the remaining
 candidate (point-list full-coverage) is a bigger, more speculative next
 step worth a deliberate decision rather than silent continuation.
+
+## `buffer` group stall on `storage_texel.storage.create.binding` - live analysis
+
+Resuming the `dEQP-VK.api.buffer.*` widening sweep (after excluding the
+first stalling case, `storage.indirect.create.binding`, and applying
+`svc power stayon true` to rule out screen-off as a factor), the run
+stalled again at case 598/~842, on
+`dEQP-VK.api.buffer.suballocation.storage_texel.storage.create.binding`.
+Confirmed NOT a screen-off artifact (stayon was already active) and NOT a
+GPU/device hang (`driver_compute_probe --submit --fill` stayed clean
+throughout, run concurrently while the stalled process was still alive -
+valid since kbase supports multiple concurrent contexts).
+
+Root cause traced by reading the CTS source
+(`external/vulkancts/modules/vulkan/api/vktApiBufferTests.cpp`,
+`getMaxBufferSize()` at line 66, `BufferTestInstance::bufferCreateAndAllocTest()`
+at line 185): for a UMA system (`limits.totalDeviceLocalMemory == 0`, true
+for this driver), the test derives its buffer size from
+`totalSystemMemory - alignment` (this device reports ~11.6GB total), then
+halves that again for `maxBufferSize` - so the *first* `vkCreateBuffer`/
+`vkAllocateMemory` attempt targets roughly a multi-GB allocation. On
+failure the test shrinks the size by `>>4` (16x) per retry and tries
+again, down to `memReqs.alignment`, before giving up with a `fail`.
+
+On-device evidence matches a kernel-side reclaim stall, not a userspace
+spin or logic bug: `ps -o pid,etime,time,stat` on the live process showed
+only ~1m29s of accumulated CPU time across 28+ minutes of elapsed time,
+state `S` (sleeping). The `.qpa` output file's mtime and the stdout log's
+last line (`Test case '...storage_texel.storage.create.binding'..` with no
+following result line) were both frozen from the moment the case started -
+zero forward progress, consistent with being parked inside a blocking
+kernel call (most likely `KBASE_IOCTL_MEM_ALLOC`/`MEM_ALLOC_EX` triggering
+synchronous memory reclaim/compaction) rather than a tight failing retry
+loop, which would show much higher accumulated CPU time over the same
+window.
+
+This is the same underlying mechanism as the already-closed
+resource-ceiling finding (`kbase_mem_pool` + Linux shrinker behavior under
+memory pressure), just manifesting here as a multi-minute reclaim stall on
+a single oversized request instead of a fast, clean `ENOMEM`. Not a driver
+correctness bug - the driver isn't misbehaving, the kernel is legitimately
+churning trying to satisfy a request sized against a memory limit
+(`totalSystemMemory`) far larger than what's actually available for GPU
+use on this device/kernel configuration. The retry loop is bounded (it
+terminates once shrunk size reaches `memReqs.alignment` or `0`), so this
+is expected to eventually resolve one way or another (test result, or the
+run's own on-device `timeout` wrapper) rather than deadlock permanently.
+Left running rather than killed, to observe which outcome actually
+happens; GPU health reconfirmed healthy at each check-in via
+`driver_compute_probe --submit --fill`.
+
+## kbase CAN import a dma-buf — measured, with two caveats that matter
+
+This closes the "Does your kernel's kbase expose the ioctls you'll need for
+dma-buf import/export, or only its own private memory model?" checkbox that
+has been open in the "Things worth checking early, not late" list since
+Phase 1. Answered by `tests/dmabuf_import_probe`, which does **no GPU work
+at all** — no queue group, no `CS_QUEUE_KICK`, no command stream — because
+the value under test is exactly the kind that wedged the device twice via
+`alias_cs_probe`.
+
+**Import works.** `KBASE_IOCTL_MEM_IMPORT` with
+`BASE_MEM_IMPORT_TYPE_UMM` accepts a dma-buf fd from `/dev/dma_heap/system`
+on the first try, with plain `CPU_RD|CPU_WR|GPU_RD|GPU_WR` flags — no
+`BASE_MEM_IMPORT_SHARED`, no `BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP` needed.
+`in.phandle` is a **pointer to** the `int` fd, not the fd by value; the
+kernel does `get_user()` on it.
+
+```
+OUT_FLAGS=0x500f  [CPU_RD CPU_WR GPU_RD GPU_WR CACHED_CPU NEED_MMAP]
+GPU_VA_RAW=0x41000        -> a cookie, not an address
+RESOLVED_GPU_VA=0x7104dfc000 (after mmap)
+VA_PAGES=1, COVERS_BUFFER=yes
+IMPORT_VA_IN_FIXED_ZONE=no
+FIXED_ALLOC_BEFORE_IMPORT=pass   FIXED_ALLOC_AFTER_IMPORT=pass
+```
+
+Four things a Mesa-side implementation has to respect, each measured rather
+than assumed:
+
+- **`out.gpu_va` is an mmap cookie, not an address** — `BASE_MEM_NEED_MMAP`
+  is set. That is the same trap as `MEM_ALIAS`, and it is checked two ways
+  here, not one: the flag, and the magnitude against the header's own cookie
+  range (`BASE_MEM_COOKIE_BASE` = `0x40000` up to
+  `BASE_MEM_FIRST_FREE_ADDRESS`; the observed `0x41000` sits inside it). The
+  probe treats disagreement between those two as a hard stop, because
+  `alias_cs_probe` is the case where one signal said "usable" and the device
+  needed a reboot. `mmap()`ing the cookie resolves it to a real address, the
+  way Panfork does.
+- **The cookie is single-use.** A second `mmap()` of the same cookie fails
+  `EINVAL`. So an imported BO's mapping must be kept — it cannot be
+  re-derived — and `bo_get_mmap_offset()` cannot serve one.
+- **It frees like a SAME_VA region.** `KBASE_IOCTL_MEM_FREE` on the resolved
+  address returns `EINVAL`; `munmap()` is the free. Getting this backwards
+  would leak a kernel region per imported buffer.
+- **The imported VA lands outside the FIXED_VA zone** (`0x800200000000` +
+  8 GB) that `pan_kmod_kbase.c`'s `util_vma_heap` owns, and a
+  `BASE_MEM_FIXED` allocation still succeeds *after* an import — so an
+  import does **not** poison the context the way `BASE_MEM_FIXABLE` does.
+  Both were open questions and both came back clean.
+
+**Caveat 1: there is no CPU view of an imported region.** `mmap()` of the
+cookie succeeds, but touching the result takes `SIGBUS` — the mapping exists,
+the pages are not backed. Identical across all three flag combinations
+(`base`, `IMPORT_SHARED`, `SYNC_ON_MAP_UNMAP`), so this is a property of UMM
+imports on this kernel rather than a flag choice. kbase evidently attaches
+the dma_buf lazily and `mmap()` alone does not set up CPU access.
+
+This does not block the use case that matters — a gralloc buffer is written
+by the *GPU*, not the CPU — but it does mean an imported `VkDeviceMemory`
+cannot honestly offer `vkMapMemory`, and it means the probe cannot prove
+same-memory identity from the CPU side. Proving that needs GPU work, i.e.
+the driver-level probe, not this one.
+
+(The probe survives the fault rather than dying on it: it installs a
+`SIGBUS`/`SIGSEGV` guard with `sigsetjmp` around each access. A probe that
+crashes tells you less than one that says "this mapping is not accessible,
+here is everything else I learned.")
+
+**Caveat 2, and the one that actually matters for presentation: the
+AHardwareBuffer path does NOT work, and it fails below kbase.**
+`AHardwareBuffer_allocate` itself succeeds from the unprivileged `shell`
+user — so binder access to the graphics allocator is not the problem — but
+the fd at `handle->data[0]`, which is exactly what `panvk_android.c` hands
+to `vkAllocateMemory`, does not behave like a usable dma-buf on this device:
+
+```
+got dma-buf fd=7 via AHardwareBuffer(BLOB)
+lseek(SEEK_END) = -1
+mmap(dma-buf) failed: Permission denied
+MEM_IMPORT [all three combos] -> FAILED: Out of memory
+```
+
+`lseek` failing and `mmap` returning `EACCES` both say this fd is not a
+plain, mappable dma-buf — either `data[0]` is not the dma-buf on this
+vendor's `native_handle` layout, or it is one from a restricted heap. The
+`ENOMEM` from kbase is downstream of that, not an independent kbase
+limitation.
+
+**So the honest summary is narrower than "dma-buf import works":** kbase can
+import a dma-heap buffer, which is a real and previously-unanswered result
+and is the mechanism the Mesa-side work needs. Whether it can import a
+*gralloc* buffer — the only kind Android WSI will ever hand it — is still
+open, and the obstacle is at the gralloc/handle layer. Anyone picking up
+presentation should settle that **first**, because it is upstream of every
+other presentation blocker and it is cheap to test with this probe.
+
+`/dev/ion` does not exist on this device (dma-heaps only), and `/dev/ashmem`
+is 0666 but ashmem is not a dma-buf, so `dma_buf_get()` rejects it — neither
+is worth retrying.

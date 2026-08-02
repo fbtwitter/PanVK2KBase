@@ -371,6 +371,17 @@ fixed_va_probe: ./src/tests/fixed_va_probe/fixed_va_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/fixed_va_probe $<
 
 # Establishes that KBASE_IOCTL_VERSION_CHECK is once-per-fd.
+# Can kbase import a dma-buf on this device, and is the gpu_va it returns a
+# real address or an mmap cookie? Answers the "does your kernel's kbase
+# expose the ioctls you'll need for dma-buf import?" box that has been open
+# in docs/kbase-notes.md since Phase 1, and gates the Mesa-side import work.
+#
+# Deliberately does NO GPU work at all - no queue group, no kick, no command
+# stream - which is why it needs no --i-know-it-hangs gate and is safe for
+# tools/run-probes.sh to run unattended. See the file header.
+dmabuf_import_probe: ./src/tests/dmabuf_import_probe/dmabuf_import_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -I./src/tests/dmabuf_import_probe -o ./build/dmabuf_import_probe $<
+
 double_handshake_probe: ./src/tests/double_handshake_probe/double_handshake_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/double_handshake_probe $<
 
