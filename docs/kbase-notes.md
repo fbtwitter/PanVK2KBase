@@ -3744,3 +3744,47 @@ The next lever, if one is wanted, is no longer the submit path: it is that
 being unable to produce a real fence. That is a genuine kernel limitation
 rather than a driver choice, and it is what a compositor would otherwise
 absorb.
+
+## CTS: `command_buffers` run to completion (and the defer submit path at scale)
+
+The first of the deferred Phase 7 sweeps, and the first large-scale exercise
+of the new `KBASE_KICK_DEFER` submit path — CTS drives submission far harder
+than the probe suite does, so if deferring the kick lost streams this is
+where it would show.
+
+**Result: 130 of 131 cases, 57 Pass / 1 Fail / 71 NotSupported.**
+
+The single failure is `many_indirect_draws_on_secondary` — one of the two
+secondary-command-buffer failures already known and triaged. **No new
+failures**, so the submit-path change caused no regression at this scale.
+
+Worth noting what *didn't* fail: `record_many_draws_secondary_2`, the other
+known one, passed. That is consistent with the cold-start finding recorded
+earlier — it fails only as the *first* secondary-buffer draw in a process,
+and in a full alphabetical run `many_indirect_draws_on_secondary` (m) runs
+before `record_many_draws_secondary_2` (r) and warms it up. The theory
+predicted this, which is mild independent support for it.
+
+The 71 `NotSupported` is high but expected for this group: much of it needs
+features this driver does not advertise.
+
+**The 131st case, `trim_command_pool`, stalled** — the run sat on it for 30+
+minutes. This is the previously-documented pattern rather than a new hang:
+
+```
+PID   STAT  ELAPSED   CPU-TIME   CMD
+6548  S     30:56     00:00:53   deqp-vk
+```
+
+State `S` (sleeping), 53 seconds of CPU across 31 minutes of wall time, no
+`D`-state process anywhere, and `driver_compute_probe --submit --fill` run
+*concurrently* against the same device came back clean. So the GPU and the
+kbase context are fine and something above them is waiting — the same
+signature as the `buffer` group stall recorded earlier, which was closed as
+kernel-side memory-pool reclaim rather than a driver defect.
+
+Two things follow. `trim_command_pool` joins the exclusion list for
+unattended runs. And the ability to run a health probe against the device
+*while* a CTS process is stalled remains the cheapest way to tell "the
+driver is wedged" from "something else is slow" — worth reaching for first,
+because the two look identical from the test runner's point of view.

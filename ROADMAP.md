@@ -391,12 +391,20 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       failing kick still did not run. That page also reads back whatever
       was last written to it, so on this device it is ordinary memory, not
       an MMIO doorbell — which is presumably why Panfork disabled it.
-      **Cost: submissions are serialised**, which defeats much of the point
-      of a ring buffer. Correct but slow, and the honest option while the
-      real wake mechanism for an onslot idle CS is unknown. Revisit if
-      kernel-side visibility ever becomes available — the answer is
-      presumably in how `kbase_csf_queue_kick()` decides whether to ring
-      the hardware doorbell for a group that is already onslot.
+      **SUPERSEDED 2026-08-02, and the "revisit if kernel-side visibility
+      becomes available" note was looking in the wrong place.** No kernel
+      visibility was needed. The observation above is correct — a kick
+      issued while `CS_ACTIVE` is set does not run — but the fix it led to
+      (wait for idle, then kick) was answering the wrong question. When
+      `CS_ACTIVE` is set the right move is *not to kick at all*: the
+      still-resident CS picks up the published `CS_INSERT` by itself, the
+      same way the `extract < old_insert` case already relied on. So the
+      wait was paying 30-40ms for a state transition that had nothing to do
+      with whether the work would run, and submissions were being
+      serialised for no reason.
+      `PANVK_KBASE_KICK_MODE=defer` is the default now; `auto` restores
+      this behaviour. 41.5 -> 64.4 fps in a present loop, 30/30 regression.
+      See "Where this actually is" below and `docs/kbase-notes.md`.
 - [x] **The compute subqueue's GPU context is initialised.** Queue creation
       now calls `panvk_per_arch(init_gpu_queue)` — panthor's own
       `init_subqueue()` path — which allocates the shared syncobj array and
@@ -933,23 +941,34 @@ slot reaches its value, rather than a `SYNC_WAIT64` blocking the GPU. That
 satisfies the feature's contract and is deliberately as far as it goes — see
 `docs/kbase-notes.md`.
 
-**Submission no longer kicks unconditionally.** A CS that is still executing
-re-reads `CS_INSERT` on its own, so work appended to a busy queue runs with
-no kick at all; only a queue that has caught up needs one. Back-to-back
-submits went from 0.39 to 0.36 ms each. The much larger number underneath it
-is that a submit arriving at an *idle* GPU costs ~12ms, because the kick has
-to wait for `CS_ACTIVE` to clear, and that is wake-up latency no submit-path
-change removes — `driver_compute_probe --fill --loop=300` is unchanged at
-~22ms per submit. An application that waits for a fence between every submit
-pays that every time; one that keeps work in flight never pays it.
+**Submission no longer kicks unconditionally**, and as of 2026-08-02 it no
+longer waits either. A CS that is still executing re-reads `CS_INSERT` on
+its own, so work appended to a busy queue runs with no kick at all; only a
+queue that has caught up needs one.
 
-Two things fell out of measuring this, both in `docs/kbase-notes.md`:
-`CS_EXTRACT` is a completion signal on this device rather than a progress
-one, so ring occupancy is only knowable at stream granularity; and removing
-the pre-kick wait entirely still breaks the driver — reproducibly losing the
-compute subqueue's stream — even though a standalone probe cannot reproduce
-the rule that wait is built on. That disagreement is unexplained and is the
-open question in this area.
+The paragraph that used to sit here said a submit arriving at an idle GPU
+costs ~12ms because the kick must wait for `CS_ACTIVE` to clear, and called
+that "wake-up latency no submit-path change removes". **That was wrong.** A
+submit-path change removed it. The wait was never necessary: when
+`CS_ACTIVE` is set the right move is not to wait for it to clear and then
+kick, but *not to kick at all* — the still-resident CS picks up the
+published `CS_INSERT` by itself. So the CS stops needing a kick well before
+it stops reporting active, and the wait was paying 30-40ms for an
+irrelevant state transition. `PANVK_KBASE_KICK_MODE=defer` is now the
+default; `auto` restores the old behaviour without a rebuild.
+
+Measured by `tests/driver_present_loop_probe` (1280x720, 120 frames):
+frame time 27.97ms -> 15.33ms median, of which the submit itself went
+26.54ms -> 0.19ms; 41.5 -> 64.4 fps. On a different workload, 200
+fence-waited compute submits went 4769ms -> 3063ms. All nine render probes
+still pass pixel-exact, which is the check that matters — a lost stream
+would report *better* numbers.
+
+Still true from the original measurement: `CS_EXTRACT` is a completion
+signal on this device rather than a progress one, so ring occupancy is only
+knowable at stream granularity. And `PANVK_KBASE_KICK_MODE=nowait` — kicking
+*while* active rather than deferring — still loses the stream, so the
+original observation was correct; only the conclusion drawn from it was not.
 
 **Compute works. Rendering works too, for command buffers that avoid
 `VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT` — this line was wrong until
