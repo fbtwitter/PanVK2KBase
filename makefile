@@ -394,6 +394,14 @@ fixed_va_probe: ./src/tests/fixed_va_probe/fixed_va_probe.c
 # Deliberately does NO GPU work at all - no queue group, no kick, no command
 # stream - which is why it needs no --i-know-it-hangs gate and is safe for
 # tools/run-probes.sh to run unattended. See the file header.
+# What can this kbase do with sync fds? Decides how ImportSemaphoreFdKHR /
+# GetSemaphoreFdKHR (SYNC_FD) have to be implemented for Android
+# acquire/release - specifically whether a real exportable fence is possible
+# or whether export must be the spec's -1 ("already signalled"). No GPU work,
+# so no --i-know-it-hangs gate.
+sync_fd_probe: ./src/tests/sync_fd_probe/sync_fd_probe.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -o ./build/sync_fd_probe $<
+
 dmabuf_import_probe: ./src/tests/dmabuf_import_probe/dmabuf_import_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(MALIFLAGS) -I./src/tests/dmabuf_import_probe -o ./build/dmabuf_import_probe $<
 

@@ -77,6 +77,7 @@ remap_probe            | raw    | remap_probe            | KBASE_VERSION=r49p1 |
 fixed_va_probe         | raw    | fixed_va_probe         | KBASE_VERSION=r49p1 |                            | 60
 alias_probe            | raw    | alias_probe            | KBASE_VERSION=r49p1 |                            | 60
 dmabuf_import_probe    | raw    | dmabuf_import_probe    | KBASE_VERSION=r49p1 | --source=heap              | 60
+sync_fd_probe          | raw    | sync_fd_probe          | KBASE_VERSION=r49p1 |                            | 60
 driver_load_probe      | driver | driver_load_probe      | NDK                 | @SO@                       | 30
 driver_enum_probe      | driver | driver_enum_probe      | NDK                 | @SO@                       | 60
 driver_extmem_probe    | driver | driver_extmem_probe    | NDK                 | @SO@                       | 60

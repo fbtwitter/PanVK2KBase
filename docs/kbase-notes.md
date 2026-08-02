@@ -3347,3 +3347,71 @@ runtime sites in particular are a strong upstream bug report.
    `KBASE_IOCTL_STREAM_CREATE` is a fence-stream ioctl the vendor blob calls.
 4. **Loading the ICD** without root, for which no Mali equivalent of
    `libadrenotools` exists.
+
+## Sync fds on kbase: import is free, export must be the spec's -1
+
+The last driver-side blocker for Android presentation, settled by
+`tests/sync_fd_probe` rather than by reading kernel source and hoping.
+
+**What the runtime actually requires** (read out of Mesa's
+`vk_android.c`, not assumed):
+
+- `vk_common_AcquireImageANDROID` calls `ImportSemaphoreFdKHR` /
+  `ImportFenceFdKHR` with `SYNC_FD`, and **only** when the application
+  passed a semaphore or fence handle. `fd == -1` is legal and means "already
+  signalled".
+- `vk_common_QueueSignalReleaseImageANDROID` returns `-1` outright when
+  `waitSemaphoreCount == 0`. Otherwise it submits, then calls
+  `GetSemaphoreFdKHR` with `SYNC_FD`.
+
+**The import half needs nothing from kbase.** A `sync_file` is pollable, so
+"wait for this fd" is `poll()`. This driver already satisfies waits on the
+CPU (see `panvk_kbase_sync.c`), so it fits the existing model exactly rather
+than requiring a new one.
+
+**The export half is the real question, and the answer is measured:**
+
+```
+STREAM_CREATE=ok                 -> fd 4
+STREAM_IS_SW_SYNC=no             -> SW_SYNC_IOC_CREATE_FENCE gives ENOTTY
+FENCE_FROM_STREAM=failed
+FENCE_VALIDATE_EVENTFD=rejected  -> it is a real type check
+EXPORT_STRATEGY=return_minus_one
+```
+
+`KBASE_IOCTL_STREAM_CREATE` succeeds and hands back what its own header calls
+a timeline — but it is **not** a userspace-drivable sw_sync timeline. In
+kbase that stream is consumed internally by job atoms
+(`BASE_JD_REQ_SOFT_FENCE_TRIGGER`), a JM-era mechanism with no CSF
+equivalent: there is no ioctl that says "signal this fence now". So
+userspace cannot manufacture a fence that signals on GPU completion.
+
+That leaves the option the Vulkan spec explicitly provides: exporting
+`SYNC_FD` may return **-1**, meaning the payload is already signalled. It is
+legal, and it is honest **provided the driver actually waits before
+returning it** — which this one can, since it already CPU-waits everywhere
+else.
+
+The cost is real and worth stating plainly: a present would block the
+calling thread until the GPU finishes, instead of handing the compositor a
+fence to wait on itself. Combined with the ~12 ms idle-GPU kick cost already
+measured, that is a per-frame tax. It is correct, not fast, and it is the
+honest option while kbase exposes no way to do better.
+
+**`FENCE_VALIDATE` is worth keeping in mind for the implementation**: it
+rejected both an eventfd and the stream fd itself, so it is a genuine "is
+this really a fence?" check rather than a rubber stamp, and can be used to
+refuse a bogus import rather than failing later and further away.
+
+### The shape the implementation should take
+
+- `panvk_kbase_sync.c` gains `import_sync_file` / `export_sync_file` on its
+  `vk_sync_type`. The runtime keys off those pointers being non-NULL; there
+  is no feature bit to add.
+- `import_sync_file`: `fd == -1` means already-signalled. Otherwise validate
+  with `KBASE_IOCTL_FENCE_VALIDATE`, keep the fd, and have the sync's wait
+  path `poll()` it. Ownership transfers to the driver on success.
+- `export_sync_file`: wait for the slot to reach its value, then return -1.
+- A patch script must advertise `SYNC_FD` in
+  `vkGetPhysicalDeviceExternalSemaphoreProperties` and the fence equivalent,
+  or the runtime will not use any of it.
