@@ -3834,7 +3834,7 @@ Fail (Color value mismatch! Ref:(0.1, 0.5, 0.3, 0.9) Mask:(1,1,1,1)
       Threshold:(0.0039,...) Color:(0, 0, 0, 0))
 ```
 
-It is **not** confined to any axis that would suggest a narrow edge case:
+The spread by axis, which is where the first reading of this went wrong:
 
 ```
 1d.linear 20   1d.optimal 18
@@ -3845,6 +3845,50 @@ single_layer 45  multiple_layers 21  remaining_array_layers 25
                                      remaining_array_layers_twostep 12
 ```
 
+**CORRECTION — the first version of this section said the failures were
+"not confined to any axis" and that `r8g8b8a8_unorm` failing proved it was
+"not an exotic-format problem". Both claims were wrong**, and the counts
+above are what misled: every cell being non-zero is not the same as the
+failures being uniform.
+
+Running individual cases shows the plainest configuration **passes**:
+
+```
+2d.optimal.single_layer.r8g8b8a8_unorm   -> Pass (cmdClearColorImage passed)
+```
+
+The `r8g8b8a8_unorm` failure that prompted the "not exotic" claim was
+`1d.linear.remaining_array_layers.r8g8b8a8_unorm` — 1D, linear-tiled, with
+array layers. Not a plain case at all; the format was the only ordinary
+thing about it.
+
+Listing the failing `single_layer` cases shows what they actually have in
+common — they are `1d.*`, `2d.linear.*`, or `2d.optimal` with a less common
+format:
+
+```
+1d.linear.single_layer.r64_uint
+1d.optimal.single_layer.a1r5g5b5_unorm_pack16
+1d.optimal.single_layer.r16_sfloat
+1d.optimal.single_layer.r32g32b32_sfloat
+1d.optimal.single_layer.r8_snorm
+1d.optimal.single_layer.r8g8b8_srgb
+2d.linear.single_layer.a8b8g8r8_uint_pack32_200x180
+2d.linear.single_layer.r8g8b8a8_snorm_200x180
+2d.optimal.single_layer.r32_uint
+```
+
+So the live hypothesis is **1D images, linear tiling, and less-common
+formats** — three plausible axes — rather than "the entry point is broken".
+That is a materially different bug and a materially lower priority: the
+configuration an application is most likely to use works.
+
+**Not yet confirmed**, because the isolation runs that would separate the
+three axes have not been done. Until they are, treat the axis list as the
+next experiment rather than as the finding. What *is* established: 103 of
+272 sampled cases fail, the failures are real (readback is black), and the
+common case is not among them.
+
 **Why no probe caught this.** Every render probe in `src/tests/` clears via
 `VK_ATTACHMENT_LOAD_OP_CLEAR` — a render-pass clear, which works and is
 pixel-exact. `vkCmdClearColorImage` is a different entry point: a standalone
@@ -3853,14 +3897,27 @@ code path was unverified while the probes all passed. That is the case for
 running CTS rather than trusting a hand-written suite, and it is worth
 remembering the next time coverage looks complete.
 
-`r8g8b8a8_unorm` failing matters: that is the most ordinary format there is,
-so this is not an exotic-format problem. Anything that clears an image
-outside a render pass — which includes plenty of real application and
-emulator code — gets black.
-
 Not yet root-caused. It is squarely in the area the recently-rewritten
 `pan_fb` framebuffer abstraction and AFBC-by-default both touch, which makes
-`PANVK_DEBUG=noafbc` the obvious first experiment.
+`PANVK_DEBUG=noafbc` an obvious experiment — though the corrected axis
+analysis above (1D / linear / uncommon formats) points more at format and
+layout handling than at compression.
+
+**On Arm's guidance that this entry point should be avoided.** Arm's
+"picking the most efficient load/store operations" advises against
+`vkCmdClearColorImage` on Mali because a tiler clears for free via
+`VK_ATTACHMENT_LOAD_OP_CLEAR`, whereas an explicit clear forces a
+full-surface write to external memory. That is about *bandwidth*, and it is
+correct, but it does not bear on this finding: a slow path still has to
+produce the right pixels, and `vkCmdClearColorImage` is core Vulkan 1.0
+rather than optional, which is why CTS tests it.
+
+Where the guidance does apply is priority and blame-assignment. It plausibly
+explains why this went unnoticed — if applications follow it, the path sees
+little traffic — and it explains why no probe here caught it, since every
+render probe in `src/tests/` clears via `LOAD_OP_CLEAR`. Combined with the
+correction above (the common configuration passes), the realistic impact is
+smaller than 103 failures suggests. It is still a conformance defect.
 
 ### `query_pool` — see below
 
