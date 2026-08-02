@@ -3600,3 +3600,80 @@ needs an APK, which is the same gap that blocks the swapchain work.
 
 Both patches are written and committed on branches in the local clone.
 **Deliberately not proposed upstream yet** — the priority is this repo.
+
+## What a frame actually costs — and it is not the sync-fd design
+
+`tests/driver_present_loop_probe` reproduces the driver-visible sequence of a
+present loop — `vkImportSemaphoreFdKHR(SYNC_FD, -1)` for acquire, a real
+render pass, then `vkGetSemaphoreFdKHR(SYNC_FD)` for release — and times each
+phase. It cannot call `vkAcquireImageANDROID`/`vkQueueSignalReleaseImageANDROID`
+(those need a swapchain, which needs an app), but it performs exactly what
+those two do, so the numbers are the driver's cost rather than a swapchain's.
+
+**1280x720, 3 images, 120 frames, trivial GPU work (clear + one triangle):**
+
+```
+                 min      med      p95      max     mean
+frame total      3.15    27.97    35.75    38.33    24.09
+  acquire        0.00     0.01     0.01     0.05     0.01
+  record+submit  2.11    26.54    32.30    34.41    21.75
+  release export 0.97     1.87     4.55     5.02     2.33
+
+120 frames in 2890.9 ms -> 24.09 ms/frame, 41.5 fps
+```
+
+**This refutes the prediction that had been driving the roadmap.** The
+expectation — written down in several places — was that the CPU-blocking
+`vkGetSemaphoreFdKHR` would dominate, because kbase cannot produce a real
+fence and the compositor therefore cannot wait on our behalf. It does not.
+Release costs **~2 ms**. The dominant cost is `record+submit` at ~22 ms, and
+`acquire` is free.
+
+**Where the 22 ms actually goes.** Running the same loop with
+`--mode=pipelined`, which drops only the blocking release and never waits:
+
+```
+frame total  min 0.02  med 0.03  p95 0.04  max 4.89  mean 0.08   (0.08 ms/frame)
+```
+
+So the CPU-side cost of building and submitting a frame is **0.08 ms**.
+Essentially all of the 22 ms is the submit *waiting*, not working — it is
+`pan_kmod_kbase_queue_wait_idle()` blocking for `CS_ACTIVE` to clear from the
+previous frame, which is documented to linger 30-40 ms after a stream ends.
+
+That gives the real causal chain, which is one step removed from where the
+cost appears:
+
+> blocking release each frame → GPU goes idle → the *next* frame's submit
+> must kick → the kick must first wait for `CS_ACTIVE` → ~22 ms.
+
+The release is what *causes* the cost but not where it is *paid*, which is
+why measuring only the export made it look cheap and innocent.
+
+**`PANVK_KBASE_KICK_MODE=nowait` is not a way out.** Dropping the pre-kick
+wait made the loop stop making progress entirely — 60 frames did not finish
+inside a 180 s timeout, where the same loop takes ~1.4 s otherwise. That
+matches the previously recorded and still-unexplained finding that removing
+the wait "reproducibly loses the compute subqueue's stream". Device confirmed
+healthy afterwards (no D-state process, `driver_compute_probe --submit
+--fill` clean), so this is a lost stream rather than a wedge.
+
+### What this means
+
+- **~41 fps of pure driver overhead at 720p with a triangle.** Fits a 30 fps
+  budget; does not fit 60. Real application work adds on top, so an emulator
+  targeting 60 fps has no headroom and one targeting 30 has little.
+- **The sync-fd design is not the problem** and does not need revisiting.
+  Returning -1 from the export costs ~2 ms.
+- **The bottleneck is the pre-kick idle wait**, which this repo already knew
+  was "correct-but-slow" and already flagged as its open question. This
+  measurement upgrades it from a known inefficiency to *the* thing standing
+  between this driver and being usable, and gives it a number.
+- The distribution is bimodal (min 3.15 vs med 27.97), which is what a
+  per-frame wake-up cost looks like and why the percentiles are reported
+  rather than a mean.
+
+The next question is therefore the old one, now worth real effort: why does a
+kick need the CS to be idle first, and what is actually being lost when it
+does not? That is the difference between ~41 fps and something far higher —
+the pipelined number says the ceiling is not the driver's CPU work.

@@ -150,6 +150,14 @@ driver_dmabuf_probe: ./src/tests/driver_dmabuf_probe/driver_dmabuf_probe.c
 driver_android_wsi_probe: ./src/tests/driver_android_wsi_probe/driver_android_wsi_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_android_wsi_probe $< -landroid
 
+# What would a frame actually cost? Reproduces the driver-visible sequence
+# of a present loop - import a sync fd (acquire), render, export a sync fd
+# (release, which CPU-blocks on this driver) - and reports per-frame time
+# with a phase breakdown. --mode=pipelined drops only the blocking release,
+# to isolate what it costs. Reuses render_vbo_probe's shaders.
+driver_present_loop_probe: ./src/tests/driver_present_loop_probe/driver_present_loop_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_vbo_probe -o ./build/driver_present_loop_probe $<
+
 # Loads the driver the way an emulator would - through a purpose-built
 # linker namespace (android_create_namespace + android_dlopen_ext), which is
 # the core of what libadrenotools does. Tests whether that mechanism is

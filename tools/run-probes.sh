@@ -106,6 +106,7 @@ user_io_probe          | manual | user_io_probe          | KBASE_VERSION=r49p1 |
 event_slot_probe       | manual | event_slot_probe       | KBASE_VERSION=r49p1 |                            | 120
 kick_pipeline_probe    | manual | kick_pipeline_probe    | KBASE_VERSION=r49p1 |                            | 120
 render_secondary_warmup_probe | manual | render_secondary_warmup_probe | NDK | @SO@ --i-know-it-hangs | 180
+driver_present_loop_probe | manual | driver_present_loop_probe | NDK       | @SO@ --i-know-it-hangs     | 300
 # ---------------------------------------------------------------------------
 # NEVER RUN. Not "not yet" - never. Not by this script, not by --only, and
 # there is no flag that overrides it.
