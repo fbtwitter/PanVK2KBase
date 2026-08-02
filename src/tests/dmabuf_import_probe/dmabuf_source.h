@@ -49,13 +49,24 @@ typedef struct dmabuf_native_handle {
   int data[0];
 } dmabuf_native_handle_t;
 
+#define DMABUF_MAX_HANDLE_FDS 8
+
 struct dmabuf_src {
-  int fd;          /* the dma-buf fd, or -1 */
+  int fd;          /* the fd we recommend importing, or -1 */
   size_t size;     /* what we asked for */
   const char *how; /* human-readable provenance */
   char err[192];   /* why fd == -1, if it is */
   void *ahb;       /* AHardwareBuffer* to release, or NULL */
   void *dso;       /* libnativewindow handle, or NULL */
+
+  /* Every fd the native_handle carried, not just data[0]. panvk_android.c
+   * assumes data[0] is the dma-buf, which is the usual layout but is a
+   * vendor-dependent convention rather than a guarantee - so when data[0]
+   * turns out not to be importable, the useful next question is "is any of
+   * them?", and answering it needs the whole list.
+   */
+  int handle_fds[DMABUF_MAX_HANDLE_FDS];
+  int n_handle_fds;
 };
 
 /* --------------------------------------------------------------- dma-heap */
@@ -164,7 +175,27 @@ static int dmabuf_from_ahb(struct dmabuf_src *s, size_t len) {
     return -1;
   }
 
-  /* data[0] is the dma-buf fd - the same index panvk_android.c reads. */
+  /* Dump the whole handle. panvk_android.c reads data[0] and calls it the
+   * dma-buf; that is the common layout, not a guarantee, and on this device
+   * data[0] does not behave like one. Printing version/numFds/numInts and
+   * probing each fd is what turns "the AHB path fails" into something
+   * actionable.
+   */
+  printf("  native_handle: version=%d numFds=%d numInts=%d\n", h->version,
+         h->numFds, h->numInts);
+  s->n_handle_fds = h->numFds < DMABUF_MAX_HANDLE_FDS ? h->numFds
+                                                      : DMABUF_MAX_HANDLE_FDS;
+  for (int i = 0; i < s->n_handle_fds; i++) {
+    s->handle_fds[i] = h->data[i];
+    off_t sz = lseek(h->data[i], 0, SEEK_END);
+    printf("    data[%d] = fd %d, lseek(SEEK_END) = %lld%s\n", i, h->data[i],
+           (long long)sz,
+           sz < 0 ? "  (not a plain dma-buf: dma_buf_llseek would work)" : "");
+  }
+  for (int i = 0; i < h->numInts && i < 8; i++)
+    printf("    int[%d] = %d (0x%x)\n", i, h->data[h->numFds + i],
+           h->data[h->numFds + i]);
+
   s->fd = h->data[0];
   s->size = len;
   s->how = "AHardwareBuffer(BLOB)";

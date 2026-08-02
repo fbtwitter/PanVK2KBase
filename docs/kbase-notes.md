@@ -3168,33 +3168,45 @@ the driver-level probe, not this one.
 crashes tells you less than one that says "this mapping is not accessible,
 here is everything else I learned.")
 
-**Caveat 2, and the one that actually matters for presentation: the
-AHardwareBuffer path does NOT work, and it fails below kbase.**
-`AHardwareBuffer_allocate` itself succeeds from the unprivileged `shell`
-user — so binder access to the graphics allocator is not the problem — but
-the fd at `handle->data[0]`, which is exactly what `panvk_android.c` hands
-to `vkAllocateMemory`, does not behave like a usable dma-buf on this device:
+**Caveat 2 — a real gralloc buffer imports fine, but NOT through the fd
+`panvk_android.c` reads.** This one nearly went into the repo as "the
+AHardwareBuffer path does not work", which was wrong, and the thing that
+caught it was dumping the whole `native_handle` instead of trusting the
+first fd.
+
+`AHardwareBuffer_allocate` succeeds from the unprivileged `shell` user, so
+binder access to the graphics allocator is not a problem. MediaTek's handle
+for a 4 KiB `BLOB` carries **three** fds:
 
 ```
-got dma-buf fd=7 via AHardwareBuffer(BLOB)
-lseek(SEEK_END) = -1
-mmap(dma-buf) failed: Permission denied
-MEM_IMPORT [all three combos] -> FAILED: Out of memory
+native_handle: version=12 numFds=3 numInts=62
+  data[0] = fd 7, lseek(SEEK_END) = -1     <- NOT a dma-buf
+  data[1] = fd 8, lseek(SEEK_END) = 4096   <- the actual buffer
+  data[2] = fd 9, lseek(SEEK_END) = 6480   <- metadata, presumably
 ```
 
-`lseek` failing and `mmap` returning `EACCES` both say this fd is not a
-plain, mappable dma-buf — either `data[0]` is not the dma-buf on this
-vendor's `native_handle` layout, or it is one from a restricted heap. The
-`ENOMEM` from kbase is downstream of that, not an independent kbase
-limitation.
+`panvk_android.c` does `int dma_buf_fd = handle->data[0];`. On this device
+`data[0]` fails `lseek`, gives `EACCES` on `mmap`, and is refused `ENOMEM`
+by every import combination — because it is not the dma-buf. **`data[1]`
+imports on the first try**, and everything else about it is identical to the
+dma-heap case: `NEED_MMAP` cookie, resolves via `mmap`, outside the FIXED_VA
+zone, `FIXED` still works afterwards, `munmap`-only free.
 
-**So the honest summary is narrower than "dma-buf import works":** kbase can
-import a dma-heap buffer, which is a real and previously-unanswered result
-and is the mechanism the Mesa-side work needs. Whether it can import a
-*gralloc* buffer — the only kind Android WSI will ever hand it — is still
-open, and the obstacle is at the gralloc/handle layer. Anyone picking up
-presentation should settle that **first**, because it is upstream of every
-other presentation blocker and it is cheap to test with this probe.
+```
+IMPORT_RESULT=ok   IMPORTED_HANDLE_FD_INDEX=1
+VERDICT=IMPORT_WORKS
+```
+
+So the result for presentation is the good one: **kbase can import the exact
+buffers Android WSI will hand it.** The `data[0]` convention is common but
+is not a guarantee, and it does not hold here — a Mesa-side implementation
+has to find the dma-buf in the handle rather than assume index 0. That is
+worth knowing before writing the import path, and it is the kind of thing
+that would otherwise present as an unexplained `ENOMEM` deep inside
+`vkAllocateMemory`.
+
+Note `lseek` on the gralloc fd is not a reliable size either — use
+`out.va_pages * 4096` from the import, as the probe does.
 
 `/dev/ion` does not exist on this device (dma-heaps only), and `/dev/ashmem`
 is 0666 but ashmem is not a dma-buf, so `dma_buf_get()` rejects it — neither

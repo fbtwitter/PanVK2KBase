@@ -164,6 +164,7 @@ static char sum_free_model[64] = "unknown";
 static const char *sum_verdict = "IMPORT_UNAVAILABLE";
 static const char *sum_import_flag_combo = "base";
 static const char *sum_kbase_cpu_map = "not_attempted";
+static int sum_imported_fd_index = -1;
 
 /* A cookie is not a heuristic here: the header defines the range exactly.
  * BASE_MEM_COOKIE_BASE = 64<<12 = 0x40000, and cookies run up to
@@ -339,13 +340,30 @@ int main(int argc, char **argv) {
       {"base|SYNC_ON_MAP_UNMAP", BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP},
   };
 
+  /* Try every fd the handle carried, not only the one we were handed. For
+   * the heap source that is a one-element list; for AHardwareBuffer it is
+   * the difference between "the AHB path fails" and "data[0] is not the
+   * dma-buf on this vendor's handle layout, but data[N] is".
+   */
+  int try_fds[DMABUF_MAX_HANDLE_FDS];
+  int n_try = 0;
+  if (src.n_handle_fds > 0) {
+    for (int i = 0; i < src.n_handle_fds; i++)
+      try_fds[n_try++] = src.handle_fds[i];
+  } else {
+    try_fds[n_try++] = src.fd;
+  }
+
   union kbase_ioctl_mem_import imp;
   bool imported = false;
   const size_t ncombo = sizeof(combos) / sizeof(combos[0]);
-  for (size_t i = 0; i < ncombo; i++) {
+  for (int fi = 0; fi < n_try && !imported; fi++) {
+   if (n_try > 1)
+     printf("  -- trying handle fd[%d] = %d --\n", fi, try_fds[fi]);
+   for (size_t i = 0; i < ncombo; i++) {
     if (force_combo >= 0 && (size_t)force_combo != i)
       continue;
-    int pass_fd = src.fd;
+    int pass_fd = try_fds[fi];
     memset(&imp, 0, sizeof(imp));
     imp.in.flags = base_flags | combos[i].extra;
     imp.in.phandle = (uint64_t)(uintptr_t)&pass_fd;
@@ -354,12 +372,14 @@ int main(int argc, char **argv) {
     if (ioctl(fd, KBASE_IOCTL_MEM_IMPORT, &imp) == 0) {
       printf("  MEM_IMPORT [%s] -> OK\n", combos[i].name);
       sum_import_flag_combo = combos[i].name;
+      sum_imported_fd_index = fi;
       imported = true;
       break;
     }
     printf("  MEM_IMPORT [%s] -> FAILED: %s\n", combos[i].name,
            strerror(errno));
     sum_import_errno = errno;
+   }
   }
 
   check(imported, "KBASE_IOCTL_MEM_IMPORT accepted a dma-buf fd");
@@ -607,6 +627,7 @@ summary:
   printf("IMPORT_RESULT=%s\n", sum_import_result);
   printf("IMPORT_ERRNO=%d\n", sum_import_errno);
   printf("IMPORT_FLAG_COMBO=%s\n", sum_import_flag_combo);
+  printf("IMPORTED_HANDLE_FD_INDEX=%d\n", sum_imported_fd_index);
   printf("OUT_FLAGS=0x%llx\n", sum_out_flags);
   printf("OUT_FLAGS_DECODED=%s\n", sum_flags_decoded);
   printf("NEED_MMAP=%s\n", sum_need_mmap);
