@@ -544,6 +544,33 @@ enum kbase_kick_mode {
    KBASE_KICK_AUTO,
    KBASE_KICK_ALWAYS,
    KBASE_KICK_NOWAIT,
+   /* "defer" - THE DEFAULT. When CS_ACTIVE is set, neither wait nor kick:
+    * leave the published CS_INSERT for the still-resident CS to pick up,
+    * exactly as the extract < old_insert case already does.
+    *
+    * This was the third option the other two modes skipped past. AUTO waits
+    * for CS_ACTIVE to clear so the kick lands immediately; NOWAIT kicks
+    * while active and loses the stream. Neither tried *not kicking* while
+    * active - and that turns out to be the right answer, which settles a
+    * question this repo had open for a long time: during the 30-40ms
+    * CS_ACTIVE lingers after a stream completes, the CS IS still re-reading
+    * CS_INSERT. It had stopped needing a kick well before it stopped
+    * reporting active, so the wait was paying for a state change that was
+    * irrelevant to whether the work would run.
+    *
+    * Measured (tests/driver_present_loop_probe, 1280x720, 120 frames):
+    *
+    *              AUTO      DEFER
+    *   frame      27.97ms   15.33ms   (median)
+    *   submit     26.54ms    0.19ms   (median)  <- the wait, gone
+    *   fps         41.5      64.4
+    *
+    * and 200 fence-waited compute submits went 4769ms -> 3063ms. All nine
+    * render probes still pass pixel-exact under it, which is the check that
+    * matters: a lost stream would show as wrong pixels or a timeout, not as
+    * a faster wrong answer.
+    */
+   KBASE_KICK_DEFER,
 };
 
 static enum kbase_kick_mode
@@ -558,8 +585,15 @@ kbase_kick_mode(void)
          mode = KBASE_KICK_ALWAYS;
       else if (v && !strcmp(v, "nowait"))
          mode = KBASE_KICK_NOWAIT;
-      else
+      else if (v && !strcmp(v, "auto"))
          mode = KBASE_KICK_AUTO;
+      else
+         /* DEFER is the default. It was measured to be both faster and no
+          * less correct than AUTO; "auto" remains selectable to get the old
+          * wait-before-kick behaviour back without a rebuild, which is what
+          * a regression in this area would need first.
+          */
+         mode = KBASE_KICK_DEFER;
    }
 
    return mode;
@@ -679,6 +713,13 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
     * Waiting here rather than inside the kick keeps the backend a thin
     * mirror of the hardware and puts the policy where the submit is.
     *
+    * SUPERSEDED BY DEFAULT: the wait below only runs under
+    * PANVK_KBASE_KICK_MODE=auto now. The default (DEFER) does not kick at
+    * all while CS_ACTIVE is set, because a still-active CS was measured to
+    * still be re-reading CS_INSERT - so there is nothing to wait for. See
+    * the KBASE_KICK_DEFER comment for the numbers. The text below describes
+    * the old default and is kept because it is still what "auto" does.
+    *
     * 100ms: CS_ACTIVE was measured to clear ~30-40ms after a stream ends.
     * Timing out is not fatal - kick anyway and let the caller's own wait
     * report a stuck queue, which produces a better error than failing here
@@ -727,16 +768,25 @@ submit_stream(struct panvk_device *dev, struct panvk_kbase_queue *queue,
    pan_kmod_kbase_queue_publish_insert(cs, old_insert + size);
 
    const uint64_t extract = pan_kmod_kbase_queue_extract(cs);
-   const bool needs_kick =
+   bool needs_kick =
       kbase_kick_mode() == KBASE_KICK_ALWAYS || extract >= old_insert;
 
    uint64_t wait_start = os_time_get_nano();
+
+   /* KBASE_KICK_DEFER: if the CS is still active, treat it the same way as
+    * extract < old_insert - publish and leave it alone. Costs nothing, where
+    * the AUTO path pays a ~22ms wait per frame in a present loop.
+    */
+   if (needs_kick && kbase_kick_mode() == KBASE_KICK_DEFER &&
+       pan_kmod_kbase_queue_active(cs))
+      needs_kick = false;
 
    if (needs_kick) {
       /* Only now is the idle wait worth paying for, and only on the CS being
        * restarted. Under sustained load this branch is not taken at all.
        */
       if (kbase_kick_mode() != KBASE_KICK_NOWAIT &&
+          kbase_kick_mode() != KBASE_KICK_DEFER &&
           !pan_kmod_kbase_queue_wait_idle(cs, 100)) {
          mesa_logw("kbase: subqueue %u still active before kick; "
                    "the submit may not take effect", subqueue);

@@ -3677,3 +3677,70 @@ The next question is therefore the old one, now worth real effort: why does a
 kick need the CS to be idle first, and what is actually being lost when it
 does not? That is the difference between ~41 fps and something far higher —
 the pipelined number says the ceiling is not the driver's CPU work.
+
+## The pre-kick wait was never necessary — 41 fps to 64 fps
+
+The bottleneck the present-loop measurement identified, solved. It closes a
+question this repo had had open since the submit path was written: *why does
+a kick need the CS to be idle first?*
+
+**It does not.** The question contained a wrong assumption. Two behaviours
+had been measured and correctly recorded:
+
+- a CS that is still *executing* re-reads `CS_INSERT`, so work appended to it
+  runs with no kick at all;
+- a kick issued while `CS_ACTIVE` is set does not take effect, and dropping
+  the wait (`PANVK_KBASE_KICK_MODE=nowait`) loses the stream.
+
+Both are true, and together they look like "so you must wait for `CS_ACTIVE`
+to clear before kicking". That conclusion skips a third option nobody had
+tried: **when `CS_ACTIVE` is set, do not kick at all** — just publish
+`CS_INSERT` and let the still-resident CS pick it up, exactly as the
+`extract < old_insert` case already did.
+
+That works, and it means the CS **stops needing a kick well before it stops
+reporting active**. The wait was paying 30-40 ms for a state transition that
+was irrelevant to whether the work would run.
+
+`PANVK_KBASE_KICK_MODE=defer` implements it and is now **the default**;
+`auto` still selects the old wait-before-kick behaviour without a rebuild.
+
+**Measured** (`tests/driver_present_loop_probe`, 1280x720, 120 frames):
+
+```
+                     AUTO (old)   DEFER (new)
+  frame total (med)    27.97 ms     15.33 ms
+  record+submit (med)  26.54 ms      0.19 ms     <- the wait, gone
+  release export (med)  1.87 ms     14.78 ms     <- unchanged; now visible
+  throughput           41.5 fps     64.4 fps
+```
+
+and on a different workload, 200 fence-waited compute submits:
+**4769 ms -> 3063 ms** (~23.8 -> ~15.3 ms each).
+
+Note what happened to the breakdown rather than just the total. The release
+export did not get slower; it was always going to wait for the GPU to finish
+the frame. It only *looks* larger now because the 22 ms of submit-side
+waiting that used to sit in front of it is gone, so the GPU has less of a
+head start by the time the export asks. The remaining ~15 ms is real work
+plus real completion latency, not overhead.
+
+**Correctness is the part that matters here**, because a change that loses
+streams would show up as *better* numbers. All nine render probes pass
+pixel-exact under it (a lost stream shows as wrong pixels or a timeout, not
+as a faster wrong answer), plus the full driver tier, `--burst=100`, and 300
+fence-waited compute submits. Full suite: 30/30 with the new default.
+
+### What this changes about the outlook
+
+The earlier conclusion — "~41 fps of driver overhead, so 30fps has little
+headroom and 60fps none" — is superseded. At 64 fps the driver is no longer
+obviously the thing that makes an emulator unusable, and the remaining
+per-frame cost is dominated by honest GPU completion latency rather than by
+waiting for a state flag.
+
+The next lever, if one is wanted, is no longer the submit path: it is that
+`vkGetSemaphoreFdKHR` must block at all, which is a consequence of kbase
+being unable to produce a real fence. That is a genuine kernel limitation
+rather than a driver choice, and it is what a compositor would otherwise
+absorb.
