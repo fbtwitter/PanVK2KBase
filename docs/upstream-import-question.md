@@ -11,6 +11,35 @@ backend can never be reached — even though kbase itself can import dma-bufs
 perfectly well.
 
 Status: **drafted, not sent.** Scoped 2026-08-01 against Mesa 26.3.0-devel.
+
+> **Update 2026-08-02 — this is now implemented and measured, and one part of
+> the question below is wrong. Rewrite before sending.**
+>
+> `src/mesa/patch-pan-kmod-import-fd.py` adds the hook, `kbase_kmod_bo_import_fd()`
+> implements it, and `tests/driver_dmabuf_probe` proves the whole path on
+> hardware including with a real AHardwareBuffer. So this stops being "would
+> you accept this shape?" and becomes "here is the shape, it works, does it
+> suit you?" — a stronger ask.
+>
+> **The part to fix:** the three cache options below all assume you can look
+> a buffer up *before* importing it. You cannot. `drmPrimeFDToHandle()` is
+> idempotent — it maps an fd to a stable handle without creating anything —
+> which is precisely what makes the `handle_to_bo` dedup work. `MEM_IMPORT`
+> creates a new region on every call, so there is nothing to look up first.
+>
+> A backend-supplied key can therefore serve **insertion and teardown but not
+> lookup**. The shape that follows: keep the shared cache for storage and
+> teardown (not optional — `pan_kmod_bo_put()` unconditionally writes `NULL`
+> into `handle_to_bo[bo->handle]`, so a BO that was never inserted corrupts
+> whatever else occupies that slot), and leave dedup to the backend. Not
+> deduping is spec-legal: each `vkAllocateMemory` import is a distinct
+> `VkDeviceMemory`.
+>
+> **Worth adding as a second, separate report:** `panvk_android.c` does
+> `int dma_buf_fd = handle->data[0];`. On this MediaTek device the gralloc
+> `native_handle` carries three fds and `data[0]` is not the dma-buf —
+> `data[1]` is. That is shared PanVK code and looks like a genuine portability
+> bug, independent of kbase.
 A third, broader question also exists —
 `docs/upstream-project-status-question.md`, asking whether kbase support
 is wanted upstream at all — intended to be sent after both technical
