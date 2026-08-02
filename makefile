@@ -150,6 +150,14 @@ driver_dmabuf_probe: ./src/tests/driver_dmabuf_probe/driver_dmabuf_probe.c
 driver_android_wsi_probe: ./src/tests/driver_android_wsi_probe/driver_android_wsi_probe.c
 	$(CC) $(CFLAGS) -o ./build/driver_android_wsi_probe $< -landroid
 
+# Loads the driver the way an emulator would - through a purpose-built
+# linker namespace (android_create_namespace + android_dlopen_ext), which is
+# the core of what libadrenotools does. Tests whether that mechanism is
+# really Adreno-specific, given this driver NEEDs two non-public libraries
+# (libdrm.so, libhardware.so) that an ordinary app namespace cannot resolve.
+driver_namespace_probe: ./src/tests/driver_namespace_probe/driver_namespace_probe.c
+	$(CC) $(CFLAGS) -o ./build/driver_namespace_probe $<
+
 # Drives the kbase event-memory vk_sync through the real Vulkan API:
 # timeline semaphore signal/get/wait and binary fence status/reset. Proves
 # the sync type works, not merely that it registered.

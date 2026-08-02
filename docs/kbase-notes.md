@@ -3415,3 +3415,80 @@ refuse a bogus import rather than failing later and further away.
 - A patch script must advertise `SYNC_FD` in
   `vkGetPhysicalDeviceExternalSemaphoreProperties` and the fence equivalent,
   or the runtime will not use any of it.
+
+## Rootless driver loading works for Mali — libadrenotools' "no Mali" is about libadrenotools
+
+The last item on the presentation list, and the only one that is not driver
+work. On Android the Vulkan loader takes the system driver from
+`/vendor/lib64/hw/vulkan.<ro.hardware>.so`, which needs root to replace.
+Emulators get around that with **libadrenotools**, whose README says plainly
+that Mali is not supported — which this repo had recorded as a hard blocker,
+possibly the longest pole.
+
+That claim is about the library, not about the linker, and separating the
+two turns out to matter. libadrenotools does three things:
+
+1. loads a driver `.so` through a purpose-built linker namespace,
+2. redirects the Adreno blob's own file accesses,
+3. `bcenabler`, an Adreno texture-compression patch.
+
+Only (1) is needed by a Mesa driver. (2) and (3) are what make the library
+Adreno-specific, and Mesa needs neither. So the question reduces to whether
+(1) works here — a linker question with a testable answer.
+
+**Why a namespace is needed at all**, measured rather than assumed. The
+driver's `DT_NEEDED` set splits cleanly:
+
+| library | app-accessible? | present on device |
+|---|---|---|
+| `libdrm.so` | **no** — not in `public.libraries.txt` | `/system/lib64`, `/vendor/lib64` |
+| `libhardware.so` | **no** | `/system/lib64` |
+| `liblog`, `libnativewindow`, `libsync`, `libz`, `libm`, `libc`, `libdl` | yes | — |
+
+An ordinary app namespace resolves only public libraries, so a plain
+`dlopen()` from an app fails on the first two. Both exist on the device; the
+namespace is what makes them reachable.
+
+**It works.** `tests/driver_namespace_probe` builds the namespace itself and
+loads the driver through it:
+
+```
+NAMESPACE_API=found       (__loader_android_create_namespace)
+CREATE_NAMESPACE=ok
+LINK_NAMESPACES=ok
+DLOPEN_EXT=ok
+DRIVER_USABLE=ok          -> enumerated: Mali-G720 MC8 (apiVersion 1.4.354)
+```
+
+### The recipe, including the part that is not obvious
+
+1. Resolve `__loader_android_create_namespace` and
+   `__loader_android_link_namespaces` — **the unprefixed names do not
+   exist**; `dlsym` returns NULL for them. Bionic exports the private
+   `__loader_`-prefixed spellings, which is how libadrenotools reaches them.
+2. Create the namespace `SHARED | ISOLATED`, with a search path covering the
+   driver's own directory plus `/system/lib64` and `/vendor/lib64`.
+3. Link it against the default namespace for the public sonames **plus
+   `libvndksupport.so` and `libdl_android.so`**. This is the step that is
+   easy to get wrong and gives a confusing error: `libhardware` pulls in
+   `libvndksupport`, which needs `libdl_android.so` from
+   `/apex/com.android.runtime/lib64/bionic` — a path an isolated namespace
+   cannot reach, so it has to be linked in rather than found. Without it the
+   failure reads *"library libdl_android.so needed or dlopened by
+   /system/lib64/libvndksupport.so is not accessible"*, which points at a
+   library nothing in this project references.
+4. `android_dlopen_ext(..., ANDROID_DLEXT_USE_NAMESPACE)`.
+
+**Caveat worth stating:** a shell process is not an app. This is strong
+evidence, not proof, that the same works inside an emulator's process. What
+it does establish is that nothing about a Mali/Mesa driver resists the
+mechanism — which was the open question.
+
+`tools/package-driver.sh` produces the Adrenotools-convention zip
+(`meta.json` + the `.so`) that pickers already know how to consume.
+
+**So the ask to an emulator author is now small and specific** — not "add
+Mali support", but "when loading a non-Adreno driver, put `/system/lib64`
+and `/vendor/lib64` on the namespace search path and link `libvndksupport`
+and `libdl_android` from the default namespace". That is a much easier
+conversation than the one this repo thought it was going to have.
