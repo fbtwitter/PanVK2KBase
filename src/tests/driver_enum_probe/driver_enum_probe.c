@@ -23,8 +23,10 @@
 //
 // Usage: driver_enum_probe /data/local/tmp/libvulkan_panfrost.so
 #include <dlfcn.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <vulkan/vulkan.h>
@@ -157,6 +159,12 @@ int main(int argc, char **argv) {
    PFN_vkGetPhysicalDeviceProperties get_props =
       (PFN_vkGetPhysicalDeviceProperties)vk->GetInstanceProcAddr(
          inst, "vkGetPhysicalDeviceProperties");
+   PFN_vkEnumerateDeviceExtensionProperties enum_ext =
+      (PFN_vkEnumerateDeviceExtensionProperties)vk->GetInstanceProcAddr(
+         inst, "vkEnumerateDeviceExtensionProperties");
+   PFN_vkGetPhysicalDeviceFeatures2 get_features2 =
+      (PFN_vkGetPhysicalDeviceFeatures2)vk->GetInstanceProcAddr(
+         inst, "vkGetPhysicalDeviceFeatures2");
 
    if (!enum_pd) {
       printf("no vkEnumeratePhysicalDevices\n");
@@ -195,6 +203,53 @@ int main(int argc, char **argv) {
       printf("    vendorID      = 0x%04x  deviceID = 0x%08x\n", p.vendorID,
              p.deviceID);
       printf("    type          = %d\n", p.deviceType);
+
+      /* Eden's log claimed VK_EXT_vertex_attribute_divisor is missing on
+       * this device, which contradicts panvk_vX_physical_device.c setting
+       * it unconditionally true - check the driver's own answer directly
+       * rather than trust a third party's suitability check.
+       */
+      if (enum_ext) {
+         uint32_t ext_count = 0;
+         enum_ext(pds[i], NULL, &ext_count, NULL);
+         VkExtensionProperties *exts =
+            calloc(ext_count, sizeof(VkExtensionProperties));
+         enum_ext(pds[i], NULL, &ext_count, exts);
+         bool has_divisor_ext = false, has_khr_divisor_ext = false;
+         for (uint32_t e = 0; e < ext_count; e++) {
+            if (!strcmp(exts[e].extensionName, "VK_EXT_vertex_attribute_divisor"))
+               has_divisor_ext = true;
+            if (!strcmp(exts[e].extensionName, "VK_KHR_vertex_attribute_divisor"))
+               has_khr_divisor_ext = true;
+         }
+         printf("    device extension count = %u\n", ext_count);
+         printf("    VK_EXT_vertex_attribute_divisor present = %s\n",
+                has_divisor_ext ? "yes" : "NO");
+         printf("    VK_KHR_vertex_attribute_divisor present = %s\n",
+                has_khr_divisor_ext ? "yes" : "NO");
+         free(exts);
+      }
+
+      if (get_features2) {
+         VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR div_feat = {
+            .sType =
+               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+         };
+         VkPhysicalDeviceFeatures2 feat2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &div_feat,
+         };
+         get_features2(pds[i], &feat2);
+         printf("    fillModeNonSolid = %d, multiViewport = %d,\n"
+                "    shaderClipDistance = %d, shaderCullDistance = %d,\n"
+                "    vertexPipelineStoresAndAtomics = %d,\n"
+                "    vertexAttributeInstanceRateDivisor (KHR feature) = %d\n",
+                feat2.features.fillModeNonSolid, feat2.features.multiViewport,
+                feat2.features.shaderClipDistance,
+                feat2.features.shaderCullDistance,
+                feat2.features.vertexPipelineStoresAndAtomics,
+                div_feat.vertexAttributeInstanceRateDivisor);
+      }
    }
 
    printf("\n=> A physical device was created through the kbase path.\n"
