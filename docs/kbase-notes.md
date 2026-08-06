@@ -4045,3 +4045,161 @@ it alongside `trim_command_pool`.
 
 The headline is `vkCmdClearColorImage`. Everything else is either a known
 issue or a single case.
+
+## `VK_EXT_transform_feedback` scaffolding: real architecture, not yet functional
+
+Eden (a Switch emulator) logged `geometryShader`, `tessellationShader`, and
+`VK_EXT_transform_feedback` as missing against this repo's driver on the real
+Poco X8 Pro (Mali-G720). All three are genuine, hardcoded-off upstream PanVK
+gaps (`panvk_vX_physical_device.c`), already tracked in `ROADMAP.md`'s Phase 7
+list — not bugs in this port.
+
+**Full geometry-shader + tessellation-shader emulation is out of scope.** The
+only prior art for this on a tile-based GPU without dedicated geometry/
+tessellation hardware — Asahi's `hk` driver for Apple Silicon — needed a
+~5,800-line driver-agnostic NIR/compute library (`src/poly/`) plus ~5,900
+lines of driver glue, a GPU-heap sub-allocator usable from compute shaders
+across a command buffer's lifetime, and chained indirect-dispatch parameters
+computed by one compute kernel and consumed by the next. Even Apple's own
+second driver (`kk`) has only ported the tessellation half, not geometry
+shaders or XFB-via-GS. Multi-month, tens-of-thousands-of-line project. Not
+attempted.
+
+**`VK_EXT_transform_feedback`, restricted to no GS/tessellation in the
+pipeline, is real and scoped** — investigated and partially implemented as
+scaffolding (`src/mesa/patch-panvk-xfb-phase1.py`, `panvk_vX_cmd_xfb.c`).
+Three architectural unknowns were traced to ground truth before writing any
+of it:
+
+1. **Can PanVK's CSF draw path accept a "monolithic, late-only" VS via a
+   flag on `RUN_IDVS`/`RUN_IDVS2`?** No — and this corrected the plan's
+   original premise. Panfrost's own GL driver, the only prior art for a VS
+   with XFB output on this exact hardware/compiler stack, never runs such a
+   shader through `RUN_IDVS` at all. `bi_should_idvs()`
+   (`bifrost_nir.c:1148-1150`) returns false whenever the compiler's
+   `no_idvs` option is set, and GL compiles the VS **twice**: a normal
+   split-IDVS render variant with XFB stores stripped
+   (`pan_nir_remove_xfb`, `pan_shader.c:617`) that renders exactly as
+   before, and a second, monolithic `is_xfb = true` variant
+   (`pan_shader.c:607-612`) launched as a **plain compute job** —
+   `GENX(csf_launch_xfb)` (`gallium/drivers/panfrost/pan_csf.c:1365-1409`,
+   `cs_run_compute(b, 1, MALI_TASK_AXIS_Z, ...)`) — running alongside, not
+   instead of, the normal draw. This converges with PanVK's own closest
+   existing analog: `panvk_cmd_precomp.h`'s `dispatch_precomp()`, the same
+   "compute job dispatched alongside a draw, wired as a job-graph
+   dependency" pattern already used by `update_prims_generated_query()` and
+   indirect-draw index min/max search in `csf/panvk_vX_cmd_draw.c`. Revised
+   design: two VS variants, XFB variant dispatched as a compute job — zero
+   changes to the existing, working IDVS render path.
+2. **Is `nir->xfb_info` already populated before PanVK's compiler sees the
+   NIR?** Yes, unconditionally — `vk_spirv_to_nir()`
+   (`src/vulkan/runtime/vk_nir.c:212-215`) calls
+   `nir_shader_gather_xfb_info(nir)` for VS/TES/GS whenever SPIR-V XFB
+   decorations survive DCE, upstream of `panvk_compile_shader` ever running.
+   No PanVK-side gather call needed.
+3. **How does `nir_load_xfb_address` resolve to a real address?** Missing
+   in PanVK specifically, but small and mechanical to add — not evidence GL
+   XFB is broken. GL resolves it via a generic sysval-lowering pass
+   (`pan_nir_lower_sysvals.c:58-59`, `PAN_SYSVAL(XFB, ...)`) before the
+   shared Bifrost/Valhall backend ever sees the intrinsic. PanVK has its own
+   separate, analogous mechanism (`panvk_lower_sysvals()`,
+   `panvk_vX_shader.c`) that simply hadn't wired up this one case yet.
+
+A fourth question, checking whether `dispatch_precomp()` could fetch vertex
+attributes (needed for the XFB compute job to read the app's actual vertex
+data): **it can't today**, but the real gap is smaller than it first looked.
+`dispatch_precomp()`'s `data`/`data_size` mechanism already passes arbitrary
+device addresses/scalars into a kernel fine — every precomp dispatch just
+unconditionally zeroes `GLOBAL_ATTRIBUTE_OFFSET` and sets "no resource
+table" (`csf/panvk_vX_cmd_precomp.c:95-107`), so it never touches Mali's
+fixed-function hardware attribute-fetch unit. But `prepare_vs_driver_set()`
+(`csf/panvk_vX_cmd_draw.c:290-`) **already builds the exact attribute-table
+resource set** (`MALI_ATTRIBUTE` descriptors via `emit_vs_attrib` + vertex
+buffer descriptors) that becomes `vs_desc_state->res_table` — the value
+written into `VERTEX_SRT` for the real IDVS draw. Since the XFB compute
+variant reads the same vertex bindings as the render VS, **it can reuse
+`vs_desc_state->res_table` directly** as its own compute dispatch's resource
+table. No new attribute-descriptor-building code needed — just a
+`dispatch_precomp`-shaped function pointing its SRT register at that
+existing table instead of 0, mirroring `csf_launch_xfb`'s register setup
+(`GLOBAL_ATTRIBUTE_OFFSET = 0`, `JOB_SIZE_X/Y = vertexCount/instanceCount`,
+`WG_SIZE = 1×1×1`, workgroup merging enabled).
+
+**What's actually landed (compiles clean across v6/v7/v10/v12/v13/v14 on
+`/opt/mesa-src` @ `7296f9a`, and the patch script applies cleanly and
+idempotently against `third_party/MESA-KMOD` @ `43ec7c6b` too — verified
+byte-identical output despite the two trees being different commits):**
+command-buffer state (`xfb` block in `panvk_cmd_graphics_state`), the three
+`Cmd*TransformFeedbackEXT` entry points, the `xfb.num_vertices`/
+`xfb.buffer_addrs` sysvals and their `panvk_lower_sysvals()` cases, the
+**two-variant shader compile** (a second, monolithic VS variant —
+`no_idvs=true`, `nir_lower_xfb_to_stores` applied, cloned from the
+original NIR *before* the render-variant loop mutates it in place — see
+`panvk_shader.h`'s new `xfb_variant` field), and the **compute-dispatch
+function** (`panvk_per_arch(cmd_dispatch_xfb_capture)`,
+`csf/panvk_vX_cmd_xfb.c`) that launches it on `PANVK_SUBQUEUE_COMPUTE`,
+reusing `vs_desc_state->res_table` for hardware attribute fetch, wired
+into `CmdDraw` for non-indexed non-indirect draws.
+
+**Tested on the real Poco X8 Pro (Mali-G720) — found and fixed two real
+bugs, confirmed by evidence, not guessed:**
+
+1. **`bifrost_postprocess_nir()` (`bifrost_nir.c`) unconditionally requires
+   a non-NULL `pan_compile_inputs::varying_layout` for any
+   `MESA_SHADER_VERTEX` compile.** It has `assert(inputs->varying_layout)`
+   immediately followed by `memcpy(&info->varyings.formats,
+   inputs->varying_layout, sizeof(*inputs->varying_layout))` — the assert
+   compiles out under this build's `-DNDEBUG`, so passing `NULL` (the
+   original plan's assumption, since the XFB variant doesn't rasterize)
+   segfaults instead. Confirmed via a symbolized tombstone: `SIGSEGV`,
+   `null pointer dereference`, backtrace through
+   `panvk_compile_shaders → panvk_compile_shader → panvk_compile_nir →
+   bifrost_postprocess_nir`. Fixed by building a real (if functionally
+   unused) `pan_varying_layout` for the XFB variant too, via the same
+   `pan_varying_collect_formats`/`pan_build_varying_layout_compact` calls
+   the render variant uses.
+2. **Resource-table register slot mismatch.** The dispatch populated the
+   CSF "slot 1" registers (`PANVK_PRECOMP_SRT/FAU/SPD/TSD` =
+   `MALI_COMPUTE_SR_*_1`, the same registers `dispatch_precomp()` uses),
+   but launched with `cs_shader_res_sel(0, 0, 0, 0)` — slot 0 — copied
+   from `GENX(csf_launch_xfb)`'s example, which uses plain offset-0
+   registers (`csf_emit_shader_regs`'s convention), not the slot-1
+   convention. The hardware executed against uninitialized slot-0
+   registers. Fixed by using `PANVK_PRECOMP_RES_SEL` (slot 1),
+   consistent with the registers actually populated.
+
+Both fixes are compiled and copied into the tracked patch script
+(`src/mesa/patch-panvk-xfb-phase1.py`), verified byte-identical against
+the working `/opt/mesa-src` tree.
+
+**Still not a working feature.** After both fixes, `vkQueueSubmit`
+succeeds but `vkWaitForFences` returns `VK_ERROR_DEVICE_LOST` — a real
+GPU-level fault. Importantly, **this is a clean fault, not a hang**: ran
+`driver_compute_probe --fill` immediately after every single attempt
+across this whole debugging session, every time 0 failures, no wedged
+process, no reboot ever needed. The kbase backend and the device handled
+every one of these faulting submissions gracefully.
+
+Leading suspect for the remaining bug, not yet investigated: **PanVK's
+CSF backend has an explicit, deliberate cross-subqueue synchronization
+mechanism** — `struct panvk_cs_subqueue_context::syncobjs`, a
+per-subqueue array bumped/waited via `panvk_per_arch(cmd_signal_barrier)`
+(`csf/panvk_vX_cmd_dispatch.c`). Ordering between subqueues is never
+automatic; it must be explicitly requested. This dispatch runs on
+`PANVK_SUBQUEUE_COMPUTE` and depends on vertex-buffer bindings and
+render-target setup done for the draw on `PANVK_SUBQUEUE_VERTEX_TILER`,
+but establishes no synchronization relationship between the two at all —
+and a purely-graphics command buffer (no real `vkCmdDispatch` calls) may
+not even initialize the `COMPUTE` subqueue's context/TLS the way this
+dispatch assumes. Either of those could explain a clean GPU-level fault
+exactly like the one observed. This needs real investigation into how
+PanVK initializes and synchronizes subqueues within one command buffer —
+out of scope for this session; picking it up is the next concrete step.
+
+`.EXT_transform_feedback` stays `false` until this is found and fixed and
+`tests/render_xfb_probe` (written, builds, runs against real hardware,
+exercises exactly this path — bind an XFB buffer, draw a triangle,
+byte-compare captured output against the render's own geometry) passes
+end to end. Phase 1 scope is deliberately narrow regardless: non-indexed,
+non-indirect `vkCmdDraw` only, single buffer/stream, no counter-buffer
+resume, no `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT`.

@@ -233,6 +233,24 @@ render_vbo_probe_shaders:
 	  python3 ../../../tools/spv_to_header.py vbo_frag.spv \
 	    vbo_frag_spv.h render_vbo_probe_frag
 
+# VK_EXT_transform_feedback, phase 1: same triangle as render_vbo_probe, but
+# the vertex shader also writes its clip-space position to an XFB-captured
+# output. Verifies the two-variant shader compile + compute-dispatch
+# capture (csf/panvk_vX_cmd_xfb.c) actually runs and writes correct data.
+# Same --i-know-it-hangs gate - this is a brand new compute-dispatch code
+# path launched from inside a graphics command buffer.
+render_xfb_probe: ./src/tests/render_xfb_probe/render_xfb_probe.c
+	$(CC) $(CFLAGS) -I./src/tests/render_xfb_probe -o ./build/render_xfb_probe $<
+
+render_xfb_probe_shaders:
+	cd ./src/tests/render_xfb_probe && \
+	  glslangValidator -V xfb.vert -o xfb_vert.spv && \
+	  glslangValidator -V xfb.frag -o xfb_frag.spv && \
+	  python3 ../../../tools/spv_to_header.py xfb_vert.spv \
+	    xfb_vert_spv.h render_xfb_probe_vert && \
+	  python3 ../../../tools/spv_to_header.py xfb_frag.spv \
+	    xfb_frag_spv.h render_xfb_probe_frag
+
 # One variable changed from render_vbo_probe: the fragment colour comes
 # from a push constant instead of being hardcoded. Same --i-know-it-hangs
 # gate - push constants have not reached a graphics-stage fragment shader
@@ -518,9 +536,11 @@ mesa-backend-sync:
 	cp src/utils/csf_user_regs.h $(MESA_KMOD_DIR)/
 	cp src/mesa/panvk_kbase_sync.c src/mesa/panvk_kbase_sync.h $(MESA_DIR)/src/panfrost/vulkan/
 	cp src/mesa/panvk_vX_kbase_queue.c $(MESA_DIR)/src/panfrost/vulkan/csf/
+	cp src/mesa/panvk_vX_cmd_xfb.c $(MESA_DIR)/src/panfrost/vulkan/csf/
 	@echo ""
 	@echo "Copied pan_kmod_kbase.{c,h} and csf_user_regs.h into $(MESA_KMOD_DIR)/"
 	@echo "Copied panvk_kbase_sync.{c,h} into $(MESA_DIR)/src/panfrost/vulkan/"
+	@echo "Copied panvk_vX_cmd_xfb.c into $(MESA_DIR)/src/panfrost/vulkan/csf/"
 	@echo "Still to apply (kept as readable patches since upstream moves):"
 	@echo "  - src/mesa/pan_kmod.c.kbase.patch      -> $(MESA_KMOD_DIR)/pan_kmod.c"
 	@echo "  - src/mesa/meson.build.kbase.patch     -> $(MESA_KMOD_DIR)/meson.build"
@@ -533,6 +553,7 @@ mesa-backend-sync:
 	@echo "  - src/mesa/patch-panvk-kbase-external-memory.py <mesa-dir> (import/export capability)"
 	@echo "  - src/mesa/patch-panvk-android-gralloc-fd.py <mesa-dir> (gralloc handle dma-buf index, NOT kbase-specific)"
 	@echo "  - src/mesa/patch-panvk-null-device-destroy.py <mesa-dir> (null-handle vkDestroyDevice, not kbase-specific)"
+	@echo "  - src/mesa/patch-panvk-xfb-phase1.py <mesa-dir> (VK_EXT_transform_feedback scaffolding, not kbase-specific, not yet functional)"
 
 # Real libdrm, fetched via Mesa's own meson wrap (pan_kmod.h includes
 # <xf86drm.h>, and a shallow clone doesn't fetch subprojects). Falls back to

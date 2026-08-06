@@ -1633,6 +1633,49 @@ Tools worth knowing about before touching any of this:
       repo's target hardware (Mali-G720, v10-class clears every v9+/v10+
       gate seen in that ticket), they are simply not implemented upstream
       yet.
+      **`VK_EXT_transform_feedback` (no GS/tessellation) is real and scoped,
+      unlike `geometryShader`/`tessellationShader` above** — investigated,
+      implemented, and tested on real hardware (2026-08-06):
+      `src/mesa/patch-panvk-xfb-phase1.py` + `src/mesa/panvk_vX_cmd_xfb.c`.
+      Full writeup and architecture in `docs/kbase-notes.md`; short version:
+      a second, monolithic VS variant (`no_idvs=true`,
+      `nir_lower_xfb_to_stores` applied) gets compiled alongside the normal
+      render VS and launched as a plain compute job on
+      `PANVK_SUBQUEUE_COMPUTE`, reusing the render VS's
+      `vs_desc_state->res_table` for hardware attribute fetch — mirroring
+      Panfrost GL's `GENX(csf_launch_xfb)` as closely as PanVK's
+      multi-subqueue CSF architecture allows.
+      **Compiles clean** across v6/v7/v10/v12/v13/v14; the patch script
+      applies cleanly and idempotently to both `/opt/mesa-src` and
+      `third_party/MESA-KMOD` despite the two trees being different
+      commits (verified byte-identical output).
+      **Tested on the real Poco X8 Pro (Mali-G720) — found and fixed two
+      confirmed bugs**: (1) `bifrost_postprocess_nir()` unconditionally
+      requires a non-NULL `varying_layout` for any `MESA_SHADER_VERTEX`
+      compile (its `assert()` compiles out in release builds and it then
+      `memcpy()`s from NULL — a real tombstone, not a guess); (2) the
+      dispatch populated the CSF "slot 1" registers
+      (`MALI_COMPUTE_SR_*_1`) but launched with slot-0 resource selection
+      copied from GL's plain-offset example, so the hardware read
+      uninitialized registers. Both fixed. **Still not a working feature**:
+      after both fixes, the dispatch cleanly returns `VK_ERROR_DEVICE_LOST`
+      — a real GPU-level fault, but not a hang (confirmed via
+      `driver_compute_probe --fill` immediately after every single
+      attempt: 0 failures, no wedge, no reboot needed, every time).
+      Leading suspect for the remaining bug: PanVK's CSF backend has an
+      explicit, deliberate cross-subqueue sync mechanism
+      (`panvk_cs_subqueue_context::syncobjs`, one entry per subqueue) —
+      ordering between subqueues is never automatic, and this dispatch
+      establishes no such relationship between `PANVK_SUBQUEUE_COMPUTE`
+      (where it runs) and `PANVK_SUBQUEUE_VERTEX_TILER` (where the draw it
+      depends on runs); a purely-graphics command buffer may not even
+      initialize the COMPUTE subqueue's context. Not yet investigated
+      further. `.EXT_transform_feedback` stays `false` until this is found
+      and fixed and `tests/render_xfb_probe` (built, on-device, exercises
+      exactly this path) passes end to end. Full geometry-shader/
+      tessellation-shader emulation remains explicitly out of scope — see
+      `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior
+      art, ~11,000+ lines, multi-month even reused).
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is
