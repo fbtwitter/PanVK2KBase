@@ -1593,6 +1593,19 @@ Tools worth knowing about before touching any of this:
       exactly the CTS groups that exercise image-copy + compressed-layout
       interactions together — the same combination behind the still-open
       texture-probe anomaly.
+      **`image_clearing` root cause narrowed further (2026-08-06):**
+      `tests/render_clear_probe --linear`/`--general`/`--no-ca-usage`
+      reproduce, via a real render-pass clear, every condition used above to
+      explain the `vkCmdClearColorImage` failures (non-AFBC tiling, the
+      `GENERAL` layout `vk_meta` actually uses, and creating the image
+      without `COLOR_ATTACHMENT_BIT` the way an app calling that entry
+      point would). All three pass, pixel-exact, on the Poco X8 Pro. So
+      "the non-AFBC clear path is broken" is not quite right either — the
+      uncompressed path works fine for render-pass clears. The bug is
+      narrower than that: it's inside `vk_meta_clear_color_image` (or the
+      internal render pass it builds) specifically, not in AFBC/layout/
+      tiling handling in general. Still upstream, still not this port —
+      see `docs/kbase-notes.md`.
       **When the `extensions` stage is eventually reached, expect a known
       gap list, not driver bugs to chase.** Cross-checked against GitLab
       work item `panfrost/mesa#125` ("features the Mali DDK implements but

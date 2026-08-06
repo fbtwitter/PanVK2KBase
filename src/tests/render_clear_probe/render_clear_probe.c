@@ -134,6 +134,30 @@ main(int argc, char **argv)
     */
    setvbuf(stdout, NULL, _IONBF, 0);
 
+   bool linear = false;
+   bool general = false;
+   bool no_ca_usage = false;
+   for (int i = 2; i < argc; i++) {
+      if (!strcmp(argv[i], "--linear"))
+         linear = true;
+      else if (!strcmp(argv[i], "--general"))
+         general = true;
+      else if (!strcmp(argv[i], "--no-ca-usage"))
+         no_ca_usage = true;
+   }
+
+   /* vkCmdClearColorImage may only be called with the image in
+    * TRANSFER_DST_OPTIMAL or GENERAL - never COLOR_ATTACHMENT_OPTIMAL, which
+    * is what every render probe in this repo uses. vk_meta passes that
+    * layout straight through to the VkRenderingAttachmentInfo it builds, so
+    * --general reproduces it. Once tiling and view type are ruled out, this
+    * is the last difference between this (passing) probe and the failing
+    * vkCmdClearColorImage path.
+    */
+   const VkImageLayout rt_layout =
+      general ? VK_IMAGE_LAYOUT_GENERAL
+              : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
    if (argc < 3 || strcmp(argv[2], "--i-know-it-hangs") != 0) {
       fprintf(stderr,
               "This is the first real VERTEX_TILER/FRAGMENT execution ever\n"
@@ -292,9 +316,19 @@ main(int argc, char **argv)
       .mipLevels = 1,
       .arrayLayers = 1,
       .samples = VK_SAMPLE_COUNT_1_BIT,
-      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      /* --linear selects VK_IMAGE_TILING_LINEAR, which is the discriminator
+       * for the vkCmdClearColorImage bug: that entry point fails on any
+       * surface AFBC does not apply to, and linear is one of those. Every
+       * render probe here uses OPTIMAL, so a plain render-pass clear into a
+       * non-AFBC target had never been tested - and that is exactly what
+       * separates "vk_meta's clear is broken" from "storing to a non-AFBC
+       * target is broken".
+       */
+      .tiling = linear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
       .usage =
-         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         (no_ca_usage ? VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                      : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
@@ -328,8 +362,26 @@ main(int argc, char **argv)
    r = bind_img_mem(device, image, img_memory, 0);
    check(r == VK_SUCCESS, "vkBindImageMemory");
 
+   /* --no-ca-usage: create the image WITHOUT
+    * VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT and add that usage only on the
+    * view, via VkImageViewUsageCreateInfo.
+    *
+    * This is what vk_meta does, and it is not an academic difference. An
+    * application calling vkCmdClearColorImage only has to create the image
+    * with TRANSFER_DST - it is asking for a clear, not for rendering - so
+    * the driver picks the image's internal layout knowing nothing about
+    * colour-attachment use. vk_meta then renders into it anyway through a
+    * view that claims the usage after the fact. If the driver's layout
+    * choice and its framebuffer setup disagree about that, the render goes
+    * somewhere the readback does not look.
+    */
+   VkImageViewUsageCreateInfo view_usage = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+   };
    VkImageViewCreateInfo ivci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = no_ca_usage ? &view_usage : NULL,
       .image = image,
       .viewType = VK_IMAGE_VIEW_TYPE_2D,
       .format = IMG_FORMAT,
@@ -428,7 +480,7 @@ main(int argc, char **argv)
       .srcAccessMask = 0,
       .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .newLayout = rt_layout,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image = image,
@@ -459,7 +511,7 @@ main(int argc, char **argv)
    VkRenderingAttachmentInfo color_attachment = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
       .imageView = view,
-      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .imageLayout = rt_layout,
       .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
       .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
       .clearValue = clear_value,
@@ -487,7 +539,7 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .oldLayout = rt_layout,
       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,

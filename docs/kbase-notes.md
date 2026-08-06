@@ -3920,6 +3920,38 @@ failing case; the stream runs and produces black). Not provable from here
 without panthor hardware, but it is where the evidence points, and it means
 the fix belongs upstream rather than in `src/mesa/`.
 
+**Confirmed on this hardware: it is not "non-AFBC clears are broken", it is
+specific to the `vkCmdClearColorImage` entry point.** `tests/render_clear_probe`
+gained three flags (`--linear`, `--general`, `--no-ca-usage`) to reproduce, via
+a real `LOAD_OP_CLEAR` render pass, every condition the table above uses to
+explain the `vkCmdClearColorImage` failures:
+
+- `--linear` — `VK_IMAGE_TILING_LINEAR`, the same tiling as the failing
+  `2d.linear.single_layer.r8g8b8a8_unorm` case, and AFBC-ineligible for the
+  same reason.
+- `--general` — `VK_IMAGE_LAYOUT_GENERAL` for the render target instead of
+  `COLOR_ATTACHMENT_OPTIMAL`, matching the layout `vk_meta_clear_color_image`
+  actually passes through to `VkRenderingAttachmentInfo`.
+- `--no-ca-usage` — the image created with only `TRANSFER_DST_BIT`, with
+  `COLOR_ATTACHMENT_BIT` added after the fact on the view via
+  `VkImageViewUsageCreateInfo`, which is what an application calling
+  `vkCmdClearColorImage` (never `vkCmdBeginRendering`) actually does.
+
+All three ran clean on the Poco X8 Pro (Mali-G720, r49p1): 16/16 pixels held
+the exact clear colour in every case, individually and matching baseline.
+Re-ran `driver_compute_probe --fill` after — 0 failures, device not left
+degraded.
+
+So a render-pass clear survives every condition that makes the standalone
+entry point fail. That rules out "the uncompressed/non-AFBC clear path is
+broken" as the cause — the uncompressed path clearly works, render passes
+use it constantly and are pixel-exact. What's actually broken is narrower
+and lives somewhere in `vk_meta_clear_color_image` itself (or the internal
+render pass it builds) — not in image layout handling, AFBC eligibility, or
+tiling in general. This does not change the "probably upstream" conclusion,
+it sharpens it: the bug is in `vk_meta`'s clear implementation, not in the
+framebuffer/AFBC machinery it shares with every other render-pass clear.
+
 **Why no probe caught this.** Every render probe in `src/tests/` clears via
 `VK_ATTACHMENT_LOAD_OP_CLEAR` — a render-pass clear, which works and is
 pixel-exact. `vkCmdClearColorImage` is a different entry point: a standalone
