@@ -1880,9 +1880,28 @@ Tools worth knowing about before touching any of this:
       buffer with 48 bytes and checks the first 48 bytes stay untouched,
       the triangle lands at offset 48, and the counter reads back 96.
       All fifteen probe modes pass, device healthy.
+      **Indirect draws landed (2026-08-06)** — `vkCmdDrawIndirect`,
+      non-indexed, `drawCount == 1`. With the counts in GPU memory three
+      things stop being host-known, and the setup kernel was already the
+      right home for all of them: the clamp and query counters (the kernel
+      reads `vertexCount`/`instanceCount` from the buffer — both
+      `VkDrawIndirectCommand` and `VkDrawIndexedIndirectCommand` start
+      count-then-instance-count, so the indexed variant will need no
+      change there), `num_vertices` (which the shader needs to split its
+      linear slot, patched into the push uniforms just like
+      `xfb.buffer_addrs[]`), and `firstVertex` (loaded straight into
+      `GLOBAL_ATTRIBUTE_OFFSET` from the command — needing no cache flush,
+      since it comes from an application buffer with no producer in our
+      command stream). The awkward part is TLS sizing, which happens on
+      the host before the kernel runs: with no host count it sizes for the
+      largest capture the bound buffers could hold, which is by
+      construction the most the clamp can let through. Tested by
+      `--indirect` and especially `--indirect --instanced`, where a broken
+      `num_vertices` patch would make instance 1 read past the vertex
+      buffer. All twenty probe modes pass, device healthy.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
-      restart with XFB active, indirect draws and
+      restart with XFB active, multi-draw indirect, indexed indirect and
       `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
       "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.

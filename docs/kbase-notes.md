@@ -4848,3 +4848,45 @@ seeds the counter buffer with 48 bytes, so a 3-vertex draw must land in the
 poison (proving the capture honoured the counter buffer rather than starting
 at 0), the triangle appears at offset 48, and the counter buffer reads back
 96. All fifteen probe-mode combinations pass, device healthy.
+
+## Indirect draws (2026-08-06, WORKING)
+
+`vkCmdDrawIndirect` now captures. Scope: **non-indexed, `drawCount == 1`**.
+
+With the counts in GPU memory, three separate things stop being host-known,
+and the setup kernel was already the right place for all of them:
+
+- **the clamp and the query counters** — the kernel now reads
+  `vertexCount`/`instanceCount` from the buffer instead of taking
+  `generated_slots` as an argument. `VkDrawIndirectCommand` and
+  `VkDrawIndexedIndirectCommand` both start with count-then-instance-count, so
+  one read serves either and the indexed variant will need no change here;
+- **`num_vertices`** — the capture shader needs it to recover
+  `instance = slot / num_vertices` from its linear slot. For a direct draw the
+  host writes that sysval; for an indirect one the kernel patches it into the
+  uploaded push-uniform buffer, exactly as it already does for
+  `xfb.buffer_addrs[]`;
+- **`firstVertex`** — loaded straight into `GLOBAL_ATTRIBUTE_OFFSET` from the
+  third word of the command. That read needs *no* cache flush, unlike anything
+  the setup kernel writes: it comes from an application buffer with no
+  producer in our own command stream, which is the same reason the existing
+  indirect-dispatch path can load it directly.
+
+The one genuinely awkward part is **TLS sizing**, which happens on the host
+before the kernel runs. With no host count, the dispatch sizes thread storage
+for the largest capture the bound buffers could possibly hold — which is by
+construction the most the clamp can ever let through.
+
+**Test**: `render_xfb_probe --indirect`, and more importantly
+`--indirect --instanced`: with `instanceCount = 2` coming from GPU memory, a
+broken `num_vertices` patch would make instance 1 read past the end of the
+3-vertex vertex buffer, so a clean repeat of the base triangle is what proves
+it. `--indirect --instanced --query` additionally confirms the kernel derived
+2 primitives written/generated from the buffer. All twenty probe-mode
+combinations pass, device healthy.
+
+Still out of scope: multi-draw indirect (needs one capture per command, so the
+write position advances between them — the kernel would have to loop, or the
+driver emit N dispatches), indexed indirect (the `xfb.index_buffer` sysval
+would need biasing by a `firstIndex` that only exists on the GPU, so the
+kernel would patch that slot too), and `vkCmdDrawIndirectByteCountEXT`.

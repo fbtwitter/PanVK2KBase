@@ -166,7 +166,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                          uint32_t vertex_count, uint32_t instance_count,
                          int32_t vertex_base, uint64_t index_buffer,
                          uint32_t index_size, uint64_t query_ptr,
-                         uint32_t verts_per_prim)
+                         uint32_t verts_per_prim, uint64_t indirect_buffer)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
@@ -179,6 +179,9 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    /* Kept for the XFB query: "generated" is what the draw asked for, before
     * the bounds clamp below reduces it to what actually fits ("written").
     */
+   /* Only meaningful for a direct draw; for an indirect one the kernel reads
+    * the counts out of the indirect buffer itself.
+    */
    const uint64_t generated_verts = (uint64_t)vertex_count * instance_count;
 
    /* The dispatch is a flat 1D grid: one invocation per captured vertex,
@@ -190,7 +193,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     */
    const uint64_t capture_slots = generated_verts;
 
-   if (!capture_slots || !state->xfb.offsets_gpu)
+   if ((!capture_slots && !indirect_buffer) || !state->xfb.offsets_gpu)
       return;
 
    state->sysvals.xfb.num_vertices = vertex_count;
@@ -211,8 +214,22 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       return;
    }
 
+   uint32_t tls_slots = (uint32_t)capture_slots;
+   if (indirect_buffer) {
+      /* No host count: size TLS for the most the bound buffers could hold,
+       * which is the most the clamp can ever let through.
+       */
+      tls_slots = 0;
+      u_foreach_bit(i, shader->xfb_buffers_written) {
+         if (i >= state->xfb.bound_count || !shader->xfb_strides[i])
+            continue;
+         tls_slots = MAX2(tls_slots, (uint32_t)(state->xfb.bufs[i].size /
+                                                shader->xfb_strides[i]));
+      }
+   }
+
    struct pan_compute_dim dim = {
-      .x = (uint32_t)capture_slots,
+      .x = tls_slots,
       .y = 1,
       .z = 1,
    };
@@ -346,10 +363,19 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          .offsets = state->xfb.offsets_gpu,
          .descs = xfb_descs.gpu,
          .desc_count = desc_count,
-         .generated_slots = (uint32_t)capture_slots,
+         .direct_vertex_count = vertex_count,
+         .direct_instance_count = instance_count,
          .verts_per_prim = verts_per_prim ? verts_per_prim : 1,
          .out_slots = out_slots.gpu,
          .query = query_ptr,
+         .indirect = indirect_buffer,
+         .num_vertices_pu =
+            indirect_buffer && push_uniforms.gpu &&
+                  shader_uses_sysval(xfb_variant, graphics, xfb.num_vertices)
+               ? push_uniforms.gpu +
+                    shader_remapped_sysval_offset(
+                       xfb_variant, sysval_offset(graphics, xfb.num_vertices))
+               : 0,
       };
 
       panlib_xfb_setup_struct(&pctx, panlib_1d(1), PANLIB_BARRIER_CSF_WAIT,
@@ -386,8 +412,18 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
        * draw (launch_draw()). This is why the indexed path needs no
        * vertexOffset maths in the shader.
        */
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                   (uint32_t)vertex_base);
+      if (indirect_buffer) {
+         /* firstVertex is the third word of VkDrawIndirectCommand. Reading it
+          * from an application buffer needs no cache flush - nothing in our
+          * command stream produced it.
+          */
+         cs_move64_to(b, cs_scratch_reg64(b, 8), indirect_buffer);
+         cs_load32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
+                      cs_scratch_reg64(b, 8), 8);
+      } else {
+         cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
+                      (uint32_t)vertex_base);
+      }
 
       struct mali_compute_size_workgroup_packed wg_size;
       pan_pack(&wg_size, COMPUTE_SIZE_WORKGROUP, cfg) {
@@ -451,7 +487,8 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
                                state->xfb.pending_draws[i].index_buffer,
                                state->xfb.pending_draws[i].index_size,
                                state->xfb.pending_draws[i].query_ptr,
-                               state->xfb.pending_draws[i].verts_per_prim);
+                               state->xfb.pending_draws[i].verts_per_prim,
+                               state->xfb.pending_draws[i].indirect_buffer);
    }
 
    state->xfb.pending_draw_count = 0;

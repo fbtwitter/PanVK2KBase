@@ -196,6 +196,16 @@ capture_verts(void)
 static bool resume_mode;
 #define RESUME_START_BYTES 48
 
+/* --indirect mode: drive the same draw through vkCmdDrawIndirect.
+ *
+ * vertexCount/instanceCount/firstVertex then live in GPU memory rather than
+ * being known when the command buffer is recorded, so the capture's clamp,
+ * its grid size and the num_vertices the shader uses to split its linear slot
+ * all have to be derived on the GPU. Producing the same three vertices as the
+ * direct path is what shows that happened correctly.
+ */
+static bool indirect_mode;
+
 static int failures;
 
 static void
@@ -254,6 +264,8 @@ main(int argc, char **argv)
          instanced_mode = true;
       else if (strcmp(argv[i], "--resume") == 0)
          resume_mode = true;
+      else if (strcmp(argv[i], "--indirect") == 0)
+         indirect_mode = true;
    }
    printf("mode: %s%s%s%s\n",
           indexed_mode ? "indexed (vkCmdDrawIndexed)"
@@ -264,6 +276,8 @@ main(int argc, char **argv)
    if (resume_mode)
       printf("       + resume (counter buffer seeded to %d bytes)\n",
              RESUME_START_BYTES);
+   if (indirect_mode)
+      printf("       + indirect (vkCmdDrawIndirect)\n");
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -413,6 +427,7 @@ main(int argc, char **argv)
    PFN_vkCmdBindIndexBuffer cmd_bind_ibo = GDPA(vkCmdBindIndexBuffer);
    PFN_vkCmdDraw cmd_draw = GDPA(vkCmdDraw);
    PFN_vkCmdDrawIndexed cmd_draw_indexed = GDPA(vkCmdDrawIndexed);
+   PFN_vkCmdDrawIndirect cmd_draw_indirect = GDPA(vkCmdDrawIndirect);
    PFN_vkCmdCopyImageToBuffer cmd_copy_img_to_buf =
       GDPA(vkCmdCopyImageToBuffer);
    PFN_vkQueueSubmit queue_submit = GDPA(vkQueueSubmit);
@@ -525,6 +540,54 @@ main(int argc, char **argv)
       *counter_mapped = RESUME_START_BYTES;
       printf("  seeded counter buffer with %d bytes (%d vertices)\n",
              RESUME_START_BYTES, RESUME_START_BYTES / 16);
+   }
+
+   /* ------------------------------------------------------- indirect buffer */
+   VkBuffer indirect_buf = VK_NULL_HANDLE;
+   VkDeviceMemory indirect_memory = VK_NULL_HANDLE;
+   if (indirect_mode) {
+      printf("\n=== indirect buffer: VkDrawIndirectCommand, host-visible ===\n");
+
+      VkBufferCreateInfo ibci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = sizeof(VkDrawIndirectCommand),
+         .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      r = create_buffer(device, &ibci, NULL, &indirect_buf);
+      check(r == VK_SUCCESS, "vkCreateBuffer (indirect buffer)");
+
+      VkMemoryRequirements ireqs;
+      get_buf_reqs(device, indirect_buf, &ireqs);
+
+      uint32_t itype =
+         find_memory_type(&mem_props, ireqs.memoryTypeBits, host_want);
+      check(itype != UINT32_MAX, "host-visible memory type for indirect buffer");
+      if (itype == UINT32_MAX)
+         return 1;
+
+      VkMemoryAllocateInfo imai = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = ireqs.size,
+         .memoryTypeIndex = itype,
+      };
+      r = alloc_mem(device, &imai, NULL, &indirect_memory);
+      check(r == VK_SUCCESS, "vkAllocateMemory (indirect buffer)");
+      r = bind_buf_mem(device, indirect_buf, indirect_memory, 0);
+      check(r == VK_SUCCESS, "vkBindBufferMemory (indirect buffer)");
+
+      VkDrawIndirectCommand *icmd = NULL;
+      r = map_mem(device, indirect_memory, 0, VK_WHOLE_SIZE, 0, (void **)&icmd);
+      check(r == VK_SUCCESS, "vkMapMemory (indirect buffer)");
+      if (r != VK_SUCCESS)
+         return 1;
+
+      icmd->vertexCount = BASE_VERTS;
+      icmd->instanceCount = instance_count();
+      icmd->firstVertex = 0;
+      icmd->firstInstance = 0;
+      printf("  wrote {vertexCount=%u, instanceCount=%u, firstVertex=0}\n",
+             icmd->vertexCount, icmd->instanceCount);
    }
 
    /* ---------------------------------------------------------- index buffer */
@@ -967,7 +1030,10 @@ main(int argc, char **argv)
       printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
    }
 
-   if (indexed_mode) {
+   if (indirect_mode) {
+      cmd_draw_indirect(cmdbuf, indirect_buf, 0, 1, 0);
+      printf("  vkCmdDrawIndirect(1 draw) recorded\n");
+   } else if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
       cmd_draw_indexed(cmdbuf, BASE_VERTS, instance_count(), 0, 0, 0);
@@ -1259,9 +1325,17 @@ main(int argc, char **argv)
       destroy_buffer(device, counter_buf, NULL);
       free_mem(device, counter_memory, NULL);
    }
+   if (indirect_mode) {
+      destroy_buffer(device, indirect_buf, NULL);
+      free_mem(device, indirect_memory, NULL);
+   }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && resume_mode)
+   if (failures == 0 && indirect_mode)
+      printf("\n=> VK_EXT_transform_feedback indirect capture works:\n"
+             "   the draw counts came from GPU memory, and the capture's grid,\n"
+             "   clamp and num_vertices were all derived from them.\n");
+   else if (failures == 0 && resume_mode)
       printf("\n=> VK_EXT_transform_feedback counter-buffer resume works:\n"
              "   the capture began at the offset the counter buffer held and\n"
              "   the final position was written back to it.\n");
