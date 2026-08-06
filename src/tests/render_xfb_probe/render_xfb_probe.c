@@ -151,6 +151,36 @@ static bool overflow_mode;
 /* --query mode: VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT. */
 static bool query_mode;
 
+/* --instanced mode: draw the triangle twice via instancing.
+ *
+ * This is what actually exercises the flat 1D capture grid. The dispatch is
+ * one invocation per captured vertex across all instances, so the shader
+ * recovers instance = slot / num_vertices and vertex = slot - instance *
+ * num_vertices. With instanceCount == 1 that decomposition is degenerate
+ * (instance is always 0) and a broken one would still pass.
+ *
+ * With two instances, slot 3 must resolve to instance 1 / vertex 0. If the
+ * decomposition were wrong - instance stuck at 0 - vertex would come out as 3,
+ * which is past the end of the 3-vertex vertex buffer, so the captured data
+ * would not be a clean repeat of the base triangle.
+ */
+static bool instanced_mode;
+#define BASE_VERTS      3
+#define MAX_INSTANCES   2
+#define MAX_CAPTURE_VERTS (BASE_VERTS * MAX_INSTANCES)
+
+static uint32_t
+instance_count(void)
+{
+   return instanced_mode ? 2 : 1;
+}
+
+static uint32_t
+capture_verts(void)
+{
+   return BASE_VERTS * instance_count();
+}
+
 static int failures;
 
 static void
@@ -205,12 +235,15 @@ main(int argc, char **argv)
          overflow_mode = true;
       else if (strcmp(argv[i], "--query") == 0)
          query_mode = true;
+      else if (strcmp(argv[i], "--instanced") == 0)
+         instanced_mode = true;
    }
-   printf("mode: %s%s%s\n",
+   printf("mode: %s%s%s%s\n",
           indexed_mode ? "indexed (vkCmdDrawIndexed)"
                        : "non-indexed (vkCmdDraw)",
           overflow_mode ? " + overflow (XFB buffer bound too small)" : "",
-          query_mode ? " + xfb query" : "");
+          query_mode ? " + xfb query" : "",
+          instanced_mode ? " + instanced (instanceCount=2)" : "");
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -477,7 +510,8 @@ main(int argc, char **argv)
    /* ------------------------------------------------------------ XFB buffer */
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
-   const VkDeviceSize xfb_size = sizeof(EXPECTED_XFB);
+   const VkDeviceSize xfb_size =
+      (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = xfb_size,
@@ -863,11 +897,13 @@ main(int argc, char **argv)
    if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
-      cmd_draw_indexed(cmdbuf, 3, 1, 0, 0, 0);
-      printf("  vkCmdDrawIndexed(3, 1, 0, 0, 0) recorded\n");
+      cmd_draw_indexed(cmdbuf, BASE_VERTS, instance_count(), 0, 0, 0);
+      printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded\n", BASE_VERTS,
+             instance_count());
    } else {
-      cmd_draw(cmdbuf, 3, 1, 0, 0);
-      printf("  vkCmdDraw(3, 1, 0, 0) recorded\n");
+      cmd_draw(cmdbuf, BASE_VERTS, instance_count(), 0, 0);
+      printf("  vkCmdDraw(%u, %u, 0, 0) recorded\n", BASE_VERTS,
+             instance_count());
    }
 
    cmd_end_xfb(cmdbuf, 0, 0, NULL, NULL);
@@ -979,8 +1015,8 @@ main(int argc, char **argv)
             "render is unaffected by the XFB-capture shader variant");
 
       printf("\n=== readback: XFB buffer ===\n");
-      float captured[3][4];
-      memcpy(captured, xfb_mapped, sizeof(captured));
+      float captured[MAX_CAPTURE_VERTS][4];
+      memcpy(captured, xfb_mapped, (size_t)xfb_size);
 
       /* 0.000 at 3 decimals is ambiguous: it prints the same for a real
        * zero write and for the untouched 0x11111111 poison pattern
@@ -989,7 +1025,7 @@ main(int argc, char **argv)
        */
       const uint8_t *raw = xfb_mapped;
       printf("  raw bytes: ");
-      for (size_t i = 0; i < sizeof(EXPECTED_XFB); i++)
+      for (size_t i = 0; i < (size_t)xfb_size; i++)
          printf("%02x", raw[i]);
       printf("\n");
 
@@ -1004,7 +1040,7 @@ main(int argc, char **argv)
           * permission to write.
           */
          bool tail_untouched = true;
-         for (size_t i = OVERFLOW_BOUND_SIZE; i < sizeof(EXPECTED_XFB); i++)
+         for (size_t i = OVERFLOW_BOUND_SIZE; i < (size_t)xfb_size; i++)
             tail_untouched = tail_untouched && raw[i] == 0x11;
 
          check(tail_untouched,
@@ -1015,7 +1051,7 @@ main(int argc, char **argv)
                    OVERFLOW_BOUND_SIZE);
 
          bool nothing_captured = true;
-         for (size_t i = 0; i < sizeof(EXPECTED_XFB); i++)
+         for (size_t i = 0; i < (size_t)xfb_size; i++)
             nothing_captured = nothing_captured && raw[i] == 0x11;
 
          check(nothing_captured,
@@ -1025,17 +1061,24 @@ main(int argc, char **argv)
       }
 
       bool xfb_ok = true;
-      for (int v = 0; v < 3; v++) {
+      for (uint32_t v = 0; v < capture_verts(); v++) {
+         /* Each instance re-captures the same triangle: the shader's
+          * position does not depend on gl_InstanceIndex, so instance i
+          * must reproduce the base triangle exactly. A broken
+          * slot->(instance, vertex) decomposition would fetch past the
+          * 3-vertex vertex buffer instead.
+          */
+         const float *want = expected[v % BASE_VERTS];
          bool vertex_ok =
-            memcmp(captured[v], expected[v], sizeof(captured[v])) == 0;
-         printf("  vertex[%d] captured = (%.3f, %.3f, %.3f, %.3f) expected "
+            memcmp(captured[v], want, sizeof(captured[v])) == 0;
+         printf("  vertex[%u] captured = (%.3f, %.3f, %.3f, %.3f) expected "
                 "= (%.3f, %.3f, %.3f, %.3f) %s\n",
                 v, captured[v][0], captured[v][1], captured[v][2],
-                captured[v][3], expected[v][0], expected[v][1], expected[v][2],
-                expected[v][3], vertex_ok ? "ok" : "MISMATCH");
+                captured[v][3], want[0], want[1], want[2], want[3],
+                vertex_ok ? "ok" : "MISMATCH");
          xfb_ok = xfb_ok && vertex_ok;
       }
-      check(xfb_ok, "all 3 vertices' XFB-captured positions match exactly");
+      check(xfb_ok, "all captured vertices' XFB positions match exactly");
 
       /* In indexed mode, capturing the *unpermuted* order is the specific
        * failure mode of a shader that ignored the index buffer and used its
@@ -1065,8 +1108,8 @@ main(int argc, char **argv)
           * too small for the whole primitive, which is exactly the --overflow
           * case - so that is where written and generated must disagree.
           */
-         const uint64_t want_generated = 1;
-         const uint64_t want_written = overflow_mode ? 0 : 1;
+         const uint64_t want_generated = instance_count();
+         const uint64_t want_written = overflow_mode ? 0 : instance_count();
 
          printf("  primitives written   = %llu (expected %llu)\n",
                 (unsigned long long)results[0],

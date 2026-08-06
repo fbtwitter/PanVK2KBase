@@ -1799,6 +1799,35 @@ Tools worth knowing about before touching any of this:
       `--overflow`); the overflow case is the only one where the two
       counters legitimately disagree (0 written, 1 generated). All eight
       probe-mode combinations pass, device healthy.
+      **Capture dispatch flattened to a 1D grid (2026-08-06)** —
+      groundwork for GPU-resident counts. The grid was
+      (`vertex_count`, `instance_count`); clamping *that* against a value
+      living in GPU memory (what counter-buffer resume and indirect draws
+      both need) means splitting the clamp across two axes and dropping
+      whole instances rather than a partial one. Now `JOB_SIZE_X =
+      vertex_count * instance_count`, `workgroup_id.x` is the linear
+      capture slot, and the shader recovers `instance = slot /
+      num_vertices`, `vertex = slot - instance * num_vertices` — which
+      reconstructs the XFB store slot exactly, since
+      `nir_lower_xfb_to_stores` computes `instance_id * num_vertices +
+      raw_vertex_id`. `num_vertices` stays the *unclamped* per-instance
+      count so the decomposition survives clamping. The host clamp
+      collapses to one `MIN2` plus primitive alignment, a partial instance
+      is now captured rather than dropped, and the two lowering passes
+      merged into one. Required adding `render_xfb_probe --instanced`:
+      every previous mode drew `instanceCount == 1`, where the
+      decomposition is degenerate (`instance` always 0, `vertex == slot`),
+      so a completely broken one would still have passed all eight modes.
+      All twelve mode combinations now pass, device healthy.
+      **Correction to an earlier note**: GPU-resident counts do *not* need
+      a new libpan CL kernel. `cs_builder.h` has `cs_udiv32`, `cs_umul64`
+      and `cs_umin32`, so capacity arithmetic fits directly in the command
+      stream. What remains is a per-cmdbuf GPU scratch of byte offsets,
+      Begin initialising it (0 or from the counter buffer), the dispatch
+      clamping `JOB_SIZE_X` via `cs_umin32` and patching
+      `xfb.buffer_addrs[i]` into the push uniforms as `base + offset`
+      (precedent in `panvk_vX_cmd_dispatch.c`'s indirect path), and End
+      writing the offset back.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
       restart with XFB active, indirect draws,

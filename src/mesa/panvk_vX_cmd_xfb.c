@@ -192,12 +192,23 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     */
    const uint64_t generated_verts = (uint64_t)vertex_count * instance_count;
 
+   /* The dispatch is a flat 1D grid: one invocation per captured vertex,
+    * across all instances. workgroup_id.x is the capture slot, and the shader
+    * recovers vertex/instance from it using num_vertices (see
+    * panvk_lower_xfb_dispatch_ids() in panvk_vX_shader.c). num_vertices stays
+    * the *unclamped* per-instance count so that decomposition survives the
+    * clamp below.
+    */
+   uint64_t capture_slots = generated_verts;
+
    /* Clamp the capture to what actually fits in the bound XFB buffers.
     * Without this a draw bigger than its capture buffer writes past the end
     * of it - an out-of-bounds GPU write, not merely wrong data.
     *
     * Capacity is the tightest constraint across every buffer this shader
-    * writes, measured from each buffer's current offset.
+    * writes, measured from each buffer's current offset. With a flat grid this
+    * is a single min, and a partial instance can be captured correctly rather
+    * than dropped.
     */
    uint64_t xfb_capture_capacity = UINT64_MAX;
    u_foreach_bit(i, shader->xfb_buffers_written) {
@@ -212,40 +223,23 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          MIN2(xfb_capture_capacity, avail / shader->xfb_strides[i]);
    }
 
-   /* Transform feedback discards whole primitives, not individual vertices:
-    * a triangle that only half fits is dropped entirely rather than captured
-    * as a partial primitive. Round the capacity down accordingly, which also
-    * keeps the XFB query self-consistent - "written" is then always a whole
-    * number of primitives that really were captured.
+   capture_slots = MIN2(capture_slots, xfb_capture_capacity);
+
+   /* Transform feedback discards whole primitives, not individual vertices: a
+    * triangle that only half fits is dropped entirely rather than captured as
+    * a partial primitive. This also keeps the XFB query self-consistent -
+    * "written" is always a whole number of primitives that really were
+    * captured.
     */
-   if (verts_per_prim > 1 && xfb_capture_capacity != UINT64_MAX)
-      xfb_capture_capacity -= xfb_capture_capacity % verts_per_prim;
+   if (verts_per_prim > 1)
+      capture_slots -= capture_slots % verts_per_prim;
 
-   if ((uint64_t)vertex_count * instance_count > xfb_capture_capacity) {
-      /* Drop whole instances rather than splitting one. The store slot is
-       * instance * num_vertices + vertex, so leaving vertex_count (and hence
-       * the num_vertices sysval) alone keeps every surviving slot at exactly
-       * the address it would otherwise have had. Capturing a trailing partial
-       * instance would need a second dispatch with a different origin; this is
-       * a little more conservative than the spec allows, never unsafe.
-       */
-      if (xfb_capture_capacity >= vertex_count) {
-         instance_count = (uint32_t)(xfb_capture_capacity / vertex_count);
-      } else {
-         /* Not even one full instance fits - capture a prefix of instance 0,
-          * where the slot index reduces to just the vertex index.
-          */
-         instance_count = 1;
-         vertex_count = (uint32_t)xfb_capture_capacity;
-      }
-
-      if (!vertex_count || !instance_count) {
-         /* Nothing fits, but the primitives were still generated. */
-         if (verts_per_prim)
-            accumulate_xfb_query(cmdbuf, query_ptr, 0,
-                                 generated_verts / verts_per_prim);
-         return;
-      }
+   if (!capture_slots) {
+      /* Nothing fits, but the primitives were still generated. */
+      if (verts_per_prim)
+         accumulate_xfb_query(cmdbuf, query_ptr, 0,
+                              generated_verts / verts_per_prim);
+      return;
    }
 
    /* Populate the sysvals the XFB variant's shader body reads
@@ -271,8 +265,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    }
 
    struct pan_compute_dim dim = {
-      .x = vertex_count,
-      .y = instance_count,
+      .x = (uint32_t)capture_slots,
+      .y = 1,
       .z = 1,
    };
    uint64_t tsd = panvk_per_arch(cmd_dispatch_prepare_tls)(
@@ -388,8 +382,9 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), vertex_count);
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), instance_count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
+                   (uint32_t)capture_slots);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), 1);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
    }
 
@@ -405,10 +400,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                         MALI_TASK_AXIS_Z, PANVK_PRECOMP_RES_SEL);
 
    if (verts_per_prim) {
-      accumulate_xfb_query(
-         cmdbuf, query_ptr,
-         ((uint64_t)vertex_count * instance_count) / verts_per_prim,
-         generated_verts / verts_per_prim);
+      accumulate_xfb_query(cmdbuf, query_ptr, capture_slots / verts_per_prim,
+                           generated_verts / verts_per_prim);
    }
 
    /* Accumulate this draw's contribution to the counter-buffer writeback
@@ -419,7 +412,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          continue;
 
       state->xfb.buffer_offset[i] +=
-         (uint64_t)shader->xfb_strides[i] * vertex_count * instance_count;
+         (uint64_t)shader->xfb_strides[i] * capture_slots;
    }
 }
 

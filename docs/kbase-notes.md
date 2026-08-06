@@ -4618,3 +4618,72 @@ failure if they come back equal.
 
 All eight probe-mode combinations pass on the real Poco X8 Pro with 0
 failures, render unaffected in every one, device healthy afterwards.
+
+## Flattening the capture dispatch to a 1D grid (2026-08-06)
+
+Groundwork for GPU-resident counts, and a simplification in its own right.
+
+The capture grid was 2D: `JOB_SIZE_X = vertex_count`,
+`JOB_SIZE_Y = instance_count`, with the shader taking `workgroup_id.x` as the
+vertex index and `.y` as the instance index. Clamping *that* against a value
+that lives in GPU memory — which is what counter-buffer resume and indirect
+draws both require — means splitting the clamp across two axes, and the
+best you can do is drop whole instances rather than a partial one.
+
+A flat grid removes the problem. `JOB_SIZE_X` is now
+`vertex_count * instance_count` with Y and Z at 1, `workgroup_id.x` is the
+linear capture slot, and the shader recovers the indices:
+
+```
+instance = slot / num_vertices
+vertex   = slot - instance * num_vertices
+```
+
+This reconstructs the XFB store slot exactly, because
+`nir_lower_xfb_to_stores` computes `instance_id * num_vertices +
+raw_vertex_id` — which is `slot` again. `num_vertices` stays the
+**unclamped** per-instance vertex count precisely so the decomposition
+survives clamping.
+
+Consequences:
+
+- The host clamp collapses from "clamp X, then Y, dropping whole instances"
+  to a single `MIN2` plus a primitive-alignment round-down, and a partial
+  instance can now be captured correctly rather than dropped.
+- The two lowering passes merged into one `panvk_lower_xfb_dispatch_ids()`,
+  since all three ID intrinsics now need the same decomposition and all want
+  it built once at the top of `main`.
+- A runtime divide and multiply per invocation. Negligible against the memory
+  traffic of the capture itself, and it buys a clamp that is a single
+  comparison.
+
+**Why `--instanced` had to be added to the probe.** Every existing mode drew
+`instanceCount == 1`, where the decomposition is degenerate — `instance` is
+always 0 and `vertex == slot` — so a completely broken decomposition would
+still have passed all eight modes. With two instances, slot 3 must resolve to
+instance 1 / vertex 0; if `instance` were stuck at 0, `vertex` would come out
+as 3, reading past the end of the 3-vertex vertex buffer. The captured data
+being a clean repeat of the base triangle is what proves it.
+
+All twelve probe-mode combinations pass, including the instanced XFB query
+(2 primitives written, 2 generated), device healthy afterwards.
+
+### Correction: the command stream can divide and multiply
+
+An earlier note here reasoned that GPU-resident counts would need a new
+`libpan` CL kernel, on the assumption that the CS could only add and
+subtract. That was wrong. `src/panfrost/genxml/cs_builder.h` provides
+`cs_udiv32`, `cs_umul64`, `cs_umin32`, `cs_add32/64`, `cs_sub32/64` and the
+shifts — so capacity arithmetic can be done directly in the command stream,
+with no new kernel and no build-system changes. Combined with the flat grid,
+the remaining work is:
+
+1. a per-command-buffer GPU scratch holding one `u32` byte offset per XFB
+   buffer;
+2. `Begin` storing 0 into it, or loading the counter buffer value (resume);
+3. the dispatch computing `capacity = (size - offset) / stride`, clamping
+   `JOB_SIZE_X` with a single `cs_umin32`, and patching
+   `xfb.buffer_addrs[i]` into the push-uniform buffer as `base + offset`
+   (precedent: `panvk_vX_cmd_dispatch.c`'s indirect path already stores
+   `JOB_SIZE_*` into push uniforms at `shader_remapped_sysval_offset()`);
+4. `End` storing the offset back to the counter buffer.
