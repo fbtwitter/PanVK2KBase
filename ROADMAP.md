@@ -1862,12 +1862,30 @@ Tools worth knowing about before touching any of this:
       where the captures are actually dispatched — the same shape as the
       deferred query-availability bug, and a trap for any future End-time
       cleanup. All twelve probe modes pass, device healthy.
+      **Counter-buffer resume landed (2026-08-06).**
+      `vkCmdBeginTransformFeedbackEXT` with `pCounterBuffers` now resumes
+      from the byte offset the counter buffer holds, and the final
+      position is written back at End. One design change made it easy:
+      the write position is tracked in **bytes** rather than capture
+      slots, because that is the unit a counter buffer uses — in slots,
+      seeding would need a divide and writeback a multiply, neither of
+      which the command stream can do on arch 10. In bytes both are plain
+      32-bit copies and the only division lives in the kernel, which
+      divides for free; it also simplifies the address resolve to
+      `base + offset`. End again cannot do the writeback itself (it runs
+      before `CmdEndRendering`), so it records the targets and the flush
+      emits the copies — the *third* instance of that same deferral in
+      this feature, now the expected shape for anything End touches.
+      Tested by `render_xfb_probe --resume`, which seeds the counter
+      buffer with 48 bytes and checks the first 48 bytes stay untouched,
+      the triangle lands at offset 48, and the counter reads back 96.
+      All fifteen probe modes pass, device healthy.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
-      restart with XFB active, indirect draws,
-      `vkCmdDrawIndirectByteCountEXT` and counter-buffer resume — so
-      advertising it would turn "unsupported" into "assert/abort".
-      Flipping it on stays a deliberate follow-up.
+      restart with XFB active, indirect draws and
+      `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
+      "unsupported" into "assert/abort". Flipping it on stays a
+      deliberate follow-up.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

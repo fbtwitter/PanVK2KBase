@@ -181,6 +181,21 @@ capture_verts(void)
    return BASE_VERTS * instance_count();
 }
 
+/* --resume mode: start the capture part-way into the buffer, from a counter
+ * buffer, and write the final position back.
+ *
+ * The XFB buffer is sized for 6 vertices and the counter buffer is seeded with
+ * RESUME_START_BYTES, so a 3-vertex draw must land in the *second* half and
+ * leave the first half untouched. That is what distinguishes a real resume
+ * from an implementation that ignored the counter buffer and started at 0.
+ *
+ * At End the counter buffer must read back RESUME_START_BYTES + 48 - proving
+ * the write position was tracked on the GPU across the capture and copied back
+ * out afterwards.
+ */
+static bool resume_mode;
+#define RESUME_START_BYTES 48
+
 static int failures;
 
 static void
@@ -237,6 +252,8 @@ main(int argc, char **argv)
          query_mode = true;
       else if (strcmp(argv[i], "--instanced") == 0)
          instanced_mode = true;
+      else if (strcmp(argv[i], "--resume") == 0)
+         resume_mode = true;
    }
    printf("mode: %s%s%s%s\n",
           indexed_mode ? "indexed (vkCmdDrawIndexed)"
@@ -244,6 +261,9 @@ main(int argc, char **argv)
           overflow_mode ? " + overflow (XFB buffer bound too small)" : "",
           query_mode ? " + xfb query" : "",
           instanced_mode ? " + instanced (instanceCount=2)" : "");
+   if (resume_mode)
+      printf("       + resume (counter buffer seeded to %d bytes)\n",
+             RESUME_START_BYTES);
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -462,6 +482,51 @@ main(int argc, char **argv)
    memcpy(vbo_mapped, VERTICES, sizeof(VERTICES));
    printf("  wrote %zu bytes of vertex data (3 x vec2)\n", sizeof(VERTICES));
 
+   /* -------------------------------------------------------- counter buffer */
+   VkBuffer counter_buf = VK_NULL_HANDLE;
+   VkDeviceMemory counter_memory = VK_NULL_HANDLE;
+   uint32_t *counter_mapped = NULL;
+   if (resume_mode) {
+      printf("\n=== counter buffer: 1 x uint32, host-visible ===\n");
+
+      VkBufferCreateInfo cbci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = sizeof(uint32_t),
+         .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      r = create_buffer(device, &cbci, NULL, &counter_buf);
+      check(r == VK_SUCCESS, "vkCreateBuffer (counter buffer)");
+
+      VkMemoryRequirements creqs;
+      get_buf_reqs(device, counter_buf, &creqs);
+
+      uint32_t ctype =
+         find_memory_type(&mem_props, creqs.memoryTypeBits, host_want);
+      check(ctype != UINT32_MAX, "host-visible memory type for counter buffer");
+      if (ctype == UINT32_MAX)
+         return 1;
+
+      VkMemoryAllocateInfo cmai = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = creqs.size,
+         .memoryTypeIndex = ctype,
+      };
+      r = alloc_mem(device, &cmai, NULL, &counter_memory);
+      check(r == VK_SUCCESS, "vkAllocateMemory (counter buffer)");
+      r = bind_buf_mem(device, counter_buf, counter_memory, 0);
+      check(r == VK_SUCCESS, "vkBindBufferMemory (counter buffer)");
+      r = map_mem(device, counter_memory, 0, VK_WHOLE_SIZE, 0,
+                  (void **)&counter_mapped);
+      check(r == VK_SUCCESS, "vkMapMemory (counter buffer)");
+      if (r != VK_SUCCESS)
+         return 1;
+
+      *counter_mapped = RESUME_START_BYTES;
+      printf("  seeded counter buffer with %d bytes (%d vertices)\n",
+             RESUME_START_BYTES, RESUME_START_BYTES / 16);
+   }
+
    /* ---------------------------------------------------------- index buffer */
    VkBuffer ibo = VK_NULL_HANDLE;
    VkDeviceMemory ibo_memory = VK_NULL_HANDLE;
@@ -511,7 +576,9 @@ main(int argc, char **argv)
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
    const VkDeviceSize xfb_size =
-      (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
+      resume_mode
+         ? (VkDeviceSize)MAX_CAPTURE_VERTS * sizeof(EXPECTED_XFB[0])
+         : (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = xfb_size,
@@ -891,8 +958,14 @@ main(int argc, char **argv)
       printf("  vkCmdBeginQueryIndexedEXT recorded (stream 0)\n");
    }
 
-   cmd_begin_xfb(cmdbuf, 0, 0, NULL, NULL);
-   printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
+   if (resume_mode) {
+      VkDeviceSize czero = 0;
+      cmd_begin_xfb(cmdbuf, 0, 1, &counter_buf, &czero);
+      printf("  vkCmdBeginTransformFeedbackEXT recorded (counter buffer)\n");
+   } else {
+      cmd_begin_xfb(cmdbuf, 0, 0, NULL, NULL);
+      printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
+   }
 
    if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
@@ -906,8 +979,14 @@ main(int argc, char **argv)
              instance_count());
    }
 
-   cmd_end_xfb(cmdbuf, 0, 0, NULL, NULL);
-   printf("  vkCmdEndTransformFeedbackEXT recorded\n");
+   if (resume_mode) {
+      VkDeviceSize czero = 0;
+      cmd_end_xfb(cmdbuf, 0, 1, &counter_buf, &czero);
+      printf("  vkCmdEndTransformFeedbackEXT recorded (counter buffer)\n");
+   } else {
+      cmd_end_xfb(cmdbuf, 0, 0, NULL, NULL);
+      printf("  vkCmdEndTransformFeedbackEXT recorded\n");
+   }
 
    cmd_end_rendering(cmdbuf);
 
@@ -1029,6 +1108,33 @@ main(int argc, char **argv)
          printf("%02x", raw[i]);
       printf("\n");
 
+      if (resume_mode) {
+         /* The capture must start at the seeded offset, so the first half of
+          * the buffer stays poison and the triangle lands in the second.
+          */
+         const float(*want)[4] =
+            indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
+
+         bool head_untouched = true;
+         for (size_t i = 0; i < RESUME_START_BYTES; i++)
+            head_untouched = head_untouched && raw[i] == 0x11;
+         check(head_untouched,
+               "capture started at the counter-buffer offset, not 0");
+
+         bool tail_ok =
+            memcmp(raw + RESUME_START_BYTES, want, sizeof(EXPECTED_XFB)) == 0;
+         check(tail_ok, "resumed capture wrote the expected vertices");
+
+         uint32_t final_counter = *counter_mapped;
+         uint32_t want_counter = RESUME_START_BYTES + (uint32_t)sizeof(EXPECTED_XFB);
+         printf("  counter buffer = %u (expected %u)\n", final_counter,
+                want_counter);
+         check(final_counter == want_counter,
+               "counter buffer holds the final byte offset");
+
+         goto xfb_done;
+      }
+
       const float(*expected)[4] =
          indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
 
@@ -1149,9 +1255,17 @@ main(int argc, char **argv)
       destroy_buffer(device, ibo, NULL);
       free_mem(device, ibo_memory, NULL);
    }
+   if (resume_mode) {
+      destroy_buffer(device, counter_buf, NULL);
+      free_mem(device, counter_memory, NULL);
+   }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && overflow_mode)
+   if (failures == 0 && resume_mode)
+      printf("\n=> VK_EXT_transform_feedback counter-buffer resume works:\n"
+             "   the capture began at the offset the counter buffer held and\n"
+             "   the final position was written back to it.\n");
+   else if (failures == 0 && overflow_mode)
       printf("\n=> VK_EXT_transform_feedback bounds clamping works:\n"
              "   the capture filled the bound range and wrote nothing past\n"
              "   it, so an undersized XFB buffer no longer causes an\n"

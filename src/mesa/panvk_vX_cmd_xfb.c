@@ -64,24 +64,12 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
 
    assert(!state->xfb.active);
 
-   /* Phase 1: every Begin starts at offset 0. Resuming from a nonzero
-    * counter-buffer offset needs either a stall-and-readback or the same
-    * GPU-side counter machinery indirect/restart draws will need - not
-    * implemented yet.
-    */
-   assert(counterBufferCount == 0 &&
-          "VK_EXT_transform_feedback: resuming from a counter buffer is "
-          "not yet supported (phase 1)");
-   (void)firstCounterBuffer;
-   (void)pCounterBuffers;
-   (void)pCounterBufferOffsets;
-
-   for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
+   for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++) {
       state->xfb.counter_buffers[i].present = false;
       state->xfb.counter_buffers[i].dev_addr = 0;
    }
 
-   /* One write position per buffer, in capture slots, zeroed here. It has to
+   /* One write position per buffer, a byte offset, zeroed here. It has to
     * live in GPU memory because panlib_xfb_setup() clamps against it.
     */
    struct pan_ptr offsets = panvk_cmd_alloc_dev_mem(
@@ -93,6 +81,37 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
 
    memset(offsets.cpu, 0, sizeof(uint32_t) * MAX_XFB_BUFFERS);
    state->xfb.offsets_gpu = offsets.gpu;
+
+   /* Resume: a counter buffer holds a byte offset, which is exactly the unit
+    * the write position uses, so seeding it is a plain copy. Buffers without
+    * a counter buffer keep the zero written above.
+    */
+   if (counterBufferCount) {
+      struct cs_builder *b =
+         panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+      struct cs_index dst = cs_scratch_reg64(b, 0);
+      struct cs_index src = cs_scratch_reg64(b, 2);
+      struct cs_index val = cs_scratch_reg32(b, 4);
+
+      cs_move64_to(b, dst, offsets.gpu);
+
+      for (uint32_t i = 0; i < counterBufferCount; i++) {
+         uint32_t buf_idx = firstCounterBuffer + i;
+
+         if (buf_idx >= MAX_XFB_BUFFERS || !pCounterBuffers[i])
+            continue;
+
+         VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
+         uint64_t caddr = panvk_buffer_gpu_ptr(
+            cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0);
+
+         cs_move64_to(b, src, caddr);
+         cs_load32_to(b, val, src, 0);
+         cs_store32(b, val, dst, buf_idx * sizeof(uint32_t));
+      }
+
+      cs_flush_stores(b);
+   }
 
    state->xfb.pending_draw_count = 0;
    state->xfb.active = true;
@@ -109,16 +128,23 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 
    assert(state->xfb.active);
 
-   /* Writing the final byte offset back to a counter buffer needs the write
-    * position, which is now GPU-resident and counted in slots, so it lands
-    * with the resume work rather than here.
+   /* The write position is only final once CmdEndRendering has dispatched the
+    * captures this End closed, so the writeback cannot happen here. Record the
+    * targets and let cmd_flush_pending_xfb_captures() emit the copies - the
+    * same deferral the XFB query's availability uses.
     */
-   assert(counterBufferCount == 0 &&
-          "VK_EXT_transform_feedback: counter-buffer writeback is not yet "
-          "supported");
-   (void)firstCounterBuffer;
-   (void)pCounterBuffers;
-   (void)pCounterBufferOffsets;
+   for (uint32_t i = 0; i < counterBufferCount; i++) {
+      uint32_t buf_idx = firstCounterBuffer + i;
+
+      if (buf_idx >= MAX_XFB_BUFFERS || !pCounterBuffers[i])
+         continue;
+
+      VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
+
+      state->xfb.counter_buffers[buf_idx].present = true;
+      state->xfb.counter_buffers[buf_idx].dev_addr = panvk_buffer_gpu_ptr(
+         cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0);
+   }
 
    /* offsets_gpu deliberately survives here: End runs before CmdEndRendering,
     * which is where the captures this End closed are actually dispatched.
@@ -309,8 +335,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       descs[desc_count++] = (struct panlib_xfb_buffer_desc){
          .base = state->xfb.bufs[i].address,
          .push_uniform = pu,
-         .size_slots =
-            (uint32_t)(state->xfb.bufs[i].size / shader->xfb_strides[i]),
+         .size_bytes = (uint32_t)state->xfb.bufs[i].size,
          .stride = shader->xfb_strides[i],
       };
    }
@@ -430,6 +455,49 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
    }
 
    state->xfb.pending_draw_count = 0;
+
+   /* Deferred counter-buffer writeback, now that every capture has run and the
+    * write positions are final. They were last written by panlib_xfb_setup(),
+    * so the caches have to be cleaned before the command stream can read them
+    * - a barrier alone does not make kernel stores visible here.
+    */
+   if (state->xfb.offsets_gpu) {
+      struct cs_builder *b =
+         panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+      bool counter_writeback = false;
+
+      for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
+         counter_writeback |= state->xfb.counter_buffers[i].present;
+
+      if (counter_writeback) {
+         struct cs_index flush_id = cs_scratch_reg32(b, 4);
+         struct cs_index src = cs_scratch_reg64(b, 0);
+         struct cs_index dst = cs_scratch_reg64(b, 2);
+         struct cs_index val = cs_scratch_reg32(b, 5);
+
+         cs_move32_to(b, flush_id, 0);
+         cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                         MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                         cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
+         cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
+
+         cs_move64_to(b, src, state->xfb.offsets_gpu);
+
+         for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++) {
+            if (!state->xfb.counter_buffers[i].present)
+               continue;
+
+            cs_load32_to(b, val, src, i * sizeof(uint32_t));
+            cs_move64_to(b, dst, state->xfb.counter_buffers[i].dev_addr);
+            cs_store32(b, val, dst, 0);
+         }
+
+         cs_flush_stores(b);
+      }
+   }
+
+   for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
+      state->xfb.counter_buffers[i].present = false;
 
    /* Safe to release only now: End runs before CmdEndRendering, so the write
     * positions have to outlive it and survive until the captures that use

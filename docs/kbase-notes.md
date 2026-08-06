@@ -4814,3 +4814,37 @@ generated) and instanced queries (2/2), device healthy afterwards.
 Counter-buffer resume is now a small addition: `Begin` seeds the offsets from
 the counter buffer instead of zeroing them, and `End` writes them back — both
 plain copies, needing no new arithmetic.
+
+## Counter-buffer resume (2026-08-06, WORKING)
+
+`vkCmdBeginTransformFeedbackEXT` with `pCounterBuffers` now resumes from the
+byte offset the counter buffer holds, and the final position is written back
+at End. `.EXT_transform_feedback` still stays `false`.
+
+**One design change made it easy: the write position is now tracked in
+bytes, not capture slots.** A counter buffer holds a *byte* offset, so keeping
+the position in slots would have meant dividing by the stride to seed it and
+multiplying to write it back — neither of which the command stream can do on
+PAN_ARCH 10. In bytes, Begin and End are plain 32-bit copies and the only
+division moves into `panlib_xfb_setup()`, which is a shader and divides for
+free. It also simplified the address resolve from `base + offset * stride` to
+just `base + offset`.
+
+**End cannot do the writeback.** It runs *before* `CmdEndRendering`, where the
+captures it just closed are actually dispatched, so the final position does
+not exist yet. End records the target addresses and
+`cmd_flush_pending_xfb_captures()` emits the copies once every capture has
+run. This is the third instance of the same deferral in this feature — after
+the XFB query's availability and `offsets_gpu`'s lifetime — and is now the
+expected shape for anything End touches.
+
+The writeback copies are preceded by a `cs_flush_caches(CLEAN)`, because the
+positions were last written by the setup kernel and, as established above,
+barriers alone do not make kernel stores visible to the command stream.
+
+**Test**: `render_xfb_probe --resume` sizes the XFB buffer for 6 vertices and
+seeds the counter buffer with 48 bytes, so a 3-vertex draw must land in the
+*second* half. It checks three things: the first 48 bytes stay untouched
+poison (proving the capture honoured the counter buffer rather than starting
+at 0), the triangle appears at offset 48, and the counter buffer reads back
+96. All fifteen probe-mode combinations pass, device healthy.
