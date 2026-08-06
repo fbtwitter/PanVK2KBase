@@ -4668,22 +4668,61 @@ being a clean repeat of the base triangle is what proves it.
 All twelve probe-mode combinations pass, including the instanced XFB query
 (2 primitives written, 2 generated), device healthy afterwards.
 
-### Correction: the command stream can divide and multiply
+### CS arithmetic is arch-gated: almost none of it exists on PAN_ARCH 10
 
-An earlier note here reasoned that GPU-resident counts would need a new
-`libpan` CL kernel, on the assumption that the CS could only add and
-subtract. That was wrong. `src/panfrost/genxml/cs_builder.h` provides
-`cs_udiv32`, `cs_umul64`, `cs_umin32`, `cs_add32/64`, `cs_sub32/64` and the
-shifts — so capacity arithmetic can be done directly in the command stream,
-with no new kernel and no build-system changes. Combined with the flat grid,
-the remaining work is:
+**This took two wrong answers to pin down; the conclusion below is the
+measured one.** First guess was that the command stream could only add and
+subtract, so GPU-resident counts would need a `libpan` CL kernel. Then
+`cs_udiv32`, `cs_umul64`, `cs_add32/64`, `cs_sub32` and `cs_lshift_imm32`
+were found in `src/panfrost/genxml/cs_builder.h`, which looked like it made
+the whole thing easy. It does not — **every one of those is inside a
+`#if PAN_ARCH >= 13` block** (lines 1844–2096 of that header).
 
-1. a per-command-buffer GPU scratch holding one `u32` byte offset per XFB
-   buffer;
-2. `Begin` storing 0 into it, or loading the counter buffer value (resume);
-3. the dispatch computing `capacity = (size - offset) / stride`, clamping
-   `JOB_SIZE_X` with a single `cs_umin32`, and patching
-   `xfb.buffer_addrs[i]` into the push-uniform buffer as `base + offset`
-   (precedent: `panvk_vX_cmd_dispatch.c`'s indirect path already stores
-   `JOB_SIZE_*` into push uniforms at `shader_remapped_sysval_offset()`);
-4. `End` storing the offset back to the counter buffer.
+What the command stream can actually do on this device (Mali-G720,
+PAN_ARCH 10):
+
+| Available on PAN_ARCH 10 | PAN_ARCH >= 13 only |
+|---|---|
+| `cs_add_imm32` / `cs_add_imm64` (immediate operand only) | `cs_add32`, `cs_sub32`, `cs_add64` |
+| `cs_umin32` | `cs_udiv32`, `cs_umul64` |
+| `cs_and32` | `cs_lshift_imm32` |
+| `cs_load32_to` / `cs_store32` / `cs_move32_to` / `cs_move64_to` | |
+
+So there is **no register-register add, no subtract, no multiply and no
+divide** on arch 10. An implementation of the capacity clamp written against
+those ops compiles for v13/v14 and fails outright on v10/v12 — which is
+exactly how this was found.
+
+### The design that respects that constraint
+
+Do the arithmetic where arithmetic is cheap: **in the capture shader**. The
+command stream then only ever has to *copy* values, which it can do.
+
+1. Per-command-buffer GPU scratch, one `u32` write position per XFB buffer,
+   in capture slots.
+2. `Begin` seeds it: `cs_move32_to` 0, or `cs_load32_to` from the counter
+   buffer then `cs_store32` — no arithmetic either way. (A byte-valued
+   counter buffer would need a divide to convert to slots, so the counter
+   buffer should be read as-is and the slot conversion done shader-side too.)
+3. Add a `xfb.slot_offset[i]` sysval. Before the dispatch, the CS copies the
+   scratch value into the already-uploaded push-uniform buffer at
+   `shader_remapped_sysval_offset()` — a plain `cs_load32_to` +
+   `cs_store32`, no arithmetic. (Precedent for patching push uniforms from
+   the CS: `panvk_vX_cmd_dispatch.c`'s indirect path.)
+4. The shader computes its own address as
+   `buffer_addr + (slot_offset + slot) * stride` and skips the store when the
+   primitive would not fit, using a host-constant `xfb.buffer_size[i]`
+   sysval. Bounds safety stops depending on host knowledge entirely, which is
+   what makes resume and indirect draws tractable.
+5. Advance with `cs_add_imm32` — the *generated* slot count is a host
+   constant, so an immediate operand suffices.
+
+The remaining wrinkle is the XFB query's "primitives written" and the
+counter-buffer writeback: once the shader decides what fits, the driver no
+longer knows the count. Either the shader maintains it atomically, or the
+offset advances by the generated count and over-reports in the overflow case
+only. Neither is free, and this is the part to design carefully rather than
+assume.
+
+`.EXT_transform_feedback` remains `false` throughout; none of this is
+reachable by applications yet.

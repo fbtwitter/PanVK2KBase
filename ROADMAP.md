@@ -1819,15 +1819,28 @@ Tools worth knowing about before touching any of this:
       decomposition is degenerate (`instance` always 0, `vertex == slot`),
       so a completely broken one would still have passed all eight modes.
       All twelve mode combinations now pass, device healthy.
-      **Correction to an earlier note**: GPU-resident counts do *not* need
-      a new libpan CL kernel. `cs_builder.h` has `cs_udiv32`, `cs_umul64`
-      and `cs_umin32`, so capacity arithmetic fits directly in the command
-      stream. What remains is a per-cmdbuf GPU scratch of byte offsets,
-      Begin initialising it (0 or from the counter buffer), the dispatch
-      clamping `JOB_SIZE_X` via `cs_umin32` and patching
-      `xfb.buffer_addrs[i]` into the push uniforms as `base + offset`
-      (precedent in `panvk_vX_cmd_dispatch.c`'s indirect path), and End
-      writing the offset back.
+      **CS arithmetic is arch-gated — measured, after two wrong guesses.**
+      `cs_udiv32`, `cs_umul64`, `cs_add32`, `cs_sub32`, `cs_add64` and
+      `cs_lshift_imm32` all exist in `cs_builder.h` but sit inside a
+      `#if PAN_ARCH >= 13` block (lines 1844-2096). On this device
+      (Mali-G720, PAN_ARCH 10) the command stream has only
+      `cs_add_imm32`/`cs_add_imm64` (immediate operand), `cs_umin32`,
+      `cs_and32` and load/store/move — **no register-register add,
+      subtract, multiply or divide**. A capacity clamp written against
+      those ops builds for v13/v14 and fails outright on v10/v12, which is
+      how this was found; that attempt was reverted rather than left
+      half-applied. The design that fits the constraint does the
+      arithmetic in the capture shader (where it is cheap) and leaves the
+      command stream only *copying* values: a GPU scratch write position
+      per buffer, a new `xfb.slot_offset[i]` sysval copied into the
+      already-uploaded push uniforms with a plain load32/store32
+      (precedent in `panvk_vX_cmd_dispatch.c`'s indirect path), the shader
+      computing `base + (slot_offset + slot) * stride` and skipping stores
+      that would not fit, and `cs_add_imm32` advancing by the host-known
+      generated count. The open question is the query's "primitives
+      written" and the counter writeback, since the driver no longer knows
+      the count once the shader decides what fits — see
+      `docs/kbase-notes.md`.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
       restart with XFB active, indirect draws,
