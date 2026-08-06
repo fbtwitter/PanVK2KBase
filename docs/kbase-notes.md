@@ -4311,7 +4311,7 @@ the bottom. Left as an open question — the empirical fix (declare
 exact mechanism, so it wasn't worth blocking on fully explaining GL's
 side.
 
-### What's left: vertex/instance ID delivery is wrong for a COMPUTE-declared job
+### The vertex-ID fix: implemented, verified on hardware, NOT sufficient (2026-08-06)
 
 With the crash fixed, the capture runs but writes nothing —
 `tests/render_xfb_probe`'s XFB buffer readback comes back as the raw,
@@ -4325,22 +4325,296 @@ and `bi_vertex_id()` (`bifrost_compile.c:65-68`) is
 `bi_preload(b, BI_PRELOAD_VERTEX_ID)` — a register the GPU firmware
 preloads automatically, but only for jobs it recognizes as running
 through the fixed-function VERTEX/IDVS path. A job declared `COMPUTE`
-gets a different value preloaded into that same physical slot (some
-workgroup/invocation-index concept, not a per-vertex index). Since
-`nir_lower_xfb_to_stores`'s generated store address is
-`(instance_id * num_vertices + raw_vertex_id) * stride + offset`, a
-garbage `raw_vertex_id` produces a wrong-but-valid-looking address —
-explaining a silent no-op (or a write somewhere harmless) rather than
-another fault. The same mechanism likely also breaks attribute fetch,
-since Mali's fixed-function attribute unit indexes by vertex ID too.
+gets a different value preloaded into that same physical slot. The same
+applies to `nir_intrinsic_load_vertex_id`/`load_instance_id` (used by
+attribute fetch on PAN_ARCH >= 9, see `panvk_lower_load_vs_input`) and
+`nir_lower_xfb_to_stores`'s generated store address.
 
-**This is real, additional, scoped engineering work, not a quick
-register fix**: the XFB-capture variant needs `raw_vertex_id`/
-`instance_id` sourced from whatever preload registers a `COMPUTE` job
-actually receives its invocation index in (Bifrost/Valhall's compute path
-has its own `BI_PRELOAD_*` constants for local/global invocation ID —
-not traced yet), via a NIR lowering pass specific to this variant that
-overrides `panvk_lower_sysvals()`'s normal (VERTEX-hardware-only)
-handling of `nir_intrinsic_load_raw_vertex_id`/`load_instance_id`. Until
-that lands, capture continues to silently write nothing.
-`.EXT_transform_feedback` stays `false`.
+**Fix implemented**: a new NIR pass, `panvk_lower_xfb_compute_dispatch_ids`
+(`panvk_vX_shader.c`), replaces all three intrinsics with
+`nir_channel(b, nir_load_workgroup_id(b), component)` — the XFB capture
+dispatch (`dispatch_one_xfb_capture()`, `csf/panvk_vX_cmd_xfb.c`) fixes
+`WG_SIZE` at 1×1×1 specifically so each workgroup is exactly one
+invocation, making `workgroup_id.x`/`.y` directly equal the vertex/
+instance index the `JOB_SIZE_X/Y` grid represents — no further math
+needed. Wired into `panvk_compile_nir()` via a new `lower_compute_dispatch_ids`
+parameter, applied only to the XFB variant, running after both
+`nir_lower_xfb_to_stores` and `panvk_lower_load_vs_input` have generated
+the intrinsics being replaced.
+
+This fix is real and necessary, but on its own it changed nothing — the
+capture buffer still read back as untouched `0x11` poison. That was
+because of a fifth bug, below: the shader had never executed at all, so
+no amount of fixing what it *computed* could matter.
+
+### THE root cause: the XFB variant's binary was never uploaded (2026-08-06, SOLVED)
+
+`panvk_shader_upload()` is the only thing that uploads a variant's
+compiled binary into `dev->mempools.exec` and records the result in
+`variant->code_mem`. It is driven by `panvk_shader_foreach_variant()`,
+which walks `shader->variants[]` — and `xfb_variant` is deliberately
+**not** in that array (it's a separate `calloc`'d allocation, see
+`panvk_shader.h`). So the XFB variant's code was never uploaded,
+`code_mem` stayed `{0}`, and
+`panvk_shader_variant_get_dev_addr(xfb_variant)` returned **0** —
+meaning the `SHADER_PROGRAM` descriptor built in
+`dispatch_one_xfb_capture()` set `cfg.binary = 0`.
+
+The GPU was faithfully dispatching a shader with no code. That produces
+exactly what was observed: no writes, and no fault either.
+
+**Fix** (`panvk_vX_shader.c`, right after the `panvk_shader_foreach_variant`
+upload loop): upload the XFB variant's binary explicitly. Deliberately
+*not* by calling `panvk_shader_upload()` — that branches on
+`info.stage`, still `MESA_SHADER_VERTEX` here, and would also build
+IDVS-shaped `MALI_SHADER_STAGE_VERTEX` SPDs that must never be used, since
+the capture dispatch builds its own `MALI_SHADER_STAGE_COMPUTE`
+descriptor. `code_mem` is all it needs:
+
+```c
+if (shader->xfb_variant && shader->xfb_variant->bin_size) {
+   shader->xfb_variant->code_mem = panvk_pool_upload_aligned(
+      &dev->mempools.exec, shader->xfb_variant->bin_ptr,
+      shader->xfb_variant->bin_size, 128);
+   ...
+}
+```
+
+**How it was found.** The three earlier fixes each *looked* insufficient
+for the same reason — the shader had never run — so bisecting what the
+shader computed could never converge. What broke the deadlock was
+checking, in order, each link in the chain rather than the shader logic:
+
+1. `BIFROST_MESA_DEBUG=shaders` dumped the compiled XFB variant. It was
+   **correct**: a full `STORE.i128` of the vec4, base address read from
+   FAU word `u0`, `num_vertices` from `u1`, attribute fetch via
+   `LD_ATTR_IMM`. (Worth noting the dump contains several shaders —
+   the XFB variant is the *first* `MESA_SHADER_VERTEX` compile; the
+   `STORE.i32` near the end of the dump belongs to an unrelated internal
+   blit kernel.)
+2. Host-side instrumentation at dispatch time showed
+   `FAU[0] = 0x8003ff5aa000` — exactly the XFB buffer's device address —
+   and `FAU[1] = 3`, plus a valid SPD, TSD and `res_table`. So everything
+   the driver programmed was right, killing the FAU/sysval hypothesis
+   outright.
+3. CS-level marker stores (`cs_store32`, i.e. command-stream stores, *not*
+   shader stores) bracketing `RUN_COMPUTE` both landed in the buffer,
+   proving the COMPUTE command stream itself executed and reached the
+   dispatch.
+
+That left only the shader binary itself — and printing `cfg.binary`
+showed `0`. After the fix it reads `0x800000001100` and the probe passes.
+
+**Verified working end-to-end** on the real Poco X8 Pro (Mali-G720, kbase
+r49p1): `tests/render_xfb_probe` captures all three vertices exactly
+(`-0.8,-0.8,0,1` / `0.8,-0.8,0,1` / `-0.8,0.8,0,1`), 0 failures, render
+unaffected (190/66/0 pixel split, matching `render_vbo_probe` on the same
+geometry), device healthy afterwards per `driver_compute_probe --fill`.
+
+**`.EXT_transform_feedback` is still left `false`.** Phase 1 implements
+only non-indexed, non-indirect `vkCmdDraw` and asserts on everything else
+(indexed and indirect draws, counter-buffer resume, XFB queries), so
+advertising the extension to real applications would convert
+"unsupported" into "assert/abort". Turning it on is a deliberate
+follow-up decision once those paths exist — not an automatic consequence
+of this probe passing.
+
+## VK_EXT_transform_feedback phase 2, step 1: indexed draws (2026-08-06, WORKING)
+
+`vkCmdDrawIndexed` now captures. This is the single most important gap
+for real applications — almost everything draws indexed, and phase 1
+simply refused to queue those draws.
+
+**The key structural observation** is that the XFB store slot and the
+vertex-attribute-fetch index are *different things* for an indexed draw:
+
+| | value needed | intrinsic it arrives as |
+|---|---|---|
+| XFB store slot | sequential invocation number (draw order) | `nir_load_raw_vertex_id` (from `nir_lower_xfb_to_stores`) |
+| attribute fetch | `index_buffer[firstIndex + i]` | `nir_load_vertex_id` (from `panvk_lower_load_vs_input`) |
+
+They conveniently already arrive as two *distinct* NIR intrinsics, so no
+disambiguation machinery was needed: `raw_vertex_id` keeps mapping to
+`workgroup_id.x`, and only `load_vertex_id` became index-buffer aware
+(`panvk_lower_xfb_vertex_id()` / `build_xfb_attrib_vertex_id()`).
+
+`vertexOffset` needs no shader work at all — `GLOBAL_ATTRIBUTE_OFFSET`
+already biases hardware attribute fetch, so the capture dispatch just
+programs it with `vertexOffset` for indexed draws instead of
+`firstVertex`.
+
+Because one compiled variant serves both indexed and non-indexed draws,
+the index fetch is a genuine **runtime branch** on the new
+`xfb.index_buffer` sysval (0 ⇒ non-indexed), not a compile-time choice. A
+`bcsel` would be wrong: it evaluates both sides, and the index load must
+not happen at all when there is no index buffer. The index *width*
+(`VK_INDEX_TYPE_UINT32`/`UINT16`/`UINT8`) is likewise a runtime branch
+rather than an over-read of a wider load, since the last index of a
+tightly sized buffer can sit right at the end of a mapping.
+
+Two implementation notes worth keeping:
+
+- The lowering builds the value **once at the top of `main`**, then
+  replaces every `load_vertex_id` with it. Introducing control flow at an
+  arbitrary cursor from inside an `nir_shader_intrinsics_pass` callback —
+  while that pass is walking the very block being split — is not safe.
+- Each `nir_if` arm needs its **own** `nir_def *`. `nir_if_phi()` takes
+  the def produced by each side, so reusing a single C variable across
+  arms silently feeds it the same (last-assigned) value twice. This was a
+  real bug caught during bring-up.
+
+**Test**: `render_xfb_probe --indexed` (phase 2 mode). It draws the same
+triangle through indices `{2, 0, 1}` — deliberately a *cyclic rotation*,
+so the winding is unchanged and the render result must still be the exact
+190/66/0 split (any render difference is therefore a genuine regression,
+not an artefact of reordering), while the *capture* order must come out
+permuted. That permutation is the whole point: a shader that ignored the
+index buffer and used its sequential invocation number would produce the
+unpermuted order and pass a weaker test. The probe calls that specific
+failure mode out by name if it sees it.
+
+**Verified on the real Poco X8 Pro**: both modes pass, 0 failures.
+Non-indexed captures `(A, B, C)`, indexed captures the permuted
+`(C, A, B)`, render unchanged in both, device healthy afterwards.
+
+Still out of scope, and still asserted on: primitive restart with XFB
+active (it removes vertices from the stream, so the capture would need a
+GPU-side compacted count rather than a host-known one), indirect draws,
+`vkCmdDrawIndirectByteCountEXT`, counter-buffer resume, and XFB queries.
+
+## VK_EXT_transform_feedback: out-of-bounds capture writes (2026-08-06, FIXED)
+
+**This was a GPU memory-safety bug, found while scoping the phase-2
+"cheap half" rather than by a failing test.** The capture dispatched
+`vertex_count * instance_count` invocations that each stored `stride`
+bytes at `base + slot * stride`, and *nothing anywhere checked
+`state->xfb.bufs[i].size`*. Binding a 48-byte XFB buffer and drawing 100
+vertices wrote ~1600 bytes — real out-of-bounds GPU writes, not merely
+wrong data. Phase 1's plan had called for host-side bounds checking at
+record time; it was never actually implemented.
+
+**Fix** (`dispatch_one_xfb_capture()`): compute the capture capacity as
+the tightest constraint across every buffer the shader writes, measured
+from each buffer's current offset, and clamp the dispatch grid to it.
+
+The clamp is deliberately *conservative in one direction*: it drops a
+trailing partial instance rather than splitting it. The store slot is
+`instance * num_vertices + vertex`, so leaving `vertex_count` (and hence
+the `num_vertices` sysval) intact keeps every surviving slot at exactly
+the address it would otherwise have had; expressing "N whole instances
+plus part of one more" would need a second dispatch with a different
+origin. When not even one instance fits, it captures a prefix of instance
+0, where the slot index reduces to just the vertex index. Never writes
+out of bounds, never writes wrong data — it may just capture slightly
+less than a spec-exact implementation would in the partial-instance case.
+
+**Test**: `render_xfb_probe --overflow` allocates the full 48-byte buffer
+and poisons it, but binds only 32 bytes via `pSizes` while still drawing
+three vertices. The captured prefix must be correct *and* bytes 32..47
+must still be poison. Because the "out of bounds" region is inside the
+probe's own allocation, this is observable without risking a GPU fault or
+a wedged device.
+
+**Confirmed to actually detect the bug**: run against the pre-clamp
+driver it fails with the tail overwritten by vertex 2's data
+(`OUT-OF-BOUNDS WRITE: bytes past the bound 32-byte range were
+modified`); against the clamped driver the tail is intact. Both the
+indexed and non-indexed variants pass, all four probe modes are green,
+device healthy afterwards.
+
+This same capacity computation is what
+`VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` will need: the difference
+between primitives *generated* (the unclamped count) and primitives
+*written* (the clamped count) is exactly what that query reports.
+
+### Why counter-buffer resume is not part of the "cheap half" after all
+
+Resume was initially grouped with XFB queries as cheap host-side work.
+Tracing it through says otherwise: the capture's store address comes from
+the `xfb.buffer_addrs[]` sysval, baked into the push-uniform buffer on
+the host at record time. A resumed offset lives in GPU memory, so it
+cannot be baked in — the command stream would have to patch the
+push-uniform buffer before the dispatch (there is precedent for exactly
+that in `panvk_vX_cmd_dispatch.c`'s indirect path, which stores
+`JOB_SIZE_*` registers into push uniforms at
+`shader_remapped_sysval_offset()`).
+
+That is doable, but it cascades: once the starting offset is GPU-resident,
+the bounds clamp above and `CmdEndTransformFeedbackEXT`'s counter
+writeback both stop being host-computable too, and all three have to move
+into the command stream together. That makes resume structurally the same
+kind of work as indirect draws, not a cheap host-side addition. XFB
+queries remain genuinely cheap in this scope, since their counts are
+host-known.
+
+## VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT (2026-08-06, WORKING)
+
+Two `uint64` reports per query: `[0]` primitives written, `[1]` primitives
+generated. `transformFeedbackQueries` is now advertised as `true`.
+
+Upstream had already left the hook — `CmdBeginQueryIndexedEXT` /
+`CmdEndQueryIndexedEXT` exist with a `/* TODO: transform feedback */`
+next to their `assert(index == 0)`, and `VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT`
+provided a complete CSF-side pattern to mirror (zero the report at Begin,
+read-modify-write it per draw, flush caches then signal availability at
+End). The new type slots into the same three places: `reports_per_query`
+in `panvk_vX_query_pool.c`, the CPU readback switch, and the
+begin/end/reset switches in `csf/panvk_vX_cmd_query.c`.
+
+The `index == 0` assert stays, but is no longer a TODO: without a geometry
+shader only stream 0 can exist, and `geometryStreams` is reported `false`,
+so a nonzero index is invalid usage rather than an unimplemented case.
+
+### Three things this pulled in
+
+**1. A topology restriction — a real correctness fix.** The capture emits
+one captured vertex per *input* vertex, which only matches transform
+feedback semantics for LIST topologies. A triangle strip of N vertices
+assembles N−2 triangles and must capture 3·(N−2) vertices, duplicating
+shared vertices; this implementation would capture N. That was silently
+wrong before. `xfb_verts_per_prim()` now rejects strips and fans at record
+time. Restricting to lists also makes the primitive count a plain divide
+by 1/2/3, which keeps gallium's `u_prim.h` out of the CSF path entirely.
+
+**2. The bounds clamp became primitive-granular.** Transform feedback
+drops whole primitives rather than truncating them, so the vertex-level
+clamp added earlier was not quite right: a 32-byte bound range with a
+48-byte triangle would have captured two of three vertices. With
+`verts_per_prim` now available at dispatch, the capacity is rounded down
+to whole primitives, so that case correctly captures nothing. This also
+keeps the query self-consistent — "written" is always a whole number of
+primitives that really were captured.
+
+**3. Availability ordering.** The capture, and therefore the counter
+accumulation, is deferred to `CmdEndRendering`. If an application ends the
+query *before* the render pass ends, writing availability at EndQuery time
+would publish the query before its counts landed. `panvk_cmd_end_xfb_query()`
+therefore defers the availability write to the flush whenever captures are
+still queued, via `xfb_query.deferred_syncobj`.
+
+### A bug the test caught
+
+First run of `--query --overflow` reported `written = 0` (correct) but
+`generated = 0` (should be 1). Cause: when the clamp reduces the capture
+to nothing, `dispatch_one_xfb_capture()` early-returns — *before* the
+query accumulation. But a primitive that does not fit is still
+**generated**; that divergence is the entire point of the query. Fixed by
+hoisting the accumulation into `accumulate_xfb_query()` and calling it on
+the zero-capture path too.
+
+### Tests
+
+`render_xfb_probe --query`, composable with `--indexed` and `--overflow`:
+
+| mode | written | generated |
+|---|---|---|
+| `--query` | 1 | 1 |
+| `--query --indexed` | 1 | 1 |
+| `--query --overflow` | 0 | 1 |
+
+The overflow row is the interesting one — it is the only case where the
+two counters legitimately disagree, and the probe explicitly names the
+failure if they come back equal.
+
+All eight probe-mode combinations pass on the real Poco X8 Pro with 0
+failures, render unaffected in every one, device healthy afterwards.

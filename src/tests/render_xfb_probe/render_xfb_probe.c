@@ -111,6 +111,46 @@ static const float EXPECTED_XFB[3][4] = {
    {-0.8f, 0.8f, 0.0f, 1.0f},
 };
 
+/* --indexed mode (phase 2): the same three vertices drawn through an index
+ * buffer that permutes them.
+ *
+ * {2, 0, 1} is chosen deliberately. It is a cyclic rotation, so the triangle's
+ * winding is unchanged and the render result must still be the exact same
+ * 190/66/0 pixel split - meaning any render difference is a real regression
+ * rather than an artefact of the reordering. The *capture* order, though, does
+ * change: it must come out permuted. That is what distinguishes a correct
+ * index-buffer fetch from a shader that just used its sequential invocation
+ * number, which would produce the unpermuted VERTICES order and pass a weaker
+ * test.
+ */
+static const uint16_t INDICES[3] = {2, 0, 1};
+
+static const float EXPECTED_XFB_INDEXED[3][4] = {
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* VERTICES[2] */
+   {-0.8f, -0.8f, 0.0f, 1.0f}, /* VERTICES[0] */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* VERTICES[1] */
+};
+
+static bool indexed_mode;
+
+/* --overflow mode: bind less XFB space than the draw needs.
+ *
+ * The buffer is still *allocated* at the full 48 bytes and poisoned, but only
+ * OVERFLOW_BOUND_SIZE of it is bound via pSizes. Transform feedback discards
+ * whole primitives rather than truncating them, and the draw is a single
+ * triangle needing all 48 bytes, so the correct result is that *nothing* is
+ * captured and the entire buffer stays poison.
+ *
+ * That makes this both an out-of-bounds check (before the bounds clamp
+ * existed, the capture wrote past the bound range for real) and a
+ * partial-primitive check.
+ */
+static bool overflow_mode;
+#define OVERFLOW_BOUND_SIZE 32
+
+/* --query mode: VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT. */
+static bool query_mode;
+
 static int failures;
 
 static void
@@ -151,10 +191,26 @@ main(int argc, char **argv)
               "\n"
               "Run tests/render_vbo_probe first if you have not already.\n"
               "\n"
-              "If you really mean it: %s <path-to-.so> --i-know-it-hangs\n",
+              "If you really mean it: %s <path-to-.so> --i-know-it-hangs\n"
+              "Add --indexed to drive the capture from an index buffer\n"
+              "(phase 2) instead of a non-indexed vkCmdDraw.\n",
               argv[0]);
       return 2;
    }
+
+   for (int i = 3; i < argc; i++) {
+      if (strcmp(argv[i], "--indexed") == 0)
+         indexed_mode = true;
+      else if (strcmp(argv[i], "--overflow") == 0)
+         overflow_mode = true;
+      else if (strcmp(argv[i], "--query") == 0)
+         query_mode = true;
+   }
+   printf("mode: %s%s%s\n",
+          indexed_mode ? "indexed (vkCmdDrawIndexed)"
+                       : "non-indexed (vkCmdDraw)",
+          overflow_mode ? " + overflow (XFB buffer bound too small)" : "",
+          query_mode ? " + xfb query" : "");
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -291,8 +347,19 @@ main(int argc, char **argv)
    PFN_vkCmdBeginRendering cmd_begin_rendering = GDPA(vkCmdBeginRendering);
    PFN_vkCmdEndRendering cmd_end_rendering = GDPA(vkCmdEndRendering);
    PFN_vkCmdBindPipeline cmd_bind_pipeline = GDPA(vkCmdBindPipeline);
+   PFN_vkCreateQueryPool create_query_pool = GDPA(vkCreateQueryPool);
+   PFN_vkDestroyQueryPool destroy_query_pool = GDPA(vkDestroyQueryPool);
+   PFN_vkCmdResetQueryPool cmd_reset_query_pool = GDPA(vkCmdResetQueryPool);
+   PFN_vkGetQueryPoolResults get_query_results = GDPA(vkGetQueryPoolResults);
+   PFN_vkCmdBeginQueryIndexedEXT cmd_begin_query_indexed =
+      GDPA(vkCmdBeginQueryIndexedEXT);
+   PFN_vkCmdEndQueryIndexedEXT cmd_end_query_indexed =
+      GDPA(vkCmdEndQueryIndexedEXT);
+
    PFN_vkCmdBindVertexBuffers cmd_bind_vbos = GDPA(vkCmdBindVertexBuffers);
+   PFN_vkCmdBindIndexBuffer cmd_bind_ibo = GDPA(vkCmdBindIndexBuffer);
    PFN_vkCmdDraw cmd_draw = GDPA(vkCmdDraw);
+   PFN_vkCmdDrawIndexed cmd_draw_indexed = GDPA(vkCmdDrawIndexed);
    PFN_vkCmdCopyImageToBuffer cmd_copy_img_to_buf =
       GDPA(vkCmdCopyImageToBuffer);
    PFN_vkQueueSubmit queue_submit = GDPA(vkQueueSubmit);
@@ -361,6 +428,51 @@ main(int argc, char **argv)
       return 1;
    memcpy(vbo_mapped, VERTICES, sizeof(VERTICES));
    printf("  wrote %zu bytes of vertex data (3 x vec2)\n", sizeof(VERTICES));
+
+   /* ---------------------------------------------------------- index buffer */
+   VkBuffer ibo = VK_NULL_HANDLE;
+   VkDeviceMemory ibo_memory = VK_NULL_HANDLE;
+   if (indexed_mode) {
+      printf("\n=== index buffer: 3 x uint16 {2, 0, 1}, host-visible ===\n");
+
+      VkBufferCreateInfo ibo_bci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = sizeof(INDICES),
+         .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      r = create_buffer(device, &ibo_bci, NULL, &ibo);
+      check(r == VK_SUCCESS, "vkCreateBuffer (index buffer)");
+
+      VkMemoryRequirements ibo_reqs;
+      get_buf_reqs(device, ibo, &ibo_reqs);
+
+      uint32_t ibo_type =
+         find_memory_type(&mem_props, ibo_reqs.memoryTypeBits, host_want);
+      check(ibo_type != UINT32_MAX, "host-visible memory type found for IBO");
+      if (ibo_type == UINT32_MAX)
+         return 1;
+
+      VkMemoryAllocateInfo ibo_mai = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = ibo_reqs.size,
+         .memoryTypeIndex = ibo_type,
+      };
+      r = alloc_mem(device, &ibo_mai, NULL, &ibo_memory);
+      check(r == VK_SUCCESS, "vkAllocateMemory (IBO)");
+
+      r = bind_buf_mem(device, ibo, ibo_memory, 0);
+      check(r == VK_SUCCESS, "vkBindBufferMemory (IBO)");
+
+      void *ibo_mapped = NULL;
+      r = map_mem(device, ibo_memory, 0, VK_WHOLE_SIZE, 0, &ibo_mapped);
+      check(r == VK_SUCCESS, "vkMapMemory (IBO)");
+      if (r != VK_SUCCESS)
+         return 1;
+      memcpy(ibo_mapped, INDICES, sizeof(INDICES));
+      printf("  wrote indices {2, 0, 1} - a cyclic rotation, so the render\n"
+             "  result must be unchanged while the capture order permutes\n");
+   }
 
    /* ------------------------------------------------------------ XFB buffer */
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
@@ -705,6 +817,26 @@ main(int argc, char **argv)
       .pColorAttachments = &color_attachment,
    };
 
+   /* The XFB query brackets the render pass: reset outside it (resets are not
+    * allowed inside), begin before the draw, end after EndRendering so the
+    * deferred capture has been flushed and counted.
+    */
+   VkQueryPool query_pool = VK_NULL_HANDLE;
+   if (query_mode) {
+      VkQueryPoolCreateInfo qpci = {
+         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+         .queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT,
+         .queryCount = 1,
+      };
+      r = create_query_pool(device, &qpci, NULL, &query_pool);
+      check(r == VK_SUCCESS, "vkCreateQueryPool (XFB stream)");
+      if (r != VK_SUCCESS)
+         return 1;
+
+      cmd_reset_query_pool(cmdbuf, query_pool, 0, 1);
+      printf("  vkCmdResetQueryPool recorded\n");
+   }
+
    cmd_begin_rendering(cmdbuf, &rendering_info);
    cmd_bind_pipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -713,19 +845,45 @@ main(int argc, char **argv)
    printf("  vkCmdBindVertexBuffers recorded\n");
 
    VkDeviceSize xfb_offset = 0;
-   cmd_bind_xfb_bufs(cmdbuf, 0, 1, &xfb_buf, &xfb_offset, &xfb_size);
-   printf("  vkCmdBindTransformFeedbackBuffersEXT recorded\n");
+   VkDeviceSize xfb_bound_size =
+      overflow_mode ? (VkDeviceSize)OVERFLOW_BOUND_SIZE : xfb_size;
+   cmd_bind_xfb_bufs(cmdbuf, 0, 1, &xfb_buf, &xfb_offset, &xfb_bound_size);
+   printf("  vkCmdBindTransformFeedbackBuffersEXT recorded (%llu bytes bound "
+          "of %llu allocated)\n",
+          (unsigned long long)xfb_bound_size, (unsigned long long)xfb_size);
+
+   if (query_mode) {
+      cmd_begin_query_indexed(cmdbuf, query_pool, 0, 0, 0);
+      printf("  vkCmdBeginQueryIndexedEXT recorded (stream 0)\n");
+   }
 
    cmd_begin_xfb(cmdbuf, 0, 0, NULL, NULL);
    printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
 
-   cmd_draw(cmdbuf, 3, 1, 0, 0);
-   printf("  vkCmdDraw(3, 1, 0, 0) recorded\n");
+   if (indexed_mode) {
+      cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
+      printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
+      cmd_draw_indexed(cmdbuf, 3, 1, 0, 0, 0);
+      printf("  vkCmdDrawIndexed(3, 1, 0, 0, 0) recorded\n");
+   } else {
+      cmd_draw(cmdbuf, 3, 1, 0, 0);
+      printf("  vkCmdDraw(3, 1, 0, 0) recorded\n");
+   }
 
    cmd_end_xfb(cmdbuf, 0, 0, NULL, NULL);
    printf("  vkCmdEndTransformFeedbackEXT recorded\n");
 
    cmd_end_rendering(cmdbuf);
+
+   if (query_mode) {
+      /* Deliberately after EndRendering: the capture dispatch (and therefore
+       * the counter accumulation) is deferred to there. Ending the query
+       * before it exercises the driver's deferred-availability path instead,
+       * which is covered by --query-inside.
+       */
+      cmd_end_query_indexed(cmdbuf, query_pool, 0, 0);
+      printf("  vkCmdEndQueryIndexedEXT recorded\n");
+   }
 
    VkImageMemoryBarrier to_transfer_src = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -835,21 +993,100 @@ main(int argc, char **argv)
          printf("%02x", raw[i]);
       printf("\n");
 
+      const float(*expected)[4] =
+         indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
+
+      if (overflow_mode) {
+         /* One triangle needs all 48 bytes but only 32 are bound. Transform
+          * feedback drops whole primitives rather than truncating them, so
+          * nothing at all may be captured - and in particular nothing past
+          * the bound range, which is memory the driver was never given
+          * permission to write.
+          */
+         bool tail_untouched = true;
+         for (size_t i = OVERFLOW_BOUND_SIZE; i < sizeof(EXPECTED_XFB); i++)
+            tail_untouched = tail_untouched && raw[i] == 0x11;
+
+         check(tail_untouched,
+               "no write past the bound XFB range (poison tail intact)");
+         if (!tail_untouched)
+            printf("  OUT-OF-BOUNDS WRITE: bytes past the bound %d-byte range "
+                   "were modified\n",
+                   OVERFLOW_BOUND_SIZE);
+
+         bool nothing_captured = true;
+         for (size_t i = 0; i < sizeof(EXPECTED_XFB); i++)
+            nothing_captured = nothing_captured && raw[i] == 0x11;
+
+         check(nothing_captured,
+               "primitive that did not fit was dropped whole, not truncated");
+
+         goto xfb_done;
+      }
+
       bool xfb_ok = true;
       for (int v = 0; v < 3; v++) {
          bool vertex_ok =
-            memcmp(captured[v], EXPECTED_XFB[v], sizeof(captured[v])) == 0;
+            memcmp(captured[v], expected[v], sizeof(captured[v])) == 0;
          printf("  vertex[%d] captured = (%.3f, %.3f, %.3f, %.3f) expected "
                 "= (%.3f, %.3f, %.3f, %.3f) %s\n",
                 v, captured[v][0], captured[v][1], captured[v][2],
-                captured[v][3], EXPECTED_XFB[v][0], EXPECTED_XFB[v][1],
-                EXPECTED_XFB[v][2], EXPECTED_XFB[v][3],
-                vertex_ok ? "ok" : "MISMATCH");
+                captured[v][3], expected[v][0], expected[v][1], expected[v][2],
+                expected[v][3], vertex_ok ? "ok" : "MISMATCH");
          xfb_ok = xfb_ok && vertex_ok;
       }
       check(xfb_ok, "all 3 vertices' XFB-captured positions match exactly");
+
+      /* In indexed mode, capturing the *unpermuted* order is the specific
+       * failure mode of a shader that ignored the index buffer and used its
+       * sequential invocation number - call that out rather than leaving it
+       * as a generic mismatch.
+       */
+      if (indexed_mode && !xfb_ok &&
+          memcmp(captured, EXPECTED_XFB, sizeof(captured)) == 0) {
+         printf("  NOTE: captured data is the UNPERMUTED vertex order - the\n"
+                "  capture shader ignored the index buffer and used its\n"
+                "  sequential invocation number as the attribute index.\n");
+      }
+
+   xfb_done:
+      if (query_mode) {
+         printf("\n=== readback: XFB stream query ===\n");
+
+         uint64_t results[2] = {UINT64_MAX, UINT64_MAX};
+         VkResult qr = get_query_results(device, query_pool, 0, 1,
+                                         sizeof(results), results,
+                                         sizeof(uint64_t),
+                                         VK_QUERY_RESULT_64_BIT |
+                                            VK_QUERY_RESULT_WAIT_BIT);
+         check(qr == VK_SUCCESS, "vkGetQueryPoolResults");
+
+         /* One triangle drawn. It is captured unless the bound XFB range is
+          * too small for the whole primitive, which is exactly the --overflow
+          * case - so that is where written and generated must disagree.
+          */
+         const uint64_t want_generated = 1;
+         const uint64_t want_written = overflow_mode ? 0 : 1;
+
+         printf("  primitives written   = %llu (expected %llu)\n",
+                (unsigned long long)results[0],
+                (unsigned long long)want_written);
+         printf("  primitives generated = %llu (expected %llu)\n",
+                (unsigned long long)results[1],
+                (unsigned long long)want_generated);
+
+         check(results[0] == want_written, "XFB query: primitives written");
+         check(results[1] == want_generated,
+               "XFB query: primitives generated");
+
+         if (overflow_mode && results[0] == results[1])
+            printf("  NOTE: written == generated in the overflow case - the\n"
+                   "  driver is not accounting for the dropped primitive.\n");
+      }
    }
 
+   if (query_pool != VK_NULL_HANDLE)
+      destroy_query_pool(device, query_pool, NULL);
    destroy_fence(device, fence, NULL);
    destroy_pool(device, pool, NULL);
    destroy_buffer(device, readback, NULL);
@@ -865,11 +1102,25 @@ main(int argc, char **argv)
    free_mem(device, xfb_memory, NULL);
    destroy_buffer(device, vbo, NULL);
    free_mem(device, vbo_memory, NULL);
+   if (indexed_mode) {
+      destroy_buffer(device, ibo, NULL);
+      free_mem(device, ibo_memory, NULL);
+   }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0)
+   if (failures == 0 && overflow_mode)
+      printf("\n=> VK_EXT_transform_feedback bounds clamping works:\n"
+             "   the capture filled the bound range and wrote nothing past\n"
+             "   it, so an undersized XFB buffer no longer causes an\n"
+             "   out-of-bounds GPU write.\n");
+   else if (failures == 0 && !indexed_mode)
       printf("\n=> VK_EXT_transform_feedback phase-1 capture works on kbase:\n"
              "   the render VS variant is unaffected, and the XFB-capture\n"
              "   compute dispatch wrote the exact vertex data expected.\n");
+   if (failures == 0 && indexed_mode && !overflow_mode)
+      printf("\n=> VK_EXT_transform_feedback phase-2 indexed capture works:\n"
+             "   the capture shader fetched attributes through the index\n"
+             "   buffer (permuted output) while keeping the XFB store slot\n"
+             "   sequential, and the render result was unchanged.\n");
    return failures ? 1 : 0;
 }

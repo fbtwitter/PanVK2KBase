@@ -30,6 +30,8 @@
  */
 
 #include "bifrost/bifrost_compile.h"
+#include "util/bitscan.h"
+#include "util/macros.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
 #include "pan_shader.h"
@@ -41,6 +43,7 @@
 #include "panvk_instr.h"
 #include "panvk_macros.h"
 #include "panvk_mempool.h"
+#include "panvk_query_pool.h"
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBindTransformFeedbackBuffersEXT)(
@@ -130,6 +133,38 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
    state->xfb.active = false;
 }
 
+/* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: report [0] = primitives
+ * written, [1] = primitives generated.
+ *
+ * Must be called even when the capture was clamped away to nothing - a
+ * primitive that did not fit is still *generated*, and the whole point of the
+ * query is to let an application detect exactly that case by seeing written
+ * fall behind generated.
+ */
+static void
+accumulate_xfb_query(struct panvk_cmd_buffer *cmdbuf, uint64_t query_ptr,
+                     uint64_t written_prims, uint64_t generated_prims)
+{
+   if (!query_ptr)
+      return;
+
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+   struct cs_index q_addr = cs_scratch_reg64(b, 6);
+   struct cs_index q_val = cs_scratch_reg64(b, 8);
+
+   cs_move64_to(b, q_addr, query_ptr);
+
+   cs_load64_to(b, q_val, q_addr, 0);
+   cs_add_imm64(b, q_val, q_val, written_prims);
+   cs_store64(b, q_val, q_addr, 0);
+
+   cs_load64_to(b, q_val, q_addr, sizeof(struct panvk_query_report));
+   cs_add_imm64(b, q_val, q_val, generated_prims);
+   cs_store64(b, q_val, q_addr, sizeof(struct panvk_query_report));
+
+   cs_flush_stores(b);
+}
+
 /* Launches shader->xfb_variant as a plain compute job on
  * PANVK_SUBQUEUE_COMPUTE, one thread per (vertex, instance) pair, mirroring
  * GENX(csf_launch_xfb)'s register setup exactly where the two subqueue
@@ -140,7 +175,9 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 static void
 dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                          uint32_t vertex_count, uint32_t instance_count,
-                         uint32_t vertex_base)
+                         int32_t vertex_base, uint64_t index_buffer,
+                         uint32_t index_size, uint64_t query_ptr,
+                         uint32_t verts_per_prim)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
@@ -150,6 +187,67 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
 
    const struct panvk_shader_variant *xfb_variant = shader->xfb_variant;
 
+   /* Kept for the XFB query: "generated" is what the draw asked for, before
+    * the bounds clamp below reduces it to what actually fits ("written").
+    */
+   const uint64_t generated_verts = (uint64_t)vertex_count * instance_count;
+
+   /* Clamp the capture to what actually fits in the bound XFB buffers.
+    * Without this a draw bigger than its capture buffer writes past the end
+    * of it - an out-of-bounds GPU write, not merely wrong data.
+    *
+    * Capacity is the tightest constraint across every buffer this shader
+    * writes, measured from each buffer's current offset.
+    */
+   uint64_t xfb_capture_capacity = UINT64_MAX;
+   u_foreach_bit(i, shader->xfb_buffers_written) {
+      if (i >= state->xfb.bound_count || !shader->xfb_strides[i])
+         continue;
+
+      uint64_t used = state->xfb.buffer_offset[i];
+      uint64_t size = state->xfb.bufs[i].size;
+      uint64_t avail = size > used ? size - used : 0;
+
+      xfb_capture_capacity =
+         MIN2(xfb_capture_capacity, avail / shader->xfb_strides[i]);
+   }
+
+   /* Transform feedback discards whole primitives, not individual vertices:
+    * a triangle that only half fits is dropped entirely rather than captured
+    * as a partial primitive. Round the capacity down accordingly, which also
+    * keeps the XFB query self-consistent - "written" is then always a whole
+    * number of primitives that really were captured.
+    */
+   if (verts_per_prim > 1 && xfb_capture_capacity != UINT64_MAX)
+      xfb_capture_capacity -= xfb_capture_capacity % verts_per_prim;
+
+   if ((uint64_t)vertex_count * instance_count > xfb_capture_capacity) {
+      /* Drop whole instances rather than splitting one. The store slot is
+       * instance * num_vertices + vertex, so leaving vertex_count (and hence
+       * the num_vertices sysval) alone keeps every surviving slot at exactly
+       * the address it would otherwise have had. Capturing a trailing partial
+       * instance would need a second dispatch with a different origin; this is
+       * a little more conservative than the spec allows, never unsafe.
+       */
+      if (xfb_capture_capacity >= vertex_count) {
+         instance_count = (uint32_t)(xfb_capture_capacity / vertex_count);
+      } else {
+         /* Not even one full instance fits - capture a prefix of instance 0,
+          * where the slot index reduces to just the vertex index.
+          */
+         instance_count = 1;
+         vertex_count = (uint32_t)xfb_capture_capacity;
+      }
+
+      if (!vertex_count || !instance_count) {
+         /* Nothing fits, but the primitives were still generated. */
+         if (verts_per_prim)
+            accumulate_xfb_query(cmdbuf, query_ptr, 0,
+                                 generated_verts / verts_per_prim);
+         return;
+      }
+   }
+
    /* Populate the sysvals the XFB variant's shader body reads
     * (nir_load_num_vertices / nir_load_xfb_address, wired in
     * panvk_lower_sysvals()) directly - this dispatch always rebuilds its
@@ -157,6 +255,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     * per-draw dirty-bit tracking the render VS/FS sysvals use.
     */
    state->sysvals.xfb.num_vertices = vertex_count;
+   state->sysvals.xfb.index_buffer = index_buffer;
+   state->sysvals.xfb.index_size = index_size;
    for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
       state->sysvals.xfb.buffer_addrs[i] =
          state->xfb.bufs[i].address + state->xfb.buffer_offset[i];
@@ -264,11 +364,13 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SPD), spd_addr);
       cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_TSD), tsd);
 
-      /* Bias attribute fetch by the draw's firstVertex, matching
-       * VERTEX_OFFSET in the real IDVS draw (launch_draw()).
+      /* Bias attribute fetch by the draw's firstVertex (non-indexed) or
+       * vertexOffset (indexed), matching VERTEX_OFFSET in the real IDVS
+       * draw (launch_draw()). This is why the indexed path needs no
+       * vertexOffset maths in the shader.
        */
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                   vertex_base);
+                   (uint32_t)vertex_base);
 
       struct mali_compute_size_workgroup_packed wg_size;
       pan_pack(&wg_size, COMPUTE_SIZE_WORKGROUP, cfg) {
@@ -302,6 +404,13 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4), 1,
                         MALI_TASK_AXIS_Z, PANVK_PRECOMP_RES_SEL);
 
+   if (verts_per_prim) {
+      accumulate_xfb_query(
+         cmdbuf, query_ptr,
+         ((uint64_t)vertex_count * instance_count) / verts_per_prim,
+         generated_verts / verts_per_prim);
+   }
+
    /* Accumulate this draw's contribution to the counter-buffer writeback
     * CmdEndTransformFeedbackEXT will perform - see the comment there.
     */
@@ -333,8 +442,22 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
    for (unsigned i = 0; i < state->xfb.pending_draw_count; i++) {
       dispatch_one_xfb_capture(cmdbuf, state->xfb.pending_draws[i].vertex_count,
                                state->xfb.pending_draws[i].instance_count,
-                               state->xfb.pending_draws[i].vertex_base);
+                               state->xfb.pending_draws[i].vertex_base,
+                               state->xfb.pending_draws[i].index_buffer,
+                               state->xfb.pending_draws[i].index_size,
+                               state->xfb.pending_draws[i].query_ptr,
+                               state->xfb.pending_draws[i].verts_per_prim);
    }
 
    state->xfb.pending_draw_count = 0;
+
+   /* An XFB query ended before the render pass did had its availability write
+    * deferred to here, so it lands after the counts above - see
+    * panvk_cmd_end_xfb_query() in csf/panvk_vX_cmd_query.c.
+    */
+   if (state->xfb_query.deferred_syncobj) {
+      panvk_per_arch(cmd_signal_xfb_query_available)(
+         cmdbuf, state->xfb_query.deferred_syncobj);
+      state->xfb_query.deferred_syncobj = 0;
+   }
 }
