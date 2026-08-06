@@ -8,3 +8,6 @@
 
 # Left behind by python -m py_compile when syntax-checking the patch scripts.
 __pycache__/
+
+# Local emulator log captures pulled off-device for debugging (eg Eden).
+/eden_log.txt
