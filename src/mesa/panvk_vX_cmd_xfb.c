@@ -39,6 +39,8 @@
 #include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_push_constant.h"
+#include "panvk_cmd_precomp.h"
+#include "libpan/draw_helper.h"
 #include "panvk_entrypoints.h"
 #include "panvk_instr.h"
 #include "panvk_macros.h"
@@ -77,8 +79,20 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
    for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
       state->xfb.counter_buffers[i].present = false;
       state->xfb.counter_buffers[i].dev_addr = 0;
-      state->xfb.buffer_offset[i] = 0;
    }
+
+   /* One write position per buffer, in capture slots, zeroed here. It has to
+    * live in GPU memory because panlib_xfb_setup() clamps against it.
+    */
+   struct pan_ptr offsets = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(uint32_t) * MAX_XFB_BUFFERS, sizeof(uint32_t));
+   if (!offsets.gpu) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   memset(offsets.cpu, 0, sizeof(uint32_t) * MAX_XFB_BUFFERS);
+   state->xfb.offsets_gpu = offsets.gpu;
 
    state->xfb.pending_draw_count = 0;
    state->xfb.active = true;
@@ -95,74 +109,23 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 
    assert(state->xfb.active);
 
-   /* vertexCount * instanceCount * stride is known on the host for phase
-    * 1's non-indexed, non-indirect draws (accumulated into
-    * state->xfb.buffer_offset[] by dispatch_one_xfb_capture below, once
-    * the queued draws are flushed at CmdEndRendering), so the counter
-    * writeback is just a plain GPU store of a host-computed constant - no
-    * compute pass. If EndTransformFeedback is called before the render
-    * pass ends (legal, if unusual), buffer_offset[] simply doesn't yet
-    * include draws still queued - phase 1 doesn't handle that ordering,
-    * matching the rest of its non-indirect-only scope.
+   /* Writing the final byte offset back to a counter buffer needs the write
+    * position, which is now GPU-resident and counted in slots, so it lands
+    * with the resume work rather than here.
     */
-   if (counterBufferCount > 0) {
-      struct cs_builder *b =
-         panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+   assert(counterBufferCount == 0 &&
+          "VK_EXT_transform_feedback: counter-buffer writeback is not yet "
+          "supported");
+   (void)firstCounterBuffer;
+   (void)pCounterBuffers;
+   (void)pCounterBufferOffsets;
 
-      for (uint32_t i = 0; i < counterBufferCount; i++) {
-         VK_FROM_HANDLE(panvk_buffer, buffer, pCounterBuffers[i]);
-         if (!buffer)
-            continue;
-
-         unsigned buf_idx = firstCounterBuffer + i;
-         uint64_t counter_addr =
-            panvk_buffer_gpu_ptr(buffer, pCounterBufferOffsets[i]);
-         uint32_t final_offset = (uint32_t)state->xfb.buffer_offset[buf_idx];
-
-         struct cs_index addr_reg = cs_scratch_reg64(b, 0);
-         struct cs_index val_reg = cs_scratch_reg32(b, 2);
-
-         cs_move64_to(b, addr_reg, counter_addr);
-         cs_move32_to(b, val_reg, final_offset);
-         cs_store32(b, val_reg, addr_reg, 0);
-      }
-
-      cs_flush_stores(b);
-   }
+   /* offsets_gpu deliberately survives here: End runs before CmdEndRendering,
+    * which is where the captures this End closed are actually dispatched.
+    * cmd_flush_pending_xfb_captures() clears it once they have been emitted.
+    */
 
    state->xfb.active = false;
-}
-
-/* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: report [0] = primitives
- * written, [1] = primitives generated.
- *
- * Must be called even when the capture was clamped away to nothing - a
- * primitive that did not fit is still *generated*, and the whole point of the
- * query is to let an application detect exactly that case by seeing written
- * fall behind generated.
- */
-static void
-accumulate_xfb_query(struct panvk_cmd_buffer *cmdbuf, uint64_t query_ptr,
-                     uint64_t written_prims, uint64_t generated_prims)
-{
-   if (!query_ptr)
-      return;
-
-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
-   struct cs_index q_addr = cs_scratch_reg64(b, 6);
-   struct cs_index q_val = cs_scratch_reg64(b, 8);
-
-   cs_move64_to(b, q_addr, query_ptr);
-
-   cs_load64_to(b, q_val, q_addr, 0);
-   cs_add_imm64(b, q_val, q_val, written_prims);
-   cs_store64(b, q_val, q_addr, 0);
-
-   cs_load64_to(b, q_val, q_addr, sizeof(struct panvk_query_report));
-   cs_add_imm64(b, q_val, q_val, generated_prims);
-   cs_store64(b, q_val, q_addr, sizeof(struct panvk_query_report));
-
-   cs_flush_stores(b);
 }
 
 /* Launches shader->xfb_variant as a plain compute job on
@@ -199,62 +162,20 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     * the *unclamped* per-instance count so that decomposition survives the
     * clamp below.
     */
-   uint64_t capture_slots = generated_verts;
+   const uint64_t capture_slots = generated_verts;
 
-   /* Clamp the capture to what actually fits in the bound XFB buffers.
-    * Without this a draw bigger than its capture buffer writes past the end
-    * of it - an out-of-bounds GPU write, not merely wrong data.
-    *
-    * Capacity is the tightest constraint across every buffer this shader
-    * writes, measured from each buffer's current offset. With a flat grid this
-    * is a single min, and a partial instance can be captured correctly rather
-    * than dropped.
-    */
-   uint64_t xfb_capture_capacity = UINT64_MAX;
-   u_foreach_bit(i, shader->xfb_buffers_written) {
-      if (i >= state->xfb.bound_count || !shader->xfb_strides[i])
-         continue;
-
-      uint64_t used = state->xfb.buffer_offset[i];
-      uint64_t size = state->xfb.bufs[i].size;
-      uint64_t avail = size > used ? size - used : 0;
-
-      xfb_capture_capacity =
-         MIN2(xfb_capture_capacity, avail / shader->xfb_strides[i]);
-   }
-
-   capture_slots = MIN2(capture_slots, xfb_capture_capacity);
-
-   /* Transform feedback discards whole primitives, not individual vertices: a
-    * triangle that only half fits is dropped entirely rather than captured as
-    * a partial primitive. This also keeps the XFB query self-consistent -
-    * "written" is always a whole number of primitives that really were
-    * captured.
-    */
-   if (verts_per_prim > 1)
-      capture_slots -= capture_slots % verts_per_prim;
-
-   if (!capture_slots) {
-      /* Nothing fits, but the primitives were still generated. */
-      if (verts_per_prim)
-         accumulate_xfb_query(cmdbuf, query_ptr, 0,
-                              generated_verts / verts_per_prim);
+   if (!capture_slots || !state->xfb.offsets_gpu)
       return;
-   }
 
-   /* Populate the sysvals the XFB variant's shader body reads
-    * (nir_load_num_vertices / nir_load_xfb_address, wired in
-    * panvk_lower_sysvals()) directly - this dispatch always rebuilds its
-    * own push-uniforms below, so there's no need to route through the
-    * per-draw dirty-bit tracking the render VS/FS sysvals use.
-    */
    state->sysvals.xfb.num_vertices = vertex_count;
    state->sysvals.xfb.index_buffer = index_buffer;
    state->sysvals.xfb.index_size = index_size;
-   for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
-      state->sysvals.xfb.buffer_addrs[i] =
-         state->xfb.bufs[i].address + state->xfb.buffer_offset[i];
-   }
+   /* Base only; panlib_xfb_setup() overwrites this slot in the uploaded
+    * push-uniform buffer with base + offset*stride, since only it knows the
+    * GPU-resident write position.
+    */
+   for (uint32_t i = 0; i < state->xfb.bound_count; i++)
+      state->sysvals.xfb.buffer_addrs[i] = state->xfb.bufs[i].address;
 
    struct pan_ptr push_uniforms;
    VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
@@ -347,6 +268,83 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       cs_flush_stores(b);
    }
 
+   /* Clamp the capture to what fits, in a helper kernel.
+    *
+    * The write position lives in GPU memory, so deciding how much fits means
+    * dividing by the stride at dispatch time - which the command stream
+    * cannot do on this arch. The kernel also owns the XFB query counters and
+    * advancing the write position, since both depend on the clamped result.
+    * Same division of labour as Asahi hk's setup_xfb_buffer().
+    */
+   struct pan_ptr xfb_descs = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct panlib_xfb_buffer_desc) * MAX_XFB_BUFFERS,
+      sizeof(uint64_t));
+   struct pan_ptr out_slots =
+      panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(uint32_t), sizeof(uint32_t));
+
+   if (!xfb_descs.gpu || !out_slots.gpu) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   struct panlib_xfb_buffer_desc *descs = xfb_descs.cpu;
+   uint32_t desc_count = 0;
+
+   u_foreach_bit(i, shader->xfb_buffers_written) {
+      if (i >= state->xfb.bound_count || !shader->xfb_strides[i])
+         continue;
+
+      /* The kernel resolves base + offset*stride straight into the
+       * push-uniform slot the capture shader reads xfb.buffer_addrs[i] from,
+       * so the shader needs no knowledge of the write position.
+       */
+      uint64_t pu = 0;
+      if (push_uniforms.gpu &&
+          shader_uses_sysval_entry(xfb_variant, graphics, xfb.buffer_addrs, i))
+         pu = push_uniforms.gpu +
+              shader_remapped_sysval_offset(
+                 xfb_variant,
+                 sysval_entry_offset(graphics, xfb.buffer_addrs, i));
+
+      descs[desc_count++] = (struct panlib_xfb_buffer_desc){
+         .base = state->xfb.bufs[i].address,
+         .push_uniform = pu,
+         .size_slots =
+            (uint32_t)(state->xfb.bufs[i].size / shader->xfb_strides[i]),
+         .stride = shader->xfb_strides[i],
+      };
+   }
+
+   {
+      struct panvk_precomp_ctx pctx = panvk_per_arch(precomp_cs)(cmdbuf);
+      struct panlib_xfb_setup_args args = {
+         .offsets = state->xfb.offsets_gpu,
+         .descs = xfb_descs.gpu,
+         .desc_count = desc_count,
+         .generated_slots = (uint32_t)capture_slots,
+         .verts_per_prim = verts_per_prim ? verts_per_prim : 1,
+         .out_slots = out_slots.gpu,
+         .query = query_ptr,
+      };
+
+      panlib_xfb_setup_struct(&pctx, panlib_1d(1), PANLIB_BARRIER_CSF_WAIT,
+                              args);
+   }
+
+
+   /* The barrier above only waits for the kernel to finish - it does not write
+    * its stores back, so the CS load below would otherwise read stale memory.
+    */
+   {
+      struct cs_index flush_id = cs_scratch_reg32(b, 4);
+
+      cs_move32_to(b, flush_id, 0);
+      cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                      MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                      cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
+      cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
+   }
+
    cs_update_compute_ctx(b) {
       cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SRT),
                    state->vs.desc.res_table);
@@ -382,8 +380,9 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
-                   (uint32_t)capture_slots);
+      cs_move64_to(b, cs_scratch_reg64(b, 6), out_slots.gpu);
+      cs_load32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
+                   cs_scratch_reg64(b, 6), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), 1);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
    }
@@ -399,21 +398,9 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4), 1,
                         MALI_TASK_AXIS_Z, PANVK_PRECOMP_RES_SEL);
 
-   if (verts_per_prim) {
-      accumulate_xfb_query(cmdbuf, query_ptr, capture_slots / verts_per_prim,
-                           generated_verts / verts_per_prim);
-   }
-
-   /* Accumulate this draw's contribution to the counter-buffer writeback
-    * CmdEndTransformFeedbackEXT will perform - see the comment there.
+   /* The XFB query counters and the write-position advance both depend on the
+    * clamped slot count, so panlib_xfb_setup() above owns them.
     */
-   for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
-      if (!(shader->xfb_buffers_written & BITFIELD_BIT(i)))
-         continue;
-
-      state->xfb.buffer_offset[i] +=
-         (uint64_t)shader->xfb_strides[i] * capture_slots;
-   }
 }
 
 /* Called from panvk_per_arch(CmdEndRendering) (csf/panvk_vX_cmd_draw.c),
@@ -443,6 +430,12 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
    }
 
    state->xfb.pending_draw_count = 0;
+
+   /* Safe to release only now: End runs before CmdEndRendering, so the write
+    * positions have to outlive it and survive until the captures that use
+    * them have actually been emitted.
+    */
+   state->xfb.offsets_gpu = 0;
 
    /* An XFB query ended before the render pass did had its availability write
     * deferred to here, so it lands after the counts above - see

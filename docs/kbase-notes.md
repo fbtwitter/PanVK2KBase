@@ -4726,3 +4726,91 @@ assume.
 
 `.EXT_transform_feedback` remains `false` throughout; none of this is
 reachable by applications yet.
+
+## GPU-resident capture offsets via panlib_xfb_setup (2026-08-06, WORKING)
+
+Prior art settled the "atomic or over-report?" question with **neither**.
+Asahi `hk` emulates XFB in compute under the same constraint and uses no
+atomics and no per-invocation bounds checks: a **single-invocation setup
+kernel** does the accounting in closed form before the capture runs
+(`src/poly/cl/geometry.cl`, `setup_xfb_buffer()`), clamping and then updating
+counters with plain non-atomic `+=` — safe precisely because it is one
+invocation. Its `Begin`/`End` are likewise a tiny copy kernel
+(`libagx_copy_xfb_counters`), so there is **no command-stream arithmetic
+anywhere** — exactly what makes it viable under the PAN_ARCH 10 limits above.
+
+PanVK now does the same. `panlib_xfb_setup` (`libpan/draw_helper.cl`) takes
+the GPU-resident write positions plus a per-buffer descriptor array, and:
+
+- clamps the capture to the tightest remaining capacity across every written
+  buffer, rounded down to whole primitives;
+- writes the resulting slot count where the command stream can load it into
+  `JOB_SIZE_X`;
+- resolves `base + offset * stride` straight into the push-uniform slot the
+  capture shader reads `xfb.buffer_addrs[i]` from, so the shader needs no
+  knowledge of the write position;
+- updates the XFB query's written/generated counters and advances the write
+  position.
+
+`draw_helper.cl` was already in `libpan/meson.build`, so no build plumbing was
+needed — the `panlib_xfb_setup_args` struct and dispatch macro generate
+themselves. The host no longer knows the write position at all, which is the
+whole point: it is what makes counter-buffer resume possible.
+
+### The bug that made this look impossible: barriers don't flush caches
+
+Wiring it up made the capture write **nothing at all**, and three plausible
+explanations were wrong. A bisect on top of the known-good build settled it:
+
+| experiment | result |
+|---|---|
+| `dispatch_precomp()` in that position, no load | works |
+| host-written value + CS load into `JOB_SIZE_X` | works |
+| kernel-written value + CS load, `PANLIB_BARRIER_CSF_WAIT` | **fails** |
+| same, `PANLIB_BARRIER_CSF_SYNC` | **fails** |
+| kernel-written value + `cs_flush_caches(CLEAN)` + wait | **works** |
+
+`PANVK_CSF_BARRIER_WAIT` is `cs_wait_slot()` and `PANVK_CSF_BARRIER_SYNC`
+bumps a syncobj (`panvk_vX_cmd_dispatch.c`) — both are pure
+**synchronisation**, neither writes back caches. So a value a kernel had just
+computed was still in L2 when the command stream tried to load it. There is
+no precedent for this in PanVK: `update_prims_generated_query()`'s kernel
+output is read by the *host* after a fence (and the query End path does its
+own `cs_flush_caches`), and the indirect-dispatch path loads from an
+application buffer with no GPU producer. Anything that has the CS consume what
+a kernel just wrote needs an explicit flush:
+
+```c
+cs_move32_to(b, flush_id, 0);
+cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
+cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
+```
+
+### A second, self-inflicted bug worth remembering
+
+`offsets_gpu` was initially released in `CmdEndTransformFeedbackEXT`. But End
+runs *before* `CmdEndRendering`, which is where the captures it just closed
+are actually dispatched — so it pulled the write positions out from under
+them, and `dispatch_one_xfb_capture()`'s guard turned that into a silent
+no-capture. It is released in `cmd_flush_pending_xfb_captures()` instead.
+
+This is the **same shape** as the deferred XFB-query availability handled
+earlier: with the capture dispatch deferred to `CmdEndRendering`, anything End
+tears down has to outlive it. Worth checking against any future End-time
+cleanup.
+
+(The first attempt at that fix made it worse by clearing `offsets_gpu` in
+`Begin` instead — a `replace(..., 1)` that matched the wrong
+`pending_draw_count = 0`. The lesson that actually saved time, twice in this
+session, was to stop hypothesising and print the values: a host-side dump
+found both this and the earlier `cfg.binary = 0` immediately.)
+
+**Verified**: all twelve `render_xfb_probe` mode combinations pass with the
+clamp fully GPU-resident, including the overflow cases (0 written / 1
+generated) and instanced queries (2/2), device healthy afterwards.
+
+Counter-buffer resume is now a small addition: `Begin` seeds the offsets from
+the counter buffer instead of zeroing them, and `End` writes them back — both
+plain copies, needing no new arithmetic.

@@ -1837,10 +1837,31 @@ Tools worth knowing about before touching any of this:
       (precedent in `panvk_vX_cmd_dispatch.c`'s indirect path), the shader
       computing `base + (slot_offset + slot) * stride` and skipping stores
       that would not fit, and `cs_add_imm32` advancing by the host-known
-      generated count. The open question is the query's "primitives
-      written" and the counter writeback, since the driver no longer knows
-      the count once the shader decides what fits — see
-      `docs/kbase-notes.md`.
+      generated count.
+      **GPU-resident capture offsets landed (2026-08-06).** Prior art
+      settled the open question with *neither* of the options above: Asahi
+      `hk` uses a single-invocation setup kernel that computes the clamp
+      in closed form and updates counters with plain non-atomic `+=`
+      (`src/poly/cl/geometry.cl`), needing no atomics and no
+      per-invocation checks. PanVK now has `panlib_xfb_setup` in
+      `libpan/draw_helper.cl` doing the same — clamping to the tightest
+      remaining capacity, writing the slot count where the CS loads it
+      into `JOB_SIZE_X`, resolving `base + offset*stride` into the
+      push-uniform slot the capture shader reads, and owning the query
+      counters and the write-position advance. `draw_helper.cl` was
+      already in `libpan/meson.build`, so no build plumbing was needed.
+      **The bug that made it look impossible**: `PANVK_CSF_BARRIER_WAIT`
+      is `cs_wait_slot()` and `SYNC` bumps a syncobj — both pure
+      synchronisation, neither flushes caches — so a value the kernel had
+      just computed was still in L2 when the command stream loaded it. An
+      explicit `cs_flush_caches(CLEAN)` plus a wait is required whenever
+      the CS consumes what a kernel just wrote, and there was no prior
+      instance of that pattern in PanVK to copy. A second, self-inflicted
+      bug is worth remembering: `offsets_gpu` was released in
+      `CmdEndTransformFeedbackEXT`, but End runs *before* `CmdEndRendering`
+      where the captures are actually dispatched — the same shape as the
+      deferred query-availability bug, and a trap for any future End-time
+      cleanup. All twelve probe modes pass, device healthy.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
       restart with XFB active, indirect draws,

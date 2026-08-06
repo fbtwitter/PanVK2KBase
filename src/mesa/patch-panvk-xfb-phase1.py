@@ -126,10 +126,11 @@ import os
 
 mesa = sys.argv[1] if len(sys.argv) > 1 else "/opt/mesa-src"
 VULKAN_DIR = os.path.join(mesa, "src/panfrost/vulkan")
+LIBPAN_DIR = os.path.join(mesa, "src/panfrost/libpan")
 
 
-def patch_file(relpath, edits, done_marker):
-    path = os.path.join(VULKAN_DIR, relpath)
+def patch_file(relpath, edits, done_marker, base=None):
+    path = os.path.join(base or VULKAN_DIR, relpath)
     src = open(path).read()
 
     if done_marker in src:
@@ -261,8 +262,15 @@ patch_file(
             "         bool present;\n"
             "      } counter_buffers[MAX_XFB_BUFFERS];\n"
             "\n"
-            "      /* Host-computed at record time for phase 1's non-indirect case. */\n"
-            "      uint64_t buffer_offset[MAX_XFB_BUFFERS];\n"
+            "      /* Capture write position, one per bound XFB buffer, in capture\n"
+            "       * *slots* rather than bytes so advancing it is a plain add. Lives\n"
+            "       * in GPU memory because panlib_xfb_setup() clamps against it: the\n"
+            "       * command stream cannot divide on PAN_ARCH 10 (cs_udiv32 and\n"
+            "       * friends are #if PAN_ARCH >= 13). Allocated by Begin, released by\n"
+            "       * cmd_flush_pending_xfb_captures() - NOT by End, which runs before\n"
+            "       * the captures that still need it are dispatched.\n"
+            "       */\n"
+            "      uint64_t offsets_gpu;\n"
             "\n"
             "      /* The capture compute dispatch cannot run immediately in CmdDraw:\n"
             "       * flush_tiling() - the only thing that signals PANVK_SUBQUEUE_VERTEX_TILER's\n"
@@ -1425,5 +1433,116 @@ patch_file(
     ],
     done_marker="csf/panvk_vX_cmd_xfb.c",
 )
+
+# 12. libpan: the helper kernel that clamps a capture to what actually fits.
+#     The clamp has to consult a GPU-resident write position, which means
+#     dividing by a stride at dispatch time - and on PAN_ARCH 10 the command
+#     stream cannot divide (cs_udiv32 and the rest of the register-register
+#     arithmetic are #if PAN_ARCH >= 13 in genxml/cs_builder.h). So the
+#     arithmetic lives in a single-invocation kernel and the command stream
+#     only loads the result into JOB_SIZE_X. Mirrors Asahi hk's
+#     setup_xfb_buffer(); see docs/kbase-notes.md.
+#
+#     draw_helper.cl is already in libpan/meson.build, so no build plumbing is
+#     needed - the panlib_xfb_setup_args struct and dispatch macro generate
+#     themselves.
+patch_file(
+    "draw_helper.h",
+    [
+        (
+            "#pragma once\n",
+            "#pragma once\n"
+            "\n"
+            "/* One bound XFB buffer, as panlib_xfb_setup() sees it.\n"
+            " *\n"
+            " * size_slots is the capacity in capture slots (buffer size / stride), which\n"
+            " * the host knows; the *used* part of it lives in GPU memory, so the clamp has\n"
+            " * to happen on the GPU. push_uniform is where to write the resolved capture\n"
+            " * base address (base + offset * stride) so the capture shader's\n"
+            " * xfb.buffer_addrs[] sysval picks it up - 0 to skip.\n"
+            " */\n"
+            "struct panlib_xfb_buffer_desc {\n"
+            "   uint64_t base;\n"
+            "   uint64_t push_uniform;\n"
+            "   uint32_t size_slots;\n"
+            "   uint32_t stride;\n"
+            "};\n"
+            "\n",
+        ),
+    ],
+    done_marker="panlib_xfb_buffer_desc",
+    base=LIBPAN_DIR,
+)
+
+patch_file(
+    "draw_helper.cl",
+    [
+        (
+            "KERNEL(1)\n"
+            "panlib_update_prims_generated_query_indirect(\n",
+            "/* VK_EXT_transform_feedback: clamp one capture to what actually fits, and do\n"
+            " * the bookkeeping that depends on the result.\n"
+            " *\n"
+            " * Single invocation on purpose. Everything here reads and writes GPU-resident\n"
+            " * counters that only this dispatch touches, so plain += is correct and no\n"
+            " * atomics are needed - the same reason Asahi's setup_xfb_buffer() can do it.\n"
+            " *\n"
+            " * Transform feedback discards whole primitives rather than truncating them,\n"
+            " * hence the round-down by verts_per_prim. The write position is in capture\n"
+            " * slots rather than bytes so that advancing it is a plain add; only the\n"
+            " * resolved base address needs the stride multiply.\n"
+            " */\n"
+            "KERNEL(1)\n"
+            "panlib_xfb_setup(global uint32_t *offsets,\n"
+            "                 constant struct panlib_xfb_buffer_desc *descs,\n"
+            "                 uint32_t desc_count, uint32_t generated_slots,\n"
+            "                 uint32_t verts_per_prim, global uint32_t *out_slots,\n"
+            "                 global uint64_t *query)\n"
+            "{\n"
+            "   uint32_t vpp = verts_per_prim ? verts_per_prim : 1;\n"
+            "   uint32_t slots = generated_slots;\n"
+            "\n"
+            "   /* Tightest constraint across every buffer this capture writes. */\n"
+            "   for (uint32_t i = 0; i < desc_count; i++) {\n"
+            "      uint32_t used = offsets[i];\n"
+            "      uint32_t cap = descs[i].size_slots;\n"
+            "      uint32_t remaining = cap > used ? cap - used : 0;\n"
+            "\n"
+            "      remaining -= remaining % vpp;\n"
+            "      slots = min(slots, remaining);\n"
+            "   }\n"
+            "\n"
+            "   *out_slots = slots;\n"
+            "\n"
+            "   for (uint32_t i = 0; i < desc_count; i++) {\n"
+            "      /* Resolve the capture base *before* advancing: this draw starts where\n"
+            "       * the previous one stopped.\n"
+            "       */\n"
+            "      if (descs[i].push_uniform) {\n"
+            "         global uint64_t *dst = (global uint64_t *)descs[i].push_uniform;\n"
+            "         *dst = descs[i].base + (uint64_t)offsets[i] * descs[i].stride;\n"
+            "      }\n"
+            "\n"
+            "      offsets[i] += slots;\n"
+            "   }\n"
+            "\n"
+            "   /* [0] primitives written, [1] primitives generated. They differ exactly\n"
+            "    * when the capture did not fit, which is what an application uses this\n"
+            "    * query to detect.\n"
+            "    */\n"
+            "   if (query) {\n"
+            "      query[0] += slots / vpp;\n"
+            "      query[1] += generated_slots / vpp;\n"
+            "   }\n"
+            "}\n"
+            "\n"
+            "KERNEL(1)\n"
+            "panlib_update_prims_generated_query_indirect(\n",
+        ),
+    ],
+    done_marker="panlib_xfb_setup",
+    base=LIBPAN_DIR,
+)
+
 
 print("panvk xfb-phase1 patch applied")
