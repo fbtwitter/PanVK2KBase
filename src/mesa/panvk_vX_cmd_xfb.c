@@ -166,7 +166,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                          uint32_t vertex_count, uint32_t instance_count,
                          int32_t vertex_base, uint64_t index_buffer,
                          uint32_t index_size, uint64_t query_ptr,
-                         uint32_t verts_per_prim, uint64_t indirect_buffer)
+                         uint32_t xfb_topology, uint64_t indirect_buffer)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
@@ -191,14 +191,20 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     * the *unclamped* per-instance count so that decomposition survives the
     * clamp below.
     */
+   /* Only an upper bound now: for a strip the captured count is larger than
+    * the input vertex count, and for an indirect draw the host has neither.
+    * The kernel computes the real figure; this just sizes TLS below.
+    */
    const uint64_t capture_slots = generated_verts;
 
-   if ((!capture_slots && !indirect_buffer) || !state->xfb.offsets_gpu)
+   if (!state->xfb.offsets_gpu)
       return;
 
    state->sysvals.xfb.num_vertices = vertex_count;
    state->sysvals.xfb.index_buffer = index_buffer;
    state->sysvals.xfb.index_size = index_size;
+   state->sysvals.xfb.topology = xfb_topology;
+
    /* Base only; panlib_xfb_setup() overwrites this slot in the uploaded
     * push-uniform buffer with base + offset*stride, since only it knows the
     * GPU-resident write position.
@@ -365,7 +371,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          .desc_count = desc_count,
          .direct_vertex_count = vertex_count,
          .direct_instance_count = instance_count,
-         .verts_per_prim = verts_per_prim ? verts_per_prim : 1,
+         .topology = xfb_topology,
          .out_slots = out_slots.gpu,
          .query = query_ptr,
          .indirect = indirect_buffer,
@@ -379,7 +385,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                        xfb_variant, sysval_offset(graphics, xfb.index_buffer))
                : 0,
          .num_vertices_pu =
-            indirect_buffer && push_uniforms.gpu &&
+            push_uniforms.gpu &&
                   shader_uses_sysval(xfb_variant, graphics, xfb.num_vertices)
                ? push_uniforms.gpu +
                     shader_remapped_sysval_offset(
@@ -497,7 +503,7 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
                                state->xfb.pending_draws[i].index_buffer,
                                state->xfb.pending_draws[i].index_size,
                                state->xfb.pending_draws[i].query_ptr,
-                               state->xfb.pending_draws[i].verts_per_prim,
+                               state->xfb.pending_draws[i].xfb_topology,
                                state->xfb.pending_draws[i].indirect_buffer);
    }
 

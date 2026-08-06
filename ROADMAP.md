@@ -1953,10 +1953,32 @@ Tools worth knowing about before touching any of this:
       is filled entirely by command 0 — the bounds clamp working *across*
       a multi-draw. The probe now derives "written" from buffer capacity
       rather than assuming everything fits. All 29 probe modes pass.
+      **Strip and fan topologies landed (2026-08-07)** — the last
+      structural gap, because it changes what the capture grid *means*.
+      Everything before emitted one captured vertex per *input* vertex,
+      which is only right for LIST topologies: a 4-vertex triangle strip
+      assembles 2 triangles and must capture **6** vertices, more than
+      were drawn. So `num_vertices` becomes the *captured* count per
+      instance (which `nir_lower_xfb_to_stores` wants anyway, and which
+      the host cannot compute — the kernel now patches it for every
+      draw), primitive counts become `n-1`/`n-2` rather than a divide, and
+      `build_xfb_input_vertex()` maps each slot back to an input vertex
+      per topology (including the odd-triangle winding swap for strips,
+      and "every triangle starts at vertex 0" for fans). Topology travels
+      as a compact enum sysval since it is dynamic state.
+      **The bug**: the first run captured `A B C D` with two slots left
+      poison, because the strip mapping was applied to `raw_vertex_id` —
+      the *store slot* — so primitives overwrote each other. Only
+      `load_vertex_id`, the attribute index, maps back to an input vertex;
+      they were already separate intrinsics, which is what made indexed
+      draws easy earlier. Tested by `--strip` and `--fan`, both composable
+      with `--indirect`; three further probe expectations needed fixing
+      and the driver was right in all three. All 35 probe modes pass, and
+      the patch script still reproduces the tested tree byte-for-byte.
       `.EXT_transform_feedback` is nonetheless still left `false` by
-      default: still unsupported and asserted on are strip/fan topologies,
-      primitive restart with XFB active and
-      `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
+      default: still unsupported and asserted on are primitive restart
+      with XFB active, `vkCmdDrawIndirectByteCountEXT` and
+      adjacency/patch-list topologies — so advertising it would turn
       "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.
       Full geometry-shader/

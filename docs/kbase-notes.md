@@ -4949,8 +4949,64 @@ The probe now derives "written" from the bound buffer's capacity rather than
 assuming everything fits, so the expectation stays correct for any combination
 of flags.
 
-Still out of scope: strip/fan topologies, primitive restart, and
-`vkCmdDrawIndirectByteCountEXT`.
+## Strip and fan topologies (2026-08-07, WORKING)
+
+The last structural gap, because it changes what the capture grid *means*.
+
+Everything before this emitted one captured vertex per **input** vertex, which
+is only correct for LIST topologies. A triangle strip of 4 vertices assembles 2
+triangles and transform feedback must capture **6** vertices — more than were
+drawn — with the shared ones emitted once per primitive that uses them.
+
+Three things follow from that:
+
+- **`num_vertices` changes meaning.** It is now the number of *captured*
+  vertices per instance (`prims_per_instance * verts_per_prim`), not the input
+  vertex count. `nir_lower_xfb_to_stores` turns `instance_id * num_vertices +
+  raw_vertex_id` back into the linear capture slot, so this is exactly the
+  right quantity. The host cannot compute it for a strip any more than it can
+  for an indirect draw, so the kernel now patches it for **every** draw.
+- **Primitive counts stop being a divide.** `panlib_xfb_setup` takes the
+  topology and computes `n-1` for line strips, `n-2` for triangle strips and
+  fans, `n/vpp` for the lists.
+- **Each slot maps back to an input vertex.** `build_xfb_input_vertex()` in the
+  shader does `prim = s / vpp`, `v = s % vpp`, then per topology:
+  `prim*vpp + v` for lists (i.e. `s`, unchanged), `prim + v` for line strips,
+  `prim + v` with the odd-triangle swap for triangle strips, and
+  `v == 0 ? 0 : prim + v` for fans.
+
+Topology arrives as a compact enum sysval (`enum panvk_xfb_topology`, ordered
+so `verts_per_prim` falls out of the value) because it is dynamic state — the
+shader cannot be specialised for it.
+
+### The bug: store slot vs attribute index
+
+First run captured `A B C D` with slots 4 and 5 left as poison. The data named
+the fault precisely: writes had landed at positions 0,1,2,3 with 2 and 1 written
+twice — the strip mapping `0,1,2,2,1,3` being used as the **store slot**.
+
+`raw_vertex_id` (the store slot) must stay sequential for every topology;
+only `load_vertex_id` (the attribute fetch index) maps back to an input vertex.
+Conflating them made primitives overwrite each other. They were already
+separate intrinsics — the same distinction that made indexed draws easy — and
+the fix was to keep `ids->vertex` as the slot and route the mapping through
+`ids->attrib` only.
+
+**Tests**: `--strip` (4 vertices → `A B C  C B D`, which catches a missing
+odd-triangle swap: that would give `A B C  B C D`) and `--fan` (→ `A B C  A C D`,
+a different mapping since every triangle starts at vertex 0). Both compose with
+`--indirect`, where the counts come from GPU memory as well.
+
+Three more probe expectations needed fixing, and in all three the driver was
+right: the query counts *primitives* (a 4-vertex strip is 2, not 1), and the
+indirect command needed `vertexCount = 4` rather than the hardcoded 3. The
+probe now derives both its vertex count and its primitive count from the mode.
+
+All 35 probe-mode combinations pass, device healthy.
+
+Still out of scope: primitive restart, `vkCmdDrawIndirectByteCountEXT`, and
+adjacency/patch-list topologies (the latter need geometry or tessellation
+shaders anyway).
 
 ## Verifying the patch script reproduces what was tested (2026-08-07)
 

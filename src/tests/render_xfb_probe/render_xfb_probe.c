@@ -101,6 +101,24 @@ static const float VERTICES[3][2] = {
    {-0.8f, 0.8f},
 };
 
+/* --strip mode draws these four as a TRIANGLE_STRIP. */
+static const float VERTICES_STRIP[4][2] = {
+   {-0.8f, -0.8f}, /* A */
+   {0.8f, -0.8f},  /* B */
+   {-0.8f, 0.8f},  /* C */
+   {0.8f, 0.8f},   /* D */
+};
+
+/* Two triangles: (A,B,C) then, with the odd-triangle swap, (C,B,D). */
+static const float EXPECTED_XFB_STRIP[6][4] = {
+   {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
+   {0.8f, 0.8f, 0.0f, 1.0f},   /* D */
+};
+
 /* Expected XFB capture: each vertex's clip-space position (vec2, 0.0, 1.0),
  * matching what xfb.vert writes to xfbPosition - byte-identical to
  * gl_Position since the shader computes both from the same value.
@@ -216,6 +234,42 @@ static bool indirect_mode;
 static bool multidraw_mode;
 #define MULTIDRAW_COUNT 2
 
+/* --strip mode: 4 vertices as a TRIANGLE_STRIP -> 2 triangles -> 6 captured
+ * vertices, i.e. more captured than drawn.
+ */
+static bool strip_mode;
+#define STRIP_VERTS 4
+
+/* --fan mode: the same four vertices as a TRIANGLE_FAN, which assembles
+ * (A,B,C) then (A,C,D) - every triangle starts at vertex 0, a different
+ * mapping from the strip's sliding window.
+ */
+static bool fan_mode;
+
+static const float EXPECTED_XFB_FAN[6][4] = {
+   {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {0.8f, 0.8f, 0.0f, 1.0f},   /* D */
+};
+
+static uint32_t
+draw_vertex_count(void)
+{
+   return strip_mode ? STRIP_VERTS : BASE_VERTS;
+}
+
+/* Strips and fans assemble n-2 triangles from n vertices; the list topologies
+ * assemble n/3.
+ */
+static uint32_t
+draw_prim_count(void)
+{
+   return strip_mode ? (STRIP_VERTS - 2) : (BASE_VERTS / 3);
+}
+
 static int failures;
 
 static void
@@ -276,6 +330,12 @@ main(int argc, char **argv)
          resume_mode = true;
       else if (strcmp(argv[i], "--indirect") == 0)
          indirect_mode = true;
+      else if (strcmp(argv[i], "--strip") == 0)
+         strip_mode = true;
+      else if (strcmp(argv[i], "--fan") == 0) {
+         strip_mode = true;  /* shares the 4-vertex setup */
+         fan_mode = true;
+      }
       else if (strcmp(argv[i], "--multidraw") == 0) {
          indirect_mode = true;
          multidraw_mode = true;
@@ -290,6 +350,10 @@ main(int argc, char **argv)
    if (resume_mode)
       printf("       + resume (counter buffer seeded to %d bytes)\n",
              RESUME_START_BYTES);
+   if (strip_mode)
+      printf("       + %s (%d verts -> 2 triangles)\n",
+             fan_mode ? "fan (TRIANGLE_FAN)" : "strip (TRIANGLE_STRIP)",
+             STRIP_VERTS);
    if (indirect_mode)
       printf("       + indirect (vkCmdDrawIndirect%s)\n",
              multidraw_mode ? ", drawCount=2" : "");
@@ -477,7 +541,7 @@ main(int argc, char **argv)
 
    VkBufferCreateInfo vbo_bci = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-      .size = sizeof(VERTICES),
+      .size = strip_mode ? sizeof(VERTICES_STRIP) : sizeof(VERTICES),
       .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
@@ -511,8 +575,14 @@ main(int argc, char **argv)
    check(r == VK_SUCCESS, "vkMapMemory (VBO)");
    if (r != VK_SUCCESS)
       return 1;
-   memcpy(vbo_mapped, VERTICES, sizeof(VERTICES));
-   printf("  wrote %zu bytes of vertex data (3 x vec2)\n", sizeof(VERTICES));
+   if (strip_mode) {
+      memcpy(vbo_mapped, VERTICES_STRIP, sizeof(VERTICES_STRIP));
+      printf("  wrote %zu bytes of vertex data (%d x vec2, strip)\n",
+             sizeof(VERTICES_STRIP), STRIP_VERTS);
+   } else {
+      memcpy(vbo_mapped, VERTICES, sizeof(VERTICES));
+      printf("  wrote %zu bytes of vertex data (3 x vec2)\n", sizeof(VERTICES));
+   }
 
    /* -------------------------------------------------------- counter buffer */
    VkBuffer counter_buf = VK_NULL_HANDLE;
@@ -607,21 +677,21 @@ main(int argc, char **argv)
          if (indexed_mode) {
             VkDrawIndexedIndirectCommand *c =
                (VkDrawIndexedIndirectCommand *)icmd + k;
-            c->indexCount = BASE_VERTS;
+            c->indexCount = draw_vertex_count();
             c->instanceCount = instance_count();
             c->firstIndex = 0;
             c->vertexOffset = 0;
             c->firstInstance = 0;
          } else {
             VkDrawIndirectCommand *c = (VkDrawIndirectCommand *)icmd + k;
-            c->vertexCount = BASE_VERTS;
+            c->vertexCount = draw_vertex_count();
             c->instanceCount = instance_count();
             c->firstVertex = 0;
             c->firstInstance = 0;
          }
       }
       printf("  wrote %u command(s), %u vertices x %u instance(s) each\n",
-             ncmd, BASE_VERTS, instance_count());
+             ncmd, draw_vertex_count(), instance_count());
    }
 
    /* ---------------------------------------------------------- index buffer */
@@ -673,7 +743,7 @@ main(int argc, char **argv)
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
    const VkDeviceSize xfb_size =
-      (resume_mode || multidraw_mode)
+      (resume_mode || multidraw_mode || strip_mode)
          ? (VkDeviceSize)MAX_CAPTURE_VERTS * sizeof(EXPECTED_XFB[0])
          : (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
@@ -882,7 +952,9 @@ main(int argc, char **argv)
    };
    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+      .topology = fan_mode      ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+                  : strip_mode ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+                               : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
    };
 
    VkViewport viewport = {
@@ -1083,8 +1155,9 @@ main(int argc, char **argv)
       printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded\n", BASE_VERTS,
              instance_count());
    } else {
-      cmd_draw(cmdbuf, BASE_VERTS, instance_count(), 0, 0);
-      printf("  vkCmdDraw(%u, %u, 0, 0) recorded\n", BASE_VERTS,
+      uint32_t nverts = draw_vertex_count();
+      cmd_draw(cmdbuf, nverts, instance_count(), 0, 0);
+      printf("  vkCmdDraw(%u, %u, 0, 0) recorded\n", nverts,
              instance_count());
    }
 
@@ -1199,8 +1272,12 @@ main(int argc, char **argv)
       check(tri_px > 0, "some pixels are the triangle colour");
       check(other_px == 0, "no pixel is anything other than clear or "
                            "triangle colour");
-      check(clear_px == 190 && tri_px == 66,
-            "render is unaffected by the XFB-capture shader variant");
+      if (strip_mode)
+         check(tri_px > 0 && clear_px > 0,
+               "strip rendered (two triangles, so not the 190/66 split)");
+      else
+         check(clear_px == 190 && tri_px == 66,
+               "render is unaffected by the XFB-capture shader variant");
 
       printf("\n=== readback: XFB buffer ===\n");
       float captured[MAX_CAPTURE_VERTS][4];
@@ -1240,6 +1317,32 @@ main(int argc, char **argv)
                 want_counter);
          check(final_counter == want_counter,
                "counter buffer holds the final byte offset");
+
+         goto xfb_done;
+      }
+
+      if (strip_mode) {
+         /* Six captured vertices from four drawn: the strip's shared vertices
+          * are emitted once per triangle that uses them, and triangle 1 swaps
+          * its first two inputs to keep winding.
+          */
+         const float(*want)[4] =
+            fan_mode ? EXPECTED_XFB_FAN : EXPECTED_XFB_STRIP;
+         bool ok = memcmp(raw, want, sizeof(EXPECTED_XFB_STRIP)) == 0;
+         float(*got)[4] = (float(*)[4])raw;
+
+         for (int v = 0; v < 6; v++)
+            printf("  captured[%d] = (%.3f, %.3f) expected (%.3f, %.3f)\n", v,
+                   got[v][0], got[v][1], want[v][0], want[v][1]);
+
+         check(ok, fan_mode
+                      ? "fan captured 6 vertices in assembled-primitive order"
+                      : "strip captured 6 vertices in assembled-primitive "
+                        "order");
+
+         if (!ok && memcmp(raw, VERTICES_STRIP, sizeof(VERTICES_STRIP)) == 0)
+            printf("  NOTE: only the 4 input vertices were captured - the\n"
+                   "  capture was sized by input vertices, not primitives.\n");
 
          goto xfb_done;
       }
@@ -1356,7 +1459,8 @@ main(int argc, char **argv)
           * pass rather than to a single draw.
           */
          const uint64_t draws = multidraw_mode ? MULTIDRAW_COUNT : 1;
-         const uint64_t want_generated = instance_count() * draws;
+         const uint64_t want_generated =
+            (uint64_t)draw_prim_count() * instance_count() * draws;
 
          /* "written" is what actually fit. Derive it from the bound buffer
           * rather than assuming everything did: --multidraw --instanced
@@ -1419,7 +1523,12 @@ main(int argc, char **argv)
    }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && multidraw_mode)
+   if (failures == 0 && strip_mode)
+      printf("\n=> VK_EXT_transform_feedback %s capture works:\n"
+             "   4 input vertices assembled into 2 triangles and captured as\n"
+             "   6 vertices in assembled-primitive order.\n",
+             fan_mode ? "fan" : "strip");
+   else if (failures == 0 && multidraw_mode)
       printf("\n=> VK_EXT_transform_feedback multi-draw indirect works:\n"
              "   each command captured to its own region, so the GPU-resident\n"
              "   write position advanced between them.\n");
