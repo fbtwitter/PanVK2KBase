@@ -1680,19 +1680,38 @@ Tools worth knowing about before touching any of this:
       explicit cross-subqueue wait against the just-incremented sync
       point (mirroring `emit_barrier_insert_waits()`'s exact primitives).
       **Still faults identically after this fix** —
-      `VK_ERROR_DEVICE_LOST`, device stays fully healthy every time. A
-      second candidate (the XFB variant's SPD declaring
-      `MALI_SHADER_STAGE_VERTEX` instead of `COMPUTE`) was checked and is
-      probably not it either, since GL's own `csf_launch_xfb` does the
-      same thing successfully. See `docs/kbase-notes.md` for the full
-      trace and the next suggested isolation experiment (a standalone
-      VS-stage compute dispatch, decoupled entirely from XFB/
-      attribute-fetch, to narrow down whether the fault is in the
-      dispatch mechanism itself or something XFB-specific). Further
-      progress likely needs either a way to read the actual Mali fault
-      registers (needs root — explicitly avoided in this project) or a
-      more targeted isolation experiment than tried so far.
-      `.EXT_transform_feedback` stays `false` until this is resolved and
+      `VK_ERROR_DEVICE_LOST`, device stays fully healthy every time.
+      **Root-caused and fixed (2026-08-06, continued): the XFB variant's
+      SPD declared `MALI_SHADER_STAGE_VERTEX`** (built by
+      `panvk_shader_upload()`, which branches purely on
+      `shader->info.stage` — still `MESA_SHADER_VERTEX` for this variant,
+      required for `bifrost_postprocess_nir()`'s VS-specific lowering to
+      run at all), **while being launched via `cs_run_compute`, a
+      `COMPUTE`-shaped job.** Found via systematic bisection (SRT forced
+      to 0 — still faulted; skipping `cs_run_compute()` entirely — fence
+      succeeded, localizing the fault to execution itself; confirmed
+      compute/render interleaving isn't inherently broken by finding
+      `update_prims_generated_query()` already doing exactly that in
+      shipping code; skipping `nir_lower_xfb_to_stores` — still
+      faulted, ruling out the XFB write mechanism). Building a plain
+      `SHADER_PROGRAM` descriptor that explicitly declares
+      `MALI_SHADER_STAGE_COMPUTE` — pointing at the same compiled binary,
+      no shader-side change — **fixed it**: `vkWaitForFences -> 0`,
+      confirmed on the real Poco X8 Pro, render unaffected. This is now
+      the permanent implementation. **The crash is solved.**
+      **What's left**: with the crash gone, the capture runs but writes
+      nothing — `nir_load_raw_vertex_id` compiles to a hardware-preloaded
+      register (`BI_PRELOAD_VERTEX_ID`) that firmware only populates
+      correctly for real VERTEX/IDVS jobs; a `COMPUTE`-declared job gets a
+      different value preloaded into that slot, so the shader's own
+      vertex/instance index — and therefore both its attribute-fetch
+      address and its XFB store address — is wrong. Real, scoped,
+      additional work: a NIR lowering pass sourcing vertex/instance index
+      from whatever registers a `COMPUTE` job actually gets its
+      invocation index in, replacing the compiler's default
+      (VERTEX-hardware-only) handling for this variant specifically. See
+      `docs/kbase-notes.md` for the full trace.
+      `.EXT_transform_feedback` stays `false` until this lands and
       `tests/render_xfb_probe` passes end to end. Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

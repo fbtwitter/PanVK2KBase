@@ -4255,3 +4255,92 @@ or in something XFB-specific like the attribute table reuse).
 narrow regardless: non-indexed, non-indirect `vkCmdDraw` only, single
 buffer/stream, no counter-buffer resume, no
 `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT`.
+
+## The `VK_ERROR_DEVICE_LOST` fault: root-caused and fixed (2026-08-06, continued)
+
+Systematic bisection on real hardware, each step confirmed via
+`driver_compute_probe --fill` immediately after (0 failures, no wedge, no
+reboot needed — every single one of the following experiments, including
+the ones that faulted, left the device fully healthy):
+
+1. **Set `PANVK_PRECOMP_SRT` to 0 (no resource table) instead of
+   `vs_desc_state->res_table`.** Still faulted identically — ruled out
+   resource-table reuse as the (sole) cause.
+2. **Skipped the `cs_trace_run_compute()` call entirely**, leaving every
+   register-setup instruction (including the new cross-subqueue wait)
+   in place. **Fence succeeded.** This precisely localized the fault to
+   *executing* the job, not to setup, the wait, or the resource table.
+3. **Compared against `update_prims_generated_query()`** (`csf/panvk_vX_cmd_draw.c:2625`),
+   existing, shipping PanVK code that already dispatches a real compute
+   job (via `dispatch_precomp()`) from inside `CmdDraw`, mid-render-pass,
+   whenever primitives-generated queries are used with indexed-restart or
+   indirect draws. This ruled out "compute/render interleaving is
+   inherently broken" — it clearly isn't; PanVK does it in production.
+4. **Skipped `nir_lower_xfb_to_stores` entirely** (attribute fetch only,
+   no XFB writes) via a `PANVK_XFB_DIAG_SKIP_STORES` env-var-gated build.
+   Still faulted — ruled out the XFB *write* mechanism specifically.
+5. **Built a custom `SHADER_PROGRAM` descriptor declaring
+   `MALI_SHADER_STAGE_COMPUTE`** instead of reusing `xfb_variant->spds.pos_triangles`/
+   `all_triangles` (which `panvk_shader_upload()` always builds declaring
+   `MALI_SHADER_STAGE_VERTEX`, since it branches purely on
+   `shader->info.stage`, and the XFB variant is still `MESA_SHADER_VERTEX`-stage
+   NIR — required for `bifrost_postprocess_nir()`'s VS-specific lowering,
+   viewport transform and point size, to run at all). **Fence succeeded.
+   Fault gone entirely.**
+
+**Root cause**: running a `MALI_SHADER_STAGE_VERTEX`-declared shader
+program via `cs_run_compute` (a `COMPUTE`-shaped job) faults. Declaring
+the program descriptor as `MALI_SHADER_STAGE_COMPUTE` instead — pointing
+at the exact same compiled binary, no shader-side changes — fixes it.
+This is now the permanent implementation (`dispatch_one_xfb_capture()` in
+`csf/panvk_vX_cmd_xfb.c` builds this descriptor directly rather than
+reusing `panvk_shader_upload()`'s output), verified fixed against the
+real, non-diagnostic code path on the Poco X8 Pro: `vkWaitForFences -> 0`,
+render unaffected (190/66/0 exact match, matching every prior probe on
+this geometry).
+
+**Why GL's `csf_launch_xfb` doesn't need this**: not fully understood.
+It also reuses a VERTEX-stage-declared RSD/SPD (`batch->rsd[MESA_SHADER_VERTEX]`)
+through the same `cs_run_compute` call, and (as far as this investigation
+found) doesn't override the stage field for its `is_xfb` variant either.
+Possibly PanVK's CSF backend has a stricter runtime check GL's own
+CSF path doesn't hit, or GL's `rsd`/RSD naming is a holdover and its
+actual stage field differs in a way this investigation didn't trace to
+the bottom. Left as an open question — the empirical fix (declare
+`COMPUTE` explicitly) is confirmed correct and low-risk regardless of the
+exact mechanism, so it wasn't worth blocking on fully explaining GL's
+side.
+
+### What's left: vertex/instance ID delivery is wrong for a COMPUTE-declared job
+
+With the crash fixed, the capture runs but writes nothing —
+`tests/render_xfb_probe`'s XFB buffer readback comes back as the raw,
+untouched `0x11` poison pattern (verified via a hex dump added to the
+probe specifically to distinguish "wrote real zeros" from "never wrote at
+all," since both print as `0.000` at 3 decimal places).
+
+Traced to its root: `nir_intrinsic_load_raw_vertex_id` compiles
+(`bifrost_compile.c:2049-2051`) to `bi_mov_i32_to(b, dst, bi_vertex_id(b))`,
+and `bi_vertex_id()` (`bifrost_compile.c:65-68`) is
+`bi_preload(b, BI_PRELOAD_VERTEX_ID)` — a register the GPU firmware
+preloads automatically, but only for jobs it recognizes as running
+through the fixed-function VERTEX/IDVS path. A job declared `COMPUTE`
+gets a different value preloaded into that same physical slot (some
+workgroup/invocation-index concept, not a per-vertex index). Since
+`nir_lower_xfb_to_stores`'s generated store address is
+`(instance_id * num_vertices + raw_vertex_id) * stride + offset`, a
+garbage `raw_vertex_id` produces a wrong-but-valid-looking address —
+explaining a silent no-op (or a write somewhere harmless) rather than
+another fault. The same mechanism likely also breaks attribute fetch,
+since Mali's fixed-function attribute unit indexes by vertex ID too.
+
+**This is real, additional, scoped engineering work, not a quick
+register fix**: the XFB-capture variant needs `raw_vertex_id`/
+`instance_id` sourced from whatever preload registers a `COMPUTE` job
+actually receives its invocation index in (Bifrost/Valhall's compute path
+has its own `BI_PRELOAD_*` constants for local/global invocation ID —
+not traced yet), via a NIR lowering pass specific to this variant that
+overrides `panvk_lower_sysvals()`'s normal (VERTEX-hardware-only)
+handling of `nir_intrinsic_load_raw_vertex_id`/`load_instance_id`. Until
+that lands, capture continues to silently write nothing.
+`.EXT_transform_feedback` stays `false`.

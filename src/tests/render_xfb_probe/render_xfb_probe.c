@@ -824,6 +824,17 @@ main(int argc, char **argv)
       float captured[3][4];
       memcpy(captured, xfb_mapped, sizeof(captured));
 
+      /* 0.000 at 3 decimals is ambiguous: it prints the same for a real
+       * zero write and for the untouched 0x11111111 poison pattern
+       * (~2.36e-27, too small to show at this precision) - dump raw hex
+       * too so "wrote zero" and "never wrote at all" are distinguishable.
+       */
+      const uint8_t *raw = xfb_mapped;
+      printf("  raw bytes: ");
+      for (size_t i = 0; i < sizeof(EXPECTED_XFB); i++)
+         printf("%02x", raw[i]);
+      printf("\n");
+
       bool xfb_ok = true;
       for (int v = 0; v < 3; v++) {
          bool vertex_ok =

@@ -45,21 +45,32 @@ cs_subqueue_ctx_reg, panvk_cs_subqueue_context::syncobjs,
 cs_progress_seqno_reg, panvk_instr_sync64_wait).
 
 This is a real, correct fix in its own right (the previous code was
-provably waiting on the wrong thing, or nothing) but is not sufficient on
-its own: the dispatch still returns VK_ERROR_DEVICE_LOST at
-vkWaitForFences after this fix too - a clean, recoverable GPU-level fault,
-device stays fully healthy every time (confirmed via driver_compute_probe
---fill after every single attempt across this whole investigation, no
-hang, no reboot needed, ever). A second candidate was found but not
-confirmed: the XFB variant's SPD declares MALI_SHADER_STAGE_VERTEX (it's
-still MESA_SHADER_VERTEX-stage NIR, needed for bifrost_postprocess_nir's
-VS-specific lowering to run), not MALI_SHADER_STAGE_COMPUTE, while it
-runs via cs_run_compute - but GL's own csf_launch_xfb does the same thing
-successfully, so this probably isn't it either. See docs/kbase-notes.md
-for the full trace and the suggested next isolation experiment (a
-standalone VS-stage compute dispatch, decoupled from XFB/attribute-fetch
-entirely). Needs further investigation before this is a working feature -
-.EXT_transform_feedback stays false until then.
+provably waiting on the wrong thing, or nothing), and further bisection
+(SRT forced to 0 - still faulted; skipping cs_trace_run_compute() entirely
+- fence succeeded, localizing the fault to execution itself; skipping
+nir_lower_xfb_to_stores - still faulted, ruling out the XFB write
+mechanism) found the actual root cause: the XFB variant's SPD, built by
+panvk_shader_upload(), declares MALI_SHADER_STAGE_VERTEX (it branches
+purely on shader->info.stage, still MESA_SHADER_VERTEX for this variant,
+needed for bifrost_postprocess_nir()'s VS-specific lowering to run at
+all), while being launched via cs_run_compute, a COMPUTE-shaped job.
+FIXED by building a plain SHADER_PROGRAM descriptor here that explicitly
+declares MALI_SHADER_STAGE_COMPUTE instead - same compiled binary, no
+shader-side change. Confirmed on the real Poco X8 Pro:
+vkWaitForFences -> 0, render unaffected. The crash is solved.
+
+What's left: with the crash fixed, the capture runs but writes nothing -
+nir_load_raw_vertex_id compiles to a hardware-preloaded register
+(BI_PRELOAD_VERTEX_ID) that firmware only populates correctly for real
+VERTEX/IDVS jobs; a COMPUTE-declared job gets something else preloaded
+into that slot, so the shader's own vertex/instance index - and therefore
+both its attribute-fetch address and its XFB store address - is wrong.
+This needs a NIR lowering pass sourcing vertex/instance index from
+whatever registers a COMPUTE job actually receives its invocation index
+in, replacing the compiler's default (VERTEX-hardware-only) handling for
+this variant specifically. See docs/kbase-notes.md for the full trace.
+.EXT_transform_feedback stays false until this lands and
+tests/render_xfb_probe passes end to end.
 
 Not kbase-specific - like patch-panvk-null-device-destroy.py, this is
 genuine upstream PanVK/Mesa capability work, a candidate for upstreaming

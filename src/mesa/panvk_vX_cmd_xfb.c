@@ -32,6 +32,7 @@
 #include "bifrost/bifrost_compile.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
+#include "pan_shader.h"
 #include "panvk_buffer.h"
 #include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
@@ -181,15 +182,36 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       return;
    }
 
-#if PAN_ARCH >= 12
-   uint64_t spd_addr = panvk_priv_mem_dev_addr(xfb_variant->spds.all_triangles);
-#else
-   /* no_idvs compilation never splits into position/varying binaries, so
-    * pos_triangles is the shader's one and only entry point - see
-    * docs/kbase-notes.md.
+   /* ROOT CAUSE OF THE ORIGINAL VK_ERROR_DEVICE_LOST (found 2026-08-06,
+    * see docs/kbase-notes.md): xfb_variant->spds.* (built by
+    * panvk_shader_upload()) declares MALI_SHADER_STAGE_VERTEX, because
+    * panvk_shader_upload() branches purely on shader->info.stage, and
+    * xfb_variant is still MESA_SHADER_VERTEX-stage NIR (required for
+    * bifrost_postprocess_nir()'s VS-specific lowering to run at all).
+    * Running a VERTEX-declared SPD via cs_run_compute (a COMPUTE job)
+    * faulted every time - confirmed by isolation testing on real
+    * hardware. Building a plain SHADER_PROGRAM descriptor here that
+    * declares MALI_SHADER_STAGE_COMPUTE explicitly, pointing at the same
+    * compiled binary, fixes it. GL's csf_launch_xfb does not need this
+    * because it isn't subject to PanVK's SPD-stage/job-type check the
+    * same way - not fully understood, but empirically necessary here.
     */
-   uint64_t spd_addr = panvk_priv_mem_dev_addr(xfb_variant->spds.pos_triangles);
-#endif
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_priv_mem compute_spd =
+      panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
+   panvk_priv_mem_write_desc(compute_spd, 0, SHADER_PROGRAM, cfg) {
+      cfg.stage = MALI_SHADER_STAGE_COMPUTE;
+      cfg.register_allocation =
+         pan_register_allocation(xfb_variant->info.work_reg_count);
+      cfg.binary = panvk_shader_variant_get_dev_addr(xfb_variant);
+      cfg.preload.r48_r63 = (xfb_variant->info.preload >> 48);
+      cfg.flush_to_zero_mode =
+         xfb_variant->info.ftz_fp32
+            ? (xfb_variant->info.ftz_fp16 ? MALI_FLUSH_TO_ZERO_MODE_ALWAYS
+                                          : MALI_FLUSH_TO_ZERO_MODE_DX11)
+            : MALI_FLUSH_TO_ZERO_MODE_PRESERVE_SUBNORMALS;
+   }
+   uint64_t spd_addr = panvk_priv_mem_dev_addr(compute_spd);
 
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
    const struct cs_tracing_ctx *tracing_ctx =
