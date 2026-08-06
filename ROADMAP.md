@@ -1914,9 +1914,30 @@ Tools worth knowing about before touching any of this:
       buffer) shows up as the *unpermuted* order the probe already names
       as a distinct failure. All twenty-four probe modes pass, device
       healthy.
-      `.EXT_transform_feedback` is nonetheless still left `false`: still
-      unsupported and asserted on are strip/fan topologies, primitive
-      restart with XFB active, multi-draw indirect and
+      **Patch script verified to reproduce the tested tree (2026-08-07).**
+      With the script now patching eleven files across
+      `src/panfrost/vulkan/` and `src/panfrost/libpan/`, "applies cleanly"
+      stopped being safe to assume. The blocker was pin drift:
+      `third_party/MESA-KMOD` sits at `43ec7c6b` while the work was
+      developed and verified against `7296f9af84cd`, and upstream
+      refactored `panvk_vX_shader.c` in between (one of the script's
+      anchors no longer exists there). Resolved without moving either pin,
+      by verifying against a throwaway `git worktree` of MESA-KMOD checked
+      out at `7296f9af84cd` — leaving the main checkout and its synced
+      kbase backend untouched. Result: applies cleanly, is idempotent, and
+      every file the script owns comes out byte-identical to the
+      hardware-verified tree (20/20 checks); the rebuilt driver passes all
+      24 probe modes. **The divergence this caught**: `/opt/mesa-src`
+      carried a `/* TEMP: enabled for hardware verification */` edit
+      advertising the extension, while the tracked script emitted `false`
+      — so every recorded hardware result was obtained with it on, and the
+      script as tracked produced a driver the probe could not test at all
+      (`vkCreateDevice` rejects an unadvertised extension, so the entry
+      points cannot even be resolved). Now a deliberate, documented
+      toggle: `PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <dir>`.
+      `.EXT_transform_feedback` is nonetheless still left `false` by
+      default: still unsupported and asserted on are strip/fan topologies,
+      primitive restart with XFB active, multi-draw indirect and
       `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
       "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.

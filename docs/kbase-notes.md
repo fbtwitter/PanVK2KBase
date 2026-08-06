@@ -4916,3 +4916,59 @@ Still out of scope: multi-draw indirect (needs one capture per command so the
 write position advances between them — either the kernel loops or the driver
 emits N dispatches), strip/fan topologies, primitive restart, and
 `vkCmdDrawIndirectByteCountEXT`.
+
+## Verifying the patch script reproduces what was tested (2026-08-07)
+
+`patch-panvk-xfb-phase1.py` now patches eleven files across
+`src/panfrost/vulkan/` and `src/panfrost/libpan/`, so "it applies cleanly"
+stopped being something to take on trust.
+
+**The pin.** The XFB work was developed and verified against Mesa
+**`7296f9af84cd`**, which is what `/opt/mesa-src` is checked out at.
+`third_party/MESA-KMOD` is pinned *newer* (`43ec7c6b`), and upstream refactored
+`panvk_vX_shader.c` in between — `panvk_lower_load_vs_input`, one of the
+script's anchors, no longer exists there in the same form. That drift is what
+had been blocking verification.
+
+Rather than move either pin, verification runs against a **throwaway git
+worktree** of `MESA-KMOD` checked out at `7296f9af84cd`. That leaves the main
+checkout and its synced kbase backend completely untouched:
+
+```
+git -C third_party/MESA-KMOD worktree add --detach <tmp> 7296f9af84cd
+# ... copy in src/mesa/panvk_vX_cmd_xfb.c, run the script, compare ...
+git -C third_party/MESA-KMOD worktree remove --force <tmp>
+```
+
+One trap worth recording: the worktree's `.git` file holds a *Windows* path, so
+git commands against it fail from inside WSL. An early run reset the worktree
+with a silently-failing `git checkout --`, compared against a stale tree, and
+produced a falsely reassuring result — then a "converge" step copied that stale
+content back over `/opt/mesa-src`, undoing real fixes. Reset the worktree from
+Windows-side git; run the patch script from WSL.
+
+**Result**: applies cleanly (exit 0), is idempotent (second run reports
+"already patched" for every file, exit 0), and every file the script owns comes
+out **byte-identical** to the hardware-verified tree — 20/20 checks, including
+marker checks on the two files the kbase backend also modifies. The rebuilt
+driver passes all 24 probe modes.
+
+### The divergence this caught: the extension bit
+
+`/opt/mesa-src` carried
+`.EXT_transform_feedback = PAN_ARCH >= 10, /* TEMP: enabled for hardware
+verification */` — a temporary edit from early in the session — while the
+tracked script emitted `false`. So **every hardware result in these notes was
+obtained with the extension advertised**, and the script as tracked produced a
+driver `render_xfb_probe` could not test at all: `vkCreateDevice` rejects an
+extension the driver does not advertise, so the probe cannot even resolve the
+`Cmd*TransformFeedbackEXT` entry points.
+
+`false` remains correct for shipping. The fix is to make the difference
+deliberate and visible rather than a stray local edit:
+
+```
+PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <mesa-src-dir>
+```
+
+which is how the probe runs are reproduced.

@@ -128,6 +128,24 @@ mesa = sys.argv[1] if len(sys.argv) > 1 else "/opt/mesa-src"
 VULKAN_DIR = os.path.join(mesa, "src/panfrost/vulkan")
 LIBPAN_DIR = os.path.join(mesa, "src/panfrost/libpan")
 
+# Whether the patched driver advertises VK_EXT_transform_feedback.
+#
+# Off by default and that is the correct shipping value - the remaining gaps
+# (strip/fan topologies, primitive restart, multi-draw indirect,
+# vkCmdDrawIndirectByteCountEXT) are asserts rather than graceful failures, so
+# advertising the extension would turn "unsupported" into "abort".
+#
+# But tests/render_xfb_probe cannot run without it: vkCreateDevice rejects an
+# extension the driver does not advertise, so the probe cannot even resolve the
+# Cmd*TransformFeedbackEXT entry points. Every hardware result recorded in
+# docs/kbase-notes.md was therefore obtained with this ON. Set it via the
+# environment so that stays a deliberate, visible choice rather than a stray
+# local edit:
+#
+#   PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <mesa-src-dir>
+XFB_EXT_ENABLED = ("PAN_ARCH >= 10" if os.environ.get("PANVK_XFB_ADVERTISE")
+                   else "false")
+
 
 def patch_file(relpath, edits, done_marker, base=None):
     path = os.path.join(base or VULKAN_DIR, relpath)
@@ -208,11 +226,16 @@ patch_file(
             "   struct panvk_shader_desc_info desc_info;\n"
             "\n"
             "   /* VK_EXT_transform_feedback, phase 1: single-stream, no GS/tess.\n"
-            "    * Only set on a MESA_SHADER_VERTEX panvk_shader when the SPIR-V\n"
-            "    * module has XFB-decorated outputs (nir->xfb_info != NULL at\n"
-            "    * compile time). A separate, heap-allocated variant rather than\n"
-            "    * growing PANVK_VS_VARIANTS unconditionally, since every other\n"
-            "    * vertex shader has no use for it - see docs/kbase-notes.md.\n"
+            "    * Only set on a MESA_SHADER_VERTEX panvk_shader when the SPIR-V module\n"
+            "    * has XFB-decorated outputs (nir->xfb_info != NULL at compile time).\n"
+            "    * A separate, heap-allocated variant rather than growing\n"
+            "    * PANVK_VS_VARIANTS unconditionally, since every other vertex shader\n"
+            "    * (the overwhelming majority) has no use for it - see\n"
+            "    * docs/kbase-notes.md for why this is a second compiled binary rather\n"
+            "    * than a flag on the render variant: it must run with no_idvs=true\n"
+            "    * (monolithic, always-shaded) since XFB has to capture every vertex's\n"
+            "    * output even for triangles the normal IDVS optimization would cull\n"
+            "    * before ever running the varying pass.\n"
             "    */\n"
             "   struct panvk_shader_variant *xfb_variant;\n"
             "\n"
@@ -249,8 +272,8 @@ patch_file(
             "   } vb;\n"
             "\n"
             "   /* VK_EXT_transform_feedback, phase 1: single-stream, no GS/tess.\n"
-            "    * Non-indexed, non-indirect vkCmdDraw only - see\n"
-            "    * docs/kbase-notes.md for the full phase-1 scope.\n"
+            "    * Non-indexed, non-indirect vkCmdDraw only - see docs/kbase-notes.md\n"
+            "    * for the full phase-1 scope.\n"
             "    */\n"
             "   struct {\n"
             "      struct panvk_attrib_buf bufs[MAX_XFB_BUFFERS];\n"
@@ -1234,16 +1257,22 @@ patch_file(
         (
             "      .EXT_vertex_input_dynamic_state = true,\n",
             "      .EXT_vertex_input_dynamic_state = true,\n"
-            "      /* VK_EXT_transform_feedback, phase 1 (single-stream, no GS/tess):\n"
-            "       * command-buffer state, the two-variant shader compile, and the\n"
-            "       * compute dispatch all exist (csf/panvk_vX_cmd_xfb.c), but the\n"
-            "       * dispatch still faults (VK_ERROR_DEVICE_LOST) - suspected missing\n"
-            "       * cross-subqueue synchronization between PANVK_SUBQUEUE_COMPUTE\n"
-            "       * (where it runs) and PANVK_SUBQUEUE_VERTEX_TILER (where the draw\n"
-            "       * it depends on runs). Leave disabled until fixed and verified on\n"
-            "       * real hardware - see docs/kbase-notes.md.\n"
+            "      /* VK_EXT_transform_feedback, single-stream, no GS/tess.\n"
+            "       *\n"
+            "       * The capture itself works: non-indexed, indexed, instanced,\n"
+            "       * indirect and indexed-indirect draws all capture correctly, with\n"
+            "       * counter-buffer resume, the XFB stream query, and bounds clamping\n"
+            "       * against the bound buffer sizes (csf/panvk_vX_cmd_xfb.c plus\n"
+            "       * panlib_xfb_setup in libpan/draw_helper.cl).\n"
+            "       *\n"
+            "       * It stays disabled because the gaps that remain are asserts, not\n"
+            "       * graceful failures: strip/fan topologies, primitive restart with\n"
+            "       * XFB active, multi-draw indirect, and\n"
+            "       * vkCmdDrawIndirectByteCountEXT. Advertising the extension would\n"
+            "       * turn \"unsupported\" into \"abort\" for applications that use any of\n"
+            "       * them. See docs/kbase-notes.md.\n"
             "       */\n"
-            "      .EXT_transform_feedback = false,\n",
+            "      .EXT_transform_feedback = " + XFB_EXT_ENABLED + ",\n",
         ),
         (
             "      /* VK_EXT_provoking_vertex */\n"
