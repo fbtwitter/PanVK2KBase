@@ -1899,9 +1899,24 @@ Tools worth knowing about before touching any of this:
       `--indirect` and especially `--indirect --instanced`, where a broken
       `num_vertices` patch would make instance 1 read past the vertex
       buffer. All twenty probe modes pass, device healthy.
+      **Indexed indirect landed (2026-08-06)** — `vkCmdDrawIndexedIndirect`,
+      and as cheap as predicted: one more push-uniform patch in a kernel
+      that already did two. The counts needed no work at all (both command
+      structs share their first two fields). `firstIndex` (word 2) does:
+      the queued draw carries the **unbiased** index-buffer base and the
+      kernel writes `base + firstIndex * index_size` into the
+      `xfb.index_buffer` sysval, whereas a *direct* indexed draw still
+      carries the pre-biased address since the host knows `firstIndex`
+      there. `vertexOffset` sits at word 3 where the non-indexed command
+      has `firstVertex` at word 2, so `GLOBAL_ATTRIBUTE_OFFSET` loads from
+      12 rather than 8. The test is self-checking: the `{2,0,1}` indices
+      permute the vertices, so a mis-applied bias (or an ignored index
+      buffer) shows up as the *unpermuted* order the probe already names
+      as a distinct failure. All twenty-four probe modes pass, device
+      healthy.
       `.EXT_transform_feedback` is nonetheless still left `false`: still
       unsupported and asserted on are strip/fan topologies, primitive
-      restart with XFB active, multi-draw indirect, indexed indirect and
+      restart with XFB active, multi-draw indirect and
       `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
       "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.

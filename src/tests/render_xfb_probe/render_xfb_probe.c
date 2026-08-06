@@ -428,6 +428,8 @@ main(int argc, char **argv)
    PFN_vkCmdDraw cmd_draw = GDPA(vkCmdDraw);
    PFN_vkCmdDrawIndexed cmd_draw_indexed = GDPA(vkCmdDrawIndexed);
    PFN_vkCmdDrawIndirect cmd_draw_indirect = GDPA(vkCmdDrawIndirect);
+   PFN_vkCmdDrawIndexedIndirect cmd_draw_indexed_indirect =
+      GDPA(vkCmdDrawIndexedIndirect);
    PFN_vkCmdCopyImageToBuffer cmd_copy_img_to_buf =
       GDPA(vkCmdCopyImageToBuffer);
    PFN_vkQueueSubmit queue_submit = GDPA(vkQueueSubmit);
@@ -550,7 +552,8 @@ main(int argc, char **argv)
 
       VkBufferCreateInfo ibci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = sizeof(VkDrawIndirectCommand),
+         .size = indexed_mode ? sizeof(VkDrawIndexedIndirectCommand)
+                              : sizeof(VkDrawIndirectCommand),
          .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
@@ -576,18 +579,31 @@ main(int argc, char **argv)
       r = bind_buf_mem(device, indirect_buf, indirect_memory, 0);
       check(r == VK_SUCCESS, "vkBindBufferMemory (indirect buffer)");
 
-      VkDrawIndirectCommand *icmd = NULL;
-      r = map_mem(device, indirect_memory, 0, VK_WHOLE_SIZE, 0, (void **)&icmd);
+      void *icmd = NULL;
+      r = map_mem(device, indirect_memory, 0, VK_WHOLE_SIZE, 0, &icmd);
       check(r == VK_SUCCESS, "vkMapMemory (indirect buffer)");
       if (r != VK_SUCCESS)
          return 1;
 
-      icmd->vertexCount = BASE_VERTS;
-      icmd->instanceCount = instance_count();
-      icmd->firstVertex = 0;
-      icmd->firstInstance = 0;
-      printf("  wrote {vertexCount=%u, instanceCount=%u, firstVertex=0}\n",
-             icmd->vertexCount, icmd->instanceCount);
+      if (indexed_mode) {
+         VkDrawIndexedIndirectCommand *c = icmd;
+         c->indexCount = BASE_VERTS;
+         c->instanceCount = instance_count();
+         c->firstIndex = 0;
+         c->vertexOffset = 0;
+         c->firstInstance = 0;
+         printf("  wrote {indexCount=%u, instanceCount=%u, firstIndex=0, "
+                "vertexOffset=0}\n",
+                c->indexCount, c->instanceCount);
+      } else {
+         VkDrawIndirectCommand *c = icmd;
+         c->vertexCount = BASE_VERTS;
+         c->instanceCount = instance_count();
+         c->firstVertex = 0;
+         c->firstInstance = 0;
+         printf("  wrote {vertexCount=%u, instanceCount=%u, firstVertex=0}\n",
+                c->vertexCount, c->instanceCount);
+      }
    }
 
    /* ---------------------------------------------------------- index buffer */
@@ -1030,7 +1046,12 @@ main(int argc, char **argv)
       printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
    }
 
-   if (indirect_mode) {
+   if (indirect_mode && indexed_mode) {
+      cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
+      printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
+      cmd_draw_indexed_indirect(cmdbuf, indirect_buf, 0, 1, 0);
+      printf("  vkCmdDrawIndexedIndirect(1 draw) recorded\n");
+   } else if (indirect_mode) {
       cmd_draw_indirect(cmdbuf, indirect_buf, 0, 1, 0);
       printf("  vkCmdDrawIndirect(1 draw) recorded\n");
    } else if (indexed_mode) {

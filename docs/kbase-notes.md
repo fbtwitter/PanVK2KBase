@@ -4885,8 +4885,34 @@ it. `--indirect --instanced --query` additionally confirms the kernel derived
 2 primitives written/generated from the buffer. All twenty probe-mode
 combinations pass, device healthy.
 
-Still out of scope: multi-draw indirect (needs one capture per command, so the
-write position advances between them — the kernel would have to loop, or the
-driver emit N dispatches), indexed indirect (the `xfb.index_buffer` sysval
-would need biasing by a `firstIndex` that only exists on the GPU, so the
-kernel would patch that slot too), and `vkCmdDrawIndirectByteCountEXT`.
+### Indexed indirect
+
+`vkCmdDrawIndexedIndirect` followed, and was as cheap as predicted — one more
+push-uniform patch in a kernel that already did two.
+
+`VkDrawIndexedIndirectCommand` is `{indexCount, instanceCount, firstIndex,
+vertexOffset, firstInstance}`. The counts at words 0 and 1 needed no work,
+exactly because the non-indexed command has the same first two fields. Two
+things did:
+
+- **`firstIndex`** (word 2). The capture shader's `xfb.index_buffer` sysval
+  has to point at the draw's *first* index, and that bias only exists on the
+  GPU. The queued draw therefore carries the **unbiased** index-buffer base
+  and the kernel writes `base + firstIndex * index_size` into the sysval slot.
+  A *direct* indexed draw still carries the pre-biased address, since the host
+  knows `firstIndex` there — the two are told apart by `indirect_buffer` being
+  set.
+- **`vertexOffset`** (word 3), where the non-indexed command has `firstVertex`
+  at word 2. Same `GLOBAL_ATTRIBUTE_OFFSET` load, different offset — `12`
+  rather than `8`.
+
+**Test**: `--indirect --indexed` is self-checking in a useful way. The indices
+`{2,0,1}` permute the vertices, so a `firstIndex` bias applied wrongly (or the
+index buffer ignored entirely) shows up immediately as the *unpermuted* order,
+which the probe already names as a distinct failure. It captures `(C, A, B)`
+as required. All twenty-four probe-mode combinations pass, device healthy.
+
+Still out of scope: multi-draw indirect (needs one capture per command so the
+write position advances between them — either the kernel loops or the driver
+emits N dispatches), strip/fan topologies, primitive restart, and
+`vkCmdDrawIndirectByteCountEXT`.

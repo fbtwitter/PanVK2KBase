@@ -369,6 +369,15 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          .out_slots = out_slots.gpu,
          .query = query_ptr,
          .indirect = indirect_buffer,
+         .index_buffer_base = index_buffer,
+         .index_size = index_size,
+         .index_buffer_pu =
+            indirect_buffer && index_size && push_uniforms.gpu &&
+                  shader_uses_sysval(xfb_variant, graphics, xfb.index_buffer)
+               ? push_uniforms.gpu +
+                    shader_remapped_sysval_offset(
+                       xfb_variant, sysval_offset(graphics, xfb.index_buffer))
+               : 0,
          .num_vertices_pu =
             indirect_buffer && push_uniforms.gpu &&
                   shader_uses_sysval(xfb_variant, graphics, xfb.num_vertices)
@@ -413,13 +422,14 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
        * vertexOffset maths in the shader.
        */
       if (indirect_buffer) {
-         /* firstVertex is the third word of VkDrawIndirectCommand. Reading it
-          * from an application buffer needs no cache flush - nothing in our
-          * command stream produced it.
+         /* firstVertex is word 2 of VkDrawIndirectCommand, but the indexed
+          * command has vertexOffset at word 3 instead. Reading either from an
+          * application buffer needs no cache flush - nothing in our command
+          * stream produced it.
           */
          cs_move64_to(b, cs_scratch_reg64(b, 8), indirect_buffer);
          cs_load32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                      cs_scratch_reg64(b, 8), 8);
+                      cs_scratch_reg64(b, 8), index_size ? 12 : 8);
       } else {
          cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
                       (uint32_t)vertex_base);
