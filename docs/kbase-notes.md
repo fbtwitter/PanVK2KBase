@@ -4180,26 +4180,78 @@ across this whole debugging session, every time 0 failures, no wedged
 process, no reboot ever needed. The kbase backend and the device handled
 every one of these faulting submissions gracefully.
 
-Leading suspect for the remaining bug, not yet investigated: **PanVK's
-CSF backend has an explicit, deliberate cross-subqueue synchronization
-mechanism** — `struct panvk_cs_subqueue_context::syncobjs`, a
-per-subqueue array bumped/waited via `panvk_per_arch(cmd_signal_barrier)`
-(`csf/panvk_vX_cmd_dispatch.c`). Ordering between subqueues is never
-automatic; it must be explicitly requested. This dispatch runs on
-`PANVK_SUBQUEUE_COMPUTE` and depends on vertex-buffer bindings and
-render-target setup done for the draw on `PANVK_SUBQUEUE_VERTEX_TILER`,
-but establishes no synchronization relationship between the two at all —
-and a purely-graphics command buffer (no real `vkCmdDispatch` calls) may
-not even initialize the `COMPUTE` subqueue's context/TLS the way this
-dispatch assumes. Either of those could explain a clean GPU-level fault
-exactly like the one observed. This needs real investigation into how
-PanVK initializes and synchronizes subqueues within one command buffer —
-out of scope for this session; picking it up is the next concrete step.
+## Cross-subqueue synchronization investigation (2026-08-06, continued)
 
-`.EXT_transform_feedback` stays `false` until this is found and fixed and
-`tests/render_xfb_probe` (written, builds, runs against real hardware,
-exercises exactly this path — bind an XFB buffer, draw a triangle,
-byte-compare captured output against the render's own geometry) passes
-end to end. Phase 1 scope is deliberately narrow regardless: non-indexed,
-non-indirect `vkCmdDraw` only, single buffer/stream, no counter-buffer
-resume, no `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT`.
+Followed up on the leading suspect above and found a real, concrete
+structural problem — not just a vague "needs a barrier" guess.
+
+**Root cause found: the dispatch fired before the only thing it could
+validly wait on existed.** Traced `flush_tiling()`
+(`csf/panvk_vX_cmd_draw.c`) — the function that signals
+`PANVK_SUBQUEUE_VERTEX_TILER`'s completion syncobj and increments
+`cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER].relative_sync_point`, the
+only value another subqueue can correctly wait on. It's called **exactly
+once, from `panvk_per_arch(CmdEndRendering)`**, flushing the entire render
+pass's tiler work as one batch — never per draw. The original
+`cmd_dispatch_xfb_capture` fired immediately inside `CmdDraw`, while the
+render pass was still open, before `flush_tiling()` had ever run for it.
+Any wait it inserted would read a stale sync point from a *previous*
+render pass (or nothing, if this was the first). Found direct precedent
+for this exact class of problem already solved elsewhere in PanVK:
+`panvk_cmd_end_occlusion_query()` explicitly defers its own GPU-side work
+when "the render pass is active... we let `EndRendering` take care of it"
+(`csf/panvk_vX_cmd_query.c:305-309`).
+
+**Fix implemented**: restructured to a queue-and-flush model. `CmdDraw`
+now records pending draws into `xfb.pending_draws[]`
+(`panvk_cmd_draw.h`) instead of dispatching immediately.
+`panvk_per_arch(cmd_flush_pending_xfb_captures)()` — called from
+`CmdEndRendering` right after `flush_tiling()` — replays them, and each
+dispatch now inserts an explicit cross-subqueue wait mirroring
+`emit_barrier_insert_waits()`'s exact primitives (`cs_subqueue_ctx_reg`,
+`struct panvk_cs_subqueue_context::syncobjs`, `cs_progress_seqno_reg`,
+`panvk_instr_sync64_wait`) against the now-valid, just-incremented
+`relative_sync_point`.
+
+**Still faults identically after this fix** (`VK_ERROR_DEVICE_LOST`,
+device stays fully healthy — confirmed again via `driver_compute_probe
+--fill`). This is a real, correct architectural fix in its own right
+(the previous code was provably waiting on the wrong thing, or nothing),
+but it wasn't sufficient on its own, meaning there is at least one more
+distinct problem.
+
+**A second candidate found but not confirmed as the culprit**: `cs->spd`
+in real `vkCmdDispatch`'s `cmd_dispatch_shader()` (`csf/panvk_vX_cmd_dispatch.c:191`)
+reads the plain `.spd` field (built via `panvk_shader_upload()`'s
+non-vertex branch, `cfg.stage = pan_shader_stage(&shader->info)` →
+`MALI_SHADER_STAGE_COMPUTE` for any non-VS/FS stage). The XFB variant is
+still `MESA_SHADER_VERTEX`-stage NIR (needed for `bifrost_postprocess_nir`'s
+VS-specific lowering — viewport transform, point size, varying layout —
+to run at all), so `panvk_shader_upload()` routes it through the
+VERTEX-only branch and its SPD's `cfg.stage` field ends up declaring
+`MALI_SHADER_STAGE_VERTEX`, not `COMPUTE`. Checked whether this is a
+mismatch worth fixing: `pan_shader_stage()` has no `is_xfb`-style
+exception, so this is inherent to compiling anything as VS-stage NIR, and
+GL's own `csf_launch_xfb` reuses `batch->rsd[MESA_SHADER_VERTEX]` (also
+VERTEX-stage-declared) through the identical `cs_run_compute` call
+without apparent issue — so this is likely *not* the actual bug, but
+wasn't ruled out with full confidence, and is worth a real test (build a
+tiny standalone `no_idvs` VS-stage kernel dispatched via `cs_run_compute`
+in isolation, no XFB/attribute-fetch complexity, to check whether a
+VERTEX-declared SPD run as a COMPUTE job faults on its own) before
+discarding it entirely.
+
+**Where this stands**: two real, concrete architectural fixes landed
+(none of them the full answer on their own), the fault is unchanged, and
+further progress needs either a way to read the actual Mali fault
+registers (requires root, which this project explicitly avoids — see
+`feedback_no_root_prefer_prior_art`) or a more targeted isolation
+experiment than has been tried so far (e.g. the standalone VS-stage
+compute-dispatch test above, decoupled entirely from XFB/attribute-fetch
+concerns, to narrow whether the fault is in the dispatch mechanism itself
+or in something XFB-specific like the attribute table reuse).
+`.EXT_transform_feedback` stays `false` until this is resolved and
+`tests/render_xfb_probe` passes end to end. Phase 1 scope is deliberately
+narrow regardless: non-indexed, non-indirect `vkCmdDraw` only, single
+buffer/stream, no counter-buffer resume, no
+`VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT`.

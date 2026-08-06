@@ -19,8 +19,14 @@
  * a plain compute job on PANVK_SUBQUEUE_COMPUTE, reusing the render VS's
  * vs_desc_state->res_table for hardware attribute fetch - mirroring
  * Panfrost GL's GENX(csf_launch_xfb) in gallium/drivers/panfrost/pan_csf.c
- * as closely as possible. NOT independently verified beyond compiling
- * clean; the first real test is tests/render_xfb_probe on real hardware.
+ * as closely as PanVK's multi-subqueue CSF architecture allows.
+ *
+ * IMPORTANT: the dispatch cannot fire immediately in CmdDraw. Draws are
+ * queued (panvk_cmd_graphics_state::xfb.pending_draws, panvk_cmd_draw.h)
+ * and the actual capture dispatches only get emitted from
+ * panvk_per_arch(cmd_flush_pending_xfb_captures)(), called from
+ * CmdEndRendering right after flush_tiling() - see that function's
+ * comment for why.
  */
 
 #include "bifrost/bifrost_compile.h"
@@ -31,6 +37,7 @@
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_push_constant.h"
 #include "panvk_entrypoints.h"
+#include "panvk_instr.h"
 #include "panvk_macros.h"
 #include "panvk_mempool.h"
 
@@ -69,6 +76,7 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
       state->xfb.buffer_offset[i] = 0;
    }
 
+   state->xfb.pending_draw_count = 0;
    state->xfb.active = true;
 }
 
@@ -85,9 +93,13 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 
    /* vertexCount * instanceCount * stride is known on the host for phase
     * 1's non-indexed, non-indirect draws (accumulated into
-    * state->xfb.buffer_offset[] by cmd_dispatch_xfb_capture below on
-    * every vkCmdDraw while active), so the counter writeback is just a
-    * plain GPU store of a host-computed constant - no compute pass.
+    * state->xfb.buffer_offset[] by dispatch_one_xfb_capture below, once
+    * the queued draws are flushed at CmdEndRendering), so the counter
+    * writeback is just a plain GPU store of a host-computed constant - no
+    * compute pass. If EndTransformFeedback is called before the render
+    * pass ends (legal, if unusual), buffer_offset[] simply doesn't yet
+    * include draws still queued - phase 1 doesn't handle that ordering,
+    * matching the rest of its non-indirect-only scope.
     */
    if (counterBufferCount > 0) {
       struct cs_builder *b =
@@ -117,16 +129,17 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
    state->xfb.active = false;
 }
 
-/* Called from panvk_per_arch(CmdDraw) (panvk_vX_cmd_draw.c) right after a
- * non-indexed, non-indirect draw, when transform feedback is active.
- * Launches shader->xfb_variant as a plain compute job on
+/* Launches shader->xfb_variant as a plain compute job on
  * PANVK_SUBQUEUE_COMPUTE, one thread per (vertex, instance) pair, mirroring
  * GENX(csf_launch_xfb)'s register setup exactly where the two subqueue
- * models allow it to translate directly.
+ * models allow it to translate directly. Only called from
+ * panvk_per_arch(cmd_flush_pending_xfb_captures)() below, never directly
+ * from CmdDraw - see that function and the module comment for why.
  */
-void
-panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
-                                         const struct panvk_draw_info *draw)
+static void
+dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
+                         uint32_t vertex_count, uint32_t instance_count,
+                         uint32_t vertex_base)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
@@ -142,7 +155,7 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
     * own push-uniforms below, so there's no need to route through the
     * per-draw dirty-bit tracking the render VS/FS sysvals use.
     */
-   state->sysvals.xfb.num_vertices = draw->vertex.count;
+   state->sysvals.xfb.num_vertices = vertex_count;
    for (uint32_t i = 0; i < state->xfb.bound_count; i++) {
       state->sysvals.xfb.buffer_addrs[i] =
          state->xfb.bufs[i].address + state->xfb.buffer_offset[i];
@@ -157,8 +170,8 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
    }
 
    struct pan_compute_dim dim = {
-      .x = draw->vertex.count,
-      .y = draw->instance.count,
+      .x = vertex_count,
+      .y = instance_count,
       .z = 1,
    };
    uint64_t tsd = panvk_per_arch(cmd_dispatch_prepare_tls)(
@@ -181,6 +194,34 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
    const struct cs_tracing_ctx *tracing_ctx =
       &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].tracing;
+
+   /* Cross-subqueue dependency: this job reads the vertex attribute state
+    * (vs_desc_state->res_table) and render/TLS state the draw on
+    * PANVK_SUBQUEUE_VERTEX_TILER set up. PanVK never synchronizes
+    * subqueues automatically (see panvk_per_arch(emit_barrier) /
+    * collect_cs_deps in panvk_vX_cmd_buffer.c - it only fires off explicit
+    * VkMemoryBarrier2-family calls), so this has to insert its own wait,
+    * mirroring emit_barrier_insert_waits()'s exact primitives. This is
+    * only valid to do here, after flush_tiling() has just signalled
+    * VERTEX_TILER's syncobj and incremented its relative_sync_point - see
+    * docs/kbase-notes.md and cmd_flush_pending_xfb_captures() below.
+    */
+   {
+      struct cs_index sync_addr = cs_scratch_reg64(b, 0);
+      struct cs_index wait_val = cs_scratch_reg64(b, 2);
+
+      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
+      cs_add_imm64(b, sync_addr, sync_addr,
+                   sizeof(struct panvk_cs_sync64) * PANVK_SUBQUEUE_VERTEX_TILER);
+
+      cs_add_imm64(b, wait_val,
+                   cs_progress_seqno_reg(b, PANVK_SUBQUEUE_VERTEX_TILER),
+                   cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER].relative_sync_point);
+
+      panvk_instr_sync64_wait(cmdbuf, PANVK_SUBQUEUE_COMPUTE, false,
+                              MALI_CS_CONDITION_GREATER, wait_val, sync_addr);
+   }
 
    if (xfb_variant->info.tls_size) {
       cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
@@ -205,7 +246,7 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
        * VERTEX_OFFSET in the real IDVS draw (launch_draw()).
        */
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                   draw->vertex.base);
+                   vertex_base);
 
       struct mali_compute_size_workgroup_packed wg_size;
       pan_pack(&wg_size, COMPUTE_SIZE_WORKGROUP, cfg) {
@@ -223,9 +264,8 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), draw->vertex.count);
-      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y),
-                   draw->instance.count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), vertex_count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), instance_count);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
    }
 
@@ -248,7 +288,31 @@ panvk_per_arch(cmd_dispatch_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
          continue;
 
       state->xfb.buffer_offset[i] +=
-         (uint64_t)shader->xfb_strides[i] * draw->vertex.count *
-         draw->instance.count;
+         (uint64_t)shader->xfb_strides[i] * vertex_count * instance_count;
    }
+}
+
+/* Called from panvk_per_arch(CmdEndRendering) (csf/panvk_vX_cmd_draw.c),
+ * right after flush_tiling() - which is the only thing that signals
+ * PANVK_SUBQUEUE_VERTEX_TILER's syncobj and gives a compute dispatch on
+ * PANVK_SUBQUEUE_COMPUTE something valid to wait on. It runs once per
+ * render pass, not per draw, so the capture dispatch for draws recorded
+ * earlier in the same render pass (queued into xfb.pending_draws by
+ * CmdDraw) has to wait until here too - firing it directly from CmdDraw
+ * would wait on a stale (or nonexistent) sync point and, worse, inject a
+ * job into the middle of a still-open vertex/tiler batch. See
+ * docs/kbase-notes.md for the investigation that found this.
+ */
+void
+panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+
+   for (unsigned i = 0; i < state->xfb.pending_draw_count; i++) {
+      dispatch_one_xfb_capture(cmdbuf, state->xfb.pending_draws[i].vertex_count,
+                               state->xfb.pending_draws[i].instance_count,
+                               state->xfb.pending_draws[i].vertex_base);
+   }
+
+   state->xfb.pending_draw_count = 0;
 }

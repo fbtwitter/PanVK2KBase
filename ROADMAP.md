@@ -1662,17 +1662,38 @@ Tools worth knowing about before touching any of this:
       — a real GPU-level fault, but not a hang (confirmed via
       `driver_compute_probe --fill` immediately after every single
       attempt: 0 failures, no wedge, no reboot needed, every time).
-      Leading suspect for the remaining bug: PanVK's CSF backend has an
-      explicit, deliberate cross-subqueue sync mechanism
-      (`panvk_cs_subqueue_context::syncobjs`, one entry per subqueue) —
-      ordering between subqueues is never automatic, and this dispatch
-      establishes no such relationship between `PANVK_SUBQUEUE_COMPUTE`
-      (where it runs) and `PANVK_SUBQUEUE_VERTEX_TILER` (where the draw it
-      depends on runs); a purely-graphics command buffer may not even
-      initialize the COMPUTE subqueue's context. Not yet investigated
-      further. `.EXT_transform_feedback` stays `false` until this is found
-      and fixed and `tests/render_xfb_probe` (built, on-device, exercises
-      exactly this path) passes end to end. Full geometry-shader/
+      **Cross-subqueue sync investigated (2026-08-06, continued) — found
+      and fixed a real structural bug, but it wasn't the whole answer.**
+      `flush_tiling()` (`csf/panvk_vX_cmd_draw.c`) — the only thing that
+      signals `PANVK_SUBQUEUE_VERTEX_TILER`'s syncobj and gives
+      `PANVK_SUBQUEUE_COMPUTE` something valid to wait on — runs once per
+      render pass, from `CmdEndRendering`, never per draw. The dispatch
+      originally fired immediately inside `CmdDraw`, before `flush_tiling()`
+      had ever run, so any wait it inserted would target a stale or
+      nonexistent sync point. Direct precedent for deferring found
+      already in PanVK: `panvk_cmd_end_occlusion_query()` explicitly waits
+      for `EndRendering` for the same reason. **Fixed** with a
+      queue-and-flush restructure: `CmdDraw` now queues pending draws
+      (`xfb.pending_draws[]`), and
+      `panvk_per_arch(cmd_flush_pending_xfb_captures)()`, called from
+      `CmdEndRendering` right after `flush_tiling()`, replays them with an
+      explicit cross-subqueue wait against the just-incremented sync
+      point (mirroring `emit_barrier_insert_waits()`'s exact primitives).
+      **Still faults identically after this fix** —
+      `VK_ERROR_DEVICE_LOST`, device stays fully healthy every time. A
+      second candidate (the XFB variant's SPD declaring
+      `MALI_SHADER_STAGE_VERTEX` instead of `COMPUTE`) was checked and is
+      probably not it either, since GL's own `csf_launch_xfb` does the
+      same thing successfully. See `docs/kbase-notes.md` for the full
+      trace and the next suggested isolation experiment (a standalone
+      VS-stage compute dispatch, decoupled entirely from XFB/
+      attribute-fetch, to narrow down whether the fault is in the
+      dispatch mechanism itself or something XFB-specific). Further
+      progress likely needs either a way to read the actual Mali fault
+      registers (needs root — explicitly avoided in this project) or a
+      more targeted isolation experiment than tried so far.
+      `.EXT_transform_feedback` stays `false` until this is resolved and
+      `tests/render_xfb_probe` passes end to end. Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior
       art, ~11,000+ lines, multi-month even reused).

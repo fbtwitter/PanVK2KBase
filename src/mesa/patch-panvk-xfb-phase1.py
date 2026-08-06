@@ -27,19 +27,39 @@ the real Poco X8 Pro (Mali-G720) through two confirmed, fixed bugs:
      was reading uninitialized slot-0 registers. Fixed.
 
 Both fixes are confirmed via tombstone/behavior on real hardware and are
-included below. As of this fix, the capture dispatch still returns
-VK_ERROR_DEVICE_LOST at vkWaitForFences (a clean, recoverable GPU-level
-fault - the device stays fully healthy afterward, confirmed via
-driver_compute_probe --fill immediately after every attempt, no hang, no
-reboot needed at any point). The remaining suspect, not yet fixed: PanVK's
-CSF backend has an explicit, deliberate cross-subqueue sync mechanism
-(struct panvk_cs_subqueue_context::syncobjs, one entry per subqueue) -
-ordering between subqueues is never automatic. This dispatch establishes
-no such relationship between PANVK_SUBQUEUE_COMPUTE (where it runs) and
-PANVK_SUBQUEUE_VERTEX_TILER (where the draw it depends on runs), and a
-purely-graphics command buffer may not even initialize the COMPUTE
-subqueue's context at all. Needs further investigation before this is a
-working feature - .EXT_transform_feedback stays false until then.
+included below.
+
+A third issue was then found and fixed: flush_tiling() (csf/panvk_vX_cmd_draw.c)
+- the only thing that signals PANVK_SUBQUEUE_VERTEX_TILER's syncobj and
+gives PANVK_SUBQUEUE_COMPUTE something valid to wait on - runs once per
+render pass from CmdEndRendering, never per draw. The dispatch originally
+fired immediately inside CmdDraw, before flush_tiling() had ever run for
+that render pass, so any wait it inserted would be against a stale or
+nonexistent sync point. Fixed with a queue-and-flush restructure: CmdDraw
+now records pending draws (xfb.pending_draws[], panvk_cmd_draw.h) instead
+of dispatching immediately; panvk_per_arch(cmd_flush_pending_xfb_captures)(),
+called from CmdEndRendering right after flush_tiling(), replays them, each
+inserting an explicit cross-subqueue wait against the just-incremented
+relative_sync_point (mirroring emit_barrier_insert_waits()'s primitives:
+cs_subqueue_ctx_reg, panvk_cs_subqueue_context::syncobjs,
+cs_progress_seqno_reg, panvk_instr_sync64_wait).
+
+This is a real, correct fix in its own right (the previous code was
+provably waiting on the wrong thing, or nothing) but is not sufficient on
+its own: the dispatch still returns VK_ERROR_DEVICE_LOST at
+vkWaitForFences after this fix too - a clean, recoverable GPU-level fault,
+device stays fully healthy every time (confirmed via driver_compute_probe
+--fill after every single attempt across this whole investigation, no
+hang, no reboot needed, ever). A second candidate was found but not
+confirmed: the XFB variant's SPD declares MALI_SHADER_STAGE_VERTEX (it's
+still MESA_SHADER_VERTEX-stage NIR, needed for bifrost_postprocess_nir's
+VS-specific lowering to run), not MALI_SHADER_STAGE_COMPUTE, while it
+runs via cs_run_compute - but GL's own csf_launch_xfb does the same thing
+successfully, so this probably isn't it either. See docs/kbase-notes.md
+for the full trace and the suggested next isolation experiment (a
+standalone VS-stage compute dispatch, decoupled from XFB/attribute-fetch
+entirely). Needs further investigation before this is a working feature -
+.EXT_transform_feedback stays false until then.
 
 Not kbase-specific - like patch-panvk-null-device-destroy.py, this is
 genuine upstream PanVK/Mesa capability work, a candidate for upstreaming
@@ -147,8 +167,10 @@ patch_file(
     done_marker="MAX_XFB_BUFFERS",
 )
 
-# 2. panvk_cmd_draw.h: xfb command-buffer state block + the compute-dispatch
-#    entry point declaration (defined in csf/panvk_vX_cmd_xfb.c).
+# 2. panvk_cmd_draw.h: xfb command-buffer state block (including the
+#    pending-draw queue - see the module comment in panvk_vX_cmd_xfb.c for
+#    why the capture dispatch can't fire immediately in CmdDraw) + the
+#    flush entry point declaration (defined in csf/panvk_vX_cmd_xfb.c).
 patch_file(
     "panvk_cmd_draw.h",
     [
@@ -178,6 +200,18 @@ patch_file(
             "\n"
             "      /* Host-computed at record time for phase 1's non-indirect case. */\n"
             "      uint64_t buffer_offset[MAX_XFB_BUFFERS];\n"
+            "\n"
+            "      /* The capture compute dispatch cannot run immediately in CmdDraw:\n"
+            "       * flush_tiling() - the only thing that signals PANVK_SUBQUEUE_VERTEX_TILER's\n"
+            "       * syncobj and gives PANVK_SUBQUEUE_COMPUTE something valid to wait on -\n"
+            "       * runs once per render pass, from CmdEndRendering, not per draw. Draws\n"
+            "       * recorded while XFB is active are queued here and the actual dispatches\n"
+            "       * fire from CmdEndRendering, after flush_tiling(). See docs/kbase-notes.md.\n"
+            "       */\n"
+            "      struct {\n"
+            "         uint32_t vertex_count, instance_count, vertex_base;\n"
+            "      } pending_draws[16];\n"
+            "      unsigned pending_draw_count;\n"
             "   } xfb;\n",
         ),
         (
@@ -194,16 +228,18 @@ patch_file(
             "#endif\n"
             "};\n"
             "\n"
-            "/* VK_EXT_transform_feedback, phase 1: single-stream, no GS/tess.\n"
-            " * Defined in csf/panvk_vX_cmd_xfb.c; called from\n"
-            " * panvk_per_arch(CmdDraw) in csf/panvk_vX_cmd_draw.c right after a\n"
-            " * non-indexed, non-indirect draw, when transform feedback is active.\n"
+            "/* VK_EXT_transform_feedback, phase 1: single-stream, no GS/tess. Defined\n"
+            " * in csf/panvk_vX_cmd_xfb.c; called from panvk_per_arch(CmdEndRendering)\n"
+            " * in csf/panvk_vX_cmd_draw.c, after flush_tiling() has signalled this\n"
+            " * render pass's VERTEX_TILER syncobj - the capture dispatch waits on\n"
+            " * that signal, so it cannot run any earlier (see the xfb.pending_draws\n"
+            " * comment above).\n"
             " */\n"
-            "void panvk_per_arch(cmd_dispatch_xfb_capture)(\n"
-            "   struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw);\n",
+            "void panvk_per_arch(cmd_flush_pending_xfb_captures)(\n"
+            "   struct panvk_cmd_buffer *cmdbuf);\n",
         ),
     ],
-    done_marker="} xfb;",
+    done_marker="pending_draws[16]",
 )
 
 # 3. panvk_vX_shader.c: nir_xfb_info.h include, sysval intrinsic lowering,
@@ -413,9 +449,12 @@ patch_file(
     done_marker="CmdBindTransformFeedbackBuffersEXT",
 )
 
-# 5. csf/panvk_vX_cmd_draw.c: wire the capture dispatch into CmdDraw. Only
-#    non-indexed, non-indirect draws call this - CmdDrawIndexed and indirect
-#    draws deliberately do not, see docs/kbase-notes.md.
+# 5. csf/panvk_vX_cmd_draw.c: queue pending XFB draws in CmdDraw (only
+#    non-indexed, non-indirect draws - CmdDrawIndexed and indirect draws
+#    deliberately do not queue), and flush them in CmdEndRendering right
+#    after flush_tiling() - the capture dispatch cannot run any earlier,
+#    see the pending_draws comment in panvk_cmd_draw.h and
+#    docs/kbase-notes.md for the investigation that found this.
 patch_file(
     "csf/panvk_vX_cmd_draw.c",
     [
@@ -442,14 +481,49 @@ patch_file(
             "\n"
             "   /* VK_EXT_transform_feedback, phase 1: only non-indexed, non-indirect\n"
             "    * vkCmdDraw is supported - CmdDrawIndexed and indirect draws\n"
-            "    * deliberately do not call this. See docs/kbase-notes.md.\n"
+            "    * deliberately do not call this. The actual capture dispatch cannot\n"
+            "    * run here: flush_tiling() (CmdEndRendering) hasn't signalled this\n"
+            "    * render pass's VERTEX_TILER syncobj yet, so there's nothing valid for\n"
+            "    * the compute dispatch to wait on. Queue it instead - see\n"
+            "    * docs/kbase-notes.md and the xfb.pending_draws comment in\n"
+            "    * panvk_cmd_draw.h.\n"
             "    */\n"
-            "   if (cmdbuf->state.gfx.xfb.active)\n"
-            "      panvk_per_arch(cmd_dispatch_xfb_capture)(cmdbuf, &draw);\n"
+            "   if (cmdbuf->state.gfx.xfb.active) {\n"
+            "      unsigned n = cmdbuf->state.gfx.xfb.pending_draw_count;\n"
+            "      assert(n < ARRAY_SIZE(cmdbuf->state.gfx.xfb.pending_draws));\n"
+            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_count = vertexCount;\n"
+            "      cmdbuf->state.gfx.xfb.pending_draws[n].instance_count = instanceCount;\n"
+            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_base = firstVertex;\n"
+            "      cmdbuf->state.gfx.xfb.pending_draw_count = n + 1;\n"
+            "   }\n"
             "}",
         ),
+        (
+            "      if (cmdbuf->state.gfx.render.fbds.gpu || inherits_render_ctx(cmdbuf)) {\n"
+            "         flush_tiling(cmdbuf);\n"
+            "         issue_fragment_jobs(cmdbuf);\n"
+            "\n"
+            "         handle_deferred_queries(cmdbuf);\n"
+            "      }",
+            "      if (cmdbuf->state.gfx.render.fbds.gpu || inherits_render_ctx(cmdbuf)) {\n"
+            "         flush_tiling(cmdbuf);\n"
+            "\n"
+            "         /* VK_EXT_transform_feedback, phase 1: now that flush_tiling() has\n"
+            "          * signalled this render pass's VERTEX_TILER syncobj, the queued\n"
+            "          * capture dispatches have something valid to wait on. See\n"
+            "          * docs/kbase-notes.md and the xfb.pending_draws comment in\n"
+            "          * panvk_cmd_draw.h.\n"
+            "          */\n"
+            "         if (cmdbuf->state.gfx.xfb.pending_draw_count)\n"
+            "            panvk_per_arch(cmd_flush_pending_xfb_captures)(cmdbuf);\n"
+            "\n"
+            "         issue_fragment_jobs(cmdbuf);\n"
+            "\n"
+            "         handle_deferred_queries(cmdbuf);\n"
+            "      }",
+        ),
     ],
-    done_marker="cmd_dispatch_xfb_capture)(cmdbuf, &draw)",
+    done_marker="cmd_flush_pending_xfb_captures)(cmdbuf);",
 )
 
 # 6. panvk_vX_physical_device.c: extension table entry (explicitly disabled
