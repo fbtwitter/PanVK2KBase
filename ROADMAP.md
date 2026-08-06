@@ -82,6 +82,21 @@ why "headless triangle" (Phase 5) is nowhere near "usable in an emulator."
       third_party/MESA-KMOD`). Local/ephemeral to this machine only —
       gitignored, won't persist across clones of this repo, re-run the
       clone command if it's missing.
+      **Synced forward to `43ec7c6b` (2026-08-06), was pinned `c439d52c`
+      (2026-07-29 — 331 commits behind).** Fast-forward pull, no conflicts:
+      checked first and confirmed neither `src/panfrost/lib/kmod/` (where
+      the local kbase dispatch patch lives) nor `src/vulkan/runtime/
+      vk_meta_clear.c` (the `vkCmdClearColorImage` bug from the
+      `image_clearing` root-cause work above) were touched upstream in that
+      range, so the local patch reapplied cleanly and the clear bug is
+      still unaddressed upstream as of this commit. `src/panfrost/vulkan/`
+      did pick up unrelated churn (a new `panvk_nir_lower_cooperative_
+      matrix.c`, extension-support changes in `panvk_physical_device.c`).
+      Also deleted a stray `pan_kmod.c.orig` sitting untracked in the clone
+      — confirmed byte-identical to the pre-kbase-patch upstream file, a
+      leftover backup from whenever the dispatch patch was first applied,
+      not needed now that the patch and the pristine file are both
+      accounted for.
 - [x] Add a `pan_kmod_kbase` backend as a third `pan_kmod` backend
       alongside `panfrost` and `panthor` — **skeleton landed** at
       `src/mesa/pan_kmod_kbase.c`. Note it lives in *this* repo, not in
