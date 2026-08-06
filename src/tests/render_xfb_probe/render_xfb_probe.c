@@ -206,6 +206,16 @@ static bool resume_mode;
  */
 static bool indirect_mode;
 
+/* --multidraw mode: vkCmdDrawIndirect with drawCount == 2.
+ *
+ * Two commands each draw the same triangle, so the capture must hold it twice
+ * back-to-back. That is precisely what shows the GPU-resident write position
+ * advanced *between* commands - if it had not, the second capture would land
+ * on top of the first and the buffer's second half would still be poison.
+ */
+static bool multidraw_mode;
+#define MULTIDRAW_COUNT 2
+
 static int failures;
 
 static void
@@ -266,6 +276,10 @@ main(int argc, char **argv)
          resume_mode = true;
       else if (strcmp(argv[i], "--indirect") == 0)
          indirect_mode = true;
+      else if (strcmp(argv[i], "--multidraw") == 0) {
+         indirect_mode = true;
+         multidraw_mode = true;
+      }
    }
    printf("mode: %s%s%s%s\n",
           indexed_mode ? "indexed (vkCmdDrawIndexed)"
@@ -277,7 +291,8 @@ main(int argc, char **argv)
       printf("       + resume (counter buffer seeded to %d bytes)\n",
              RESUME_START_BYTES);
    if (indirect_mode)
-      printf("       + indirect (vkCmdDrawIndirect)\n");
+      printf("       + indirect (vkCmdDrawIndirect%s)\n",
+             multidraw_mode ? ", drawCount=2" : "");
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -552,8 +567,9 @@ main(int argc, char **argv)
 
       VkBufferCreateInfo ibci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = indexed_mode ? sizeof(VkDrawIndexedIndirectCommand)
-                              : sizeof(VkDrawIndirectCommand),
+         .size = (VkDeviceSize)MULTIDRAW_COUNT *
+                 (indexed_mode ? sizeof(VkDrawIndexedIndirectCommand)
+                               : sizeof(VkDrawIndirectCommand)),
          .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
@@ -585,25 +601,27 @@ main(int argc, char **argv)
       if (r != VK_SUCCESS)
          return 1;
 
-      if (indexed_mode) {
-         VkDrawIndexedIndirectCommand *c = icmd;
-         c->indexCount = BASE_VERTS;
-         c->instanceCount = instance_count();
-         c->firstIndex = 0;
-         c->vertexOffset = 0;
-         c->firstInstance = 0;
-         printf("  wrote {indexCount=%u, instanceCount=%u, firstIndex=0, "
-                "vertexOffset=0}\n",
-                c->indexCount, c->instanceCount);
-      } else {
-         VkDrawIndirectCommand *c = icmd;
-         c->vertexCount = BASE_VERTS;
-         c->instanceCount = instance_count();
-         c->firstVertex = 0;
-         c->firstInstance = 0;
-         printf("  wrote {vertexCount=%u, instanceCount=%u, firstVertex=0}\n",
-                c->vertexCount, c->instanceCount);
+      uint32_t ncmd = multidraw_mode ? MULTIDRAW_COUNT : 1;
+
+      for (uint32_t k = 0; k < ncmd; k++) {
+         if (indexed_mode) {
+            VkDrawIndexedIndirectCommand *c =
+               (VkDrawIndexedIndirectCommand *)icmd + k;
+            c->indexCount = BASE_VERTS;
+            c->instanceCount = instance_count();
+            c->firstIndex = 0;
+            c->vertexOffset = 0;
+            c->firstInstance = 0;
+         } else {
+            VkDrawIndirectCommand *c = (VkDrawIndirectCommand *)icmd + k;
+            c->vertexCount = BASE_VERTS;
+            c->instanceCount = instance_count();
+            c->firstVertex = 0;
+            c->firstInstance = 0;
+         }
       }
+      printf("  wrote %u command(s), %u vertices x %u instance(s) each\n",
+             ncmd, BASE_VERTS, instance_count());
    }
 
    /* ---------------------------------------------------------- index buffer */
@@ -655,7 +673,7 @@ main(int argc, char **argv)
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
    const VkDeviceSize xfb_size =
-      resume_mode
+      (resume_mode || multidraw_mode)
          ? (VkDeviceSize)MAX_CAPTURE_VERTS * sizeof(EXPECTED_XFB[0])
          : (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
@@ -1049,11 +1067,15 @@ main(int argc, char **argv)
    if (indirect_mode && indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
-      cmd_draw_indexed_indirect(cmdbuf, indirect_buf, 0, 1, 0);
-      printf("  vkCmdDrawIndexedIndirect(1 draw) recorded\n");
+      uint32_t ncmd = multidraw_mode ? MULTIDRAW_COUNT : 1;
+      cmd_draw_indexed_indirect(cmdbuf, indirect_buf, 0, ncmd,
+                                sizeof(VkDrawIndexedIndirectCommand));
+      printf("  vkCmdDrawIndexedIndirect(%u draw(s)) recorded\n", ncmd);
    } else if (indirect_mode) {
-      cmd_draw_indirect(cmdbuf, indirect_buf, 0, 1, 0);
-      printf("  vkCmdDrawIndirect(1 draw) recorded\n");
+      uint32_t ncmd = multidraw_mode ? MULTIDRAW_COUNT : 1;
+      cmd_draw_indirect(cmdbuf, indirect_buf, 0, ncmd,
+                        sizeof(VkDrawIndirectCommand));
+      printf("  vkCmdDrawIndirect(%u draw(s)) recorded\n", ncmd);
    } else if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
@@ -1222,6 +1244,34 @@ main(int argc, char **argv)
          goto xfb_done;
       }
 
+      if (multidraw_mode) {
+         /* Each command captures the whole triangle, so command k must land at
+          * offset k * sizeof(EXPECTED_XFB). Anything else means the write
+          * position did not advance between commands.
+          */
+         const float(*want)[4] =
+            indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
+         bool all_ok = true;
+
+         for (uint32_t k = 0; k < MULTIDRAW_COUNT; k++) {
+            bool ok = memcmp(raw + k * sizeof(EXPECTED_XFB), want,
+                             sizeof(EXPECTED_XFB)) == 0;
+            printf("  command[%u] capture at offset %zu %s\n", k,
+                   k * sizeof(EXPECTED_XFB), ok ? "ok" : "MISMATCH");
+            all_ok = all_ok && ok;
+         }
+         check(all_ok, "each indirect command captured to its own region");
+
+         bool second_untouched = true;
+         for (size_t i = sizeof(EXPECTED_XFB); i < 2 * sizeof(EXPECTED_XFB); i++)
+            second_untouched = second_untouched && raw[i] == 0x11;
+         if (second_untouched)
+            printf("  NOTE: the second half is untouched poison - the write\n"
+                   "  position did not advance between indirect commands.\n");
+
+         goto xfb_done;
+      }
+
       const float(*expected)[4] =
          indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
 
@@ -1301,8 +1351,25 @@ main(int argc, char **argv)
           * too small for the whole primitive, which is exactly the --overflow
           * case - so that is where written and generated must disagree.
           */
-         const uint64_t want_generated = instance_count();
-         const uint64_t want_written = overflow_mode ? 0 : instance_count();
+         /* One triangle per instance, per indirect command. Multi-draw makes
+          * the query span both commands, since it is scoped to the render
+          * pass rather than to a single draw.
+          */
+         const uint64_t draws = multidraw_mode ? MULTIDRAW_COUNT : 1;
+         const uint64_t want_generated = instance_count() * draws;
+
+         /* "written" is what actually fit. Derive it from the bound buffer
+          * rather than assuming everything did: --multidraw --instanced
+          * deliberately generates more than the buffer holds, so the first
+          * command fills it and the second is clamped away entirely. That
+          * divergence is the whole point of the query.
+          */
+         const uint64_t capacity_prims =
+            ((uint64_t)xfb_size / sizeof(EXPECTED_XFB[0])) / BASE_VERTS;
+         const uint64_t want_written =
+            overflow_mode ? 0
+                          : (want_generated < capacity_prims ? want_generated
+                                                             : capacity_prims);
 
          printf("  primitives written   = %llu (expected %llu)\n",
                 (unsigned long long)results[0],
@@ -1352,7 +1419,11 @@ main(int argc, char **argv)
    }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && indirect_mode)
+   if (failures == 0 && multidraw_mode)
+      printf("\n=> VK_EXT_transform_feedback multi-draw indirect works:\n"
+             "   each command captured to its own region, so the GPU-resident\n"
+             "   write position advanced between them.\n");
+   else if (failures == 0 && indirect_mode)
       printf("\n=> VK_EXT_transform_feedback indirect capture works:\n"
              "   the draw counts came from GPU memory, and the capture's grid,\n"
              "   clamp and num_vertices were all derived from them.\n");

@@ -1935,9 +1935,27 @@ Tools worth knowing about before touching any of this:
       (`vkCreateDevice` rejects an unadvertised extension, so the entry
       points cannot even be resolved). Now a deliberate, documented
       toggle: `PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <dir>`.
+      **Multi-draw indirect landed (2026-08-07)** — and needed *no kernel
+      change at all*. Each command is an independent draw and
+      `panlib_xfb_setup()` already advances the GPU-resident write
+      position once per capture, so the driver just queues N pending
+      captures at record time, one per command at `base + i * stride`;
+      they run in order on the compute subqueue, each picking up where the
+      last left off. Both indirect entry points now share one
+      `xfb_queue_indirect_captures()` helper. Tested by `--multidraw`,
+      which requires the triangle to appear twice at offsets 0 and 48 —
+      had the position not advanced, the second capture would land on the
+      first and the buffer's second half would stay poison. Two *probe*
+      expectations were wrong before the driver was: `--multidraw --query`
+      reports 2 primitives (two commands, two triangles; the query is
+      scoped to the render pass), and `--multidraw --instanced --query`
+      reports 2 written against 4 generated because the six-vertex buffer
+      is filled entirely by command 0 — the bounds clamp working *across*
+      a multi-draw. The probe now derives "written" from buffer capacity
+      rather than assuming everything fits. All 29 probe modes pass.
       `.EXT_transform_feedback` is nonetheless still left `false` by
       default: still unsupported and asserted on are strip/fan topologies,
-      primitive restart with XFB active, multi-draw indirect and
+      primitive restart with XFB active and
       `vkCmdDrawIndirectByteCountEXT` — so advertising it would turn
       "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.

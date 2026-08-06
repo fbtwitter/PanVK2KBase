@@ -4912,9 +4912,44 @@ index buffer ignored entirely) shows up immediately as the *unpermuted* order,
 which the probe already names as a distinct failure. It captures `(C, A, B)`
 as required. All twenty-four probe-mode combinations pass, device healthy.
 
-Still out of scope: multi-draw indirect (needs one capture per command so the
-write position advances between them — either the kernel loops or the driver
-emits N dispatches), strip/fan topologies, primitive restart, and
+### Multi-draw indirect
+
+`drawCount > 1` turned out to need **no kernel change at all**. Each command is
+an independent draw, and `panlib_xfb_setup()` already advances the GPU-resident
+write position once per capture — so the driver simply queues N pending
+captures at record time, one per command, each pointing at
+`base + i * stride`. They execute in order on `PANVK_SUBQUEUE_COMPUTE` and each
+one's setup kernel picks up the position the previous left behind.
+
+Both `CmdDrawIndirect` and `CmdDrawIndexedIndirect` now share one
+`xfb_queue_indirect_captures()` helper, which also folds in the
+primitive-restart assert and the `pending_draws[]` capacity check. `stride` is
+only meaningful when `drawCount > 1` — Vulkan lets it be anything for a single
+draw — hence the `sizeof(command)` fallback.
+
+**Test**: `--multidraw` issues two commands each drawing the triangle, and
+requires the capture to hold it twice back-to-back, at offsets 0 and 48. If the
+write position had *not* advanced between commands the second capture would
+land on top of the first and the buffer's second half would stay poison, which
+the probe calls out by name.
+
+Two probe expectations were wrong before the driver was — worth recording,
+because in both cases the driver was right:
+
+1. `--multidraw --query` reported 2 primitives where the probe expected 1. Two
+   commands means two triangles; the query is scoped to the render pass, not to
+   a single draw.
+2. `--multidraw --instanced --query` reported 2 written against 4 generated.
+   Also correct: the buffer holds six vertices, so command 0 (2 instances × 3
+   vertices) fills it entirely and command 1 is clamped away completely. That
+   is the bounds clamp working *across* a multi-draw, and exactly the
+   divergence the query exists to report.
+
+The probe now derives "written" from the bound buffer's capacity rather than
+assuming everything fits, so the expectation stays correct for any combination
+of flags.
+
+Still out of scope: strip/fan topologies, primitive restart, and
 `vkCmdDrawIndirectByteCountEXT`.
 
 ## Verifying the patch script reproduces what was tested (2026-08-07)
