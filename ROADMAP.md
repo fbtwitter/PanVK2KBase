@@ -2096,6 +2096,35 @@ Tools worth knowing about before touching any of this:
       backend in `bi_make_vec_to` (`holes_*`,
       `max_output_components_64/128`) were excluded from the run rather
       than fixed — still open, still in the shared compiler.
+- [x] **The rest of `dEQP-VK.transform_feedback.*` measured** (2026-08-07,
+      after the snapshot fix). Cheap sizing pass before more design work,
+      and it changes where the remaining value is:
+      - **`fuzz` (2,168) — 415 Pass / 0 Fail / 1,753 NotSupported.** Never
+        run before; clean on the first attempt, no crashes, no freeze.
+      - **`primitives_generated_query` (107,866)** — a 79-case stride
+        sample across the whole group came back 100% NotSupported, as did
+        the first 40. Not proof of all 107,866, but enough to say this is
+        not where the value is despite being 80% of the extension's cases.
+      - **`simple_fast_gpl` / `simple_optimized_gpl` (7,891 each)** — these
+        do execute, so they are not free skips. A 25-case sample was 15
+        Pass / 8 Fail / 2 NotSupported, and all 8 failures are the same
+        `backward_dependency*` cases as in `simple`, mirrored through
+        `VK_EXT_graphics_pipeline_library`. Running them in full is
+        deferred: on this evidence it re-measures the class below rather
+        than finding a new one.
+      - **`primitive_restart` (4) — 1 Pass / 3 Fail, and pre-existing.**
+        All three report `Unexpected value in XFB counter buffer: got 48
+        and expected 240`. This is not a regression from the snapshot
+        work: proven by rebuilding the exact tree the first CTS run used
+        (the pre-restore diff, kept when `/opt/mesa-src` was restored) and
+        measuring it at the same 1/4. Worth noting the roadmap recorded
+        this group as "run" without recording its result - which is how
+        three failures sat unnoticed. **Record the number, not the fact
+        that you ran it.**
+      Note for whoever runs the GPL groups: `libvulkan_panfrost_xfb.so` on
+      the device is *not* a usable baseline. It predates the
+      `load_raw_vertex_offset` fix and segfaults on the first
+      `primitive_restart` case.
 - [ ] **Next: counter-buffer reads within one render pass.** All 9
       remaining failures are one class — eight `backward_dependency*` and
       `draw_indirect_counter_resubmit`. They write a counter buffer at
@@ -2106,6 +2135,11 @@ Tools worth knowing about before touching any of this:
       This is inherent to deferring the writeback that far, not a
       snapshot problem, and unpicking it means finding a point where the
       write positions are final but the render pass is not over.
+      The `fuzz` result above sharpens this: it is now the *only* known
+      failing class in the extension apart from the three
+      `primitive_restart` counter-buffer failures, and the GPL groups
+      duplicate it rather than adding to it. Whatever fixes it also
+      clears the 8 mirrored GPL cases.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior
