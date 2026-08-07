@@ -5253,3 +5253,64 @@ combination was never meaningful. `--restart` is the indexed strip path.
 All 43 mode combinations pass, `driver_compute_probe --fill` passes afterwards,
 and the patch script reproduces the tested tree byte-for-byte (23/23, and
 idempotent on a second apply).
+
+## Primitive restart with an indirect draw (2026-08-07)
+
+The last reachable gap. It had been asserted on with the reason "there is no
+host index count to size the slot table with" — which was true, and also not
+the question that mattered.
+
+### The host never needed the real count
+
+Restart makes slot → input vertex data-dependent, so `panlib_xfb_setup()` walks
+the index buffer and writes a resolved table the shader reads directly. That
+walk already took its index count from the indirect command
+(`vertex_count = indirect ? indirect[0] : direct_vertex_count`), so the *kernel*
+side was already correct. What blocked the combination was purely the host,
+which allocates the table.
+
+But allocating does not need the exact count — only an upper bound. And the
+bound index buffer is one: a draw cannot consume more indices than the buffer
+holds. `gfx->ib.size / index_size` is known at record time, indirect or not.
+So the queue entry carries a new `index_count_bound`: the real index count for
+a direct draw, the buffer's capacity for an indirect one. It over-allocates,
+never under-allocates, and the worst case is one `uint32_t` per index per
+vertex-per-primitive.
+
+### The one genuinely new line: firstIndex
+
+For a direct indexed draw the host pre-biases the index pointer by
+`firstIndex`. An indirect draw cannot: `firstIndex` is word 2 of
+`VkDrawIndexedIndirectCommand`, readable only on the GPU. The restart walk was
+still starting at the unbiased base, so it would have assembled primitives from
+the wrong indices. The kernel now applies the bias itself.
+
+This was the only piece with no existing coverage, so it got a negative
+control. `--firstindex` pads the index stream with two leading entries the draw
+must skip (`{3,3, 0,1,2, 0xFFFF, 1,2,3}`, `firstIndex=2`), chosen so that a
+walk starting at 0 assembles visibly different primitives rather than the right
+answer by luck. With the bias removed the probe fails exactly as predicted:
+
+```
+captured[0] = (0.800, 0.800) expected (-0.800, -0.800)
+restart split the strip into two runs correctly          FAILED
+```
+
+and passes with it restored. Verifying that a new test can fail is worth the
+extra build cycle — a test that passes both ways proves nothing.
+
+### Incidental cleanup
+
+`dispatch_one_xfb_capture()` had grown to ten positional arguments and this
+would have made eleven. Since the queue entry is now a named struct
+(`struct panvk_xfb_pending_draw`, from the growable-queue work), it takes that
+instead. Costs nothing in the patch script: `csf/panvk_vX_cmd_xfb.c` is copied
+in wholesale rather than literal-patched.
+
+All 48 probe-mode combinations pass, `driver_compute_probe --fill` passes
+afterwards, and the patch script reproduces the tested tree byte-for-byte
+(23/23, idempotent on re-apply).
+
+The only remaining unsupported case is adjacency and patch-list topologies,
+which is unreachable: they require `geometryShader` or `tessellationShader`,
+and both are reported `false`.

@@ -2014,17 +2014,26 @@ Tools worth knowing about before touching any of this:
       by asserts that compile out under `NDEBUG`. A release build
       recording a 17th captured draw in one render pass wrote past the
       array. It is now a `util_dynarray`, so any number of captured draws
-      works, freed on command-buffer reset and destroy. Two asserts
-      remain, neither reachable-and-unsafe: restart combined with an
-      indirect draw (wrong data, not a wrong pointer), and
-      adjacency/patch-list topologies, which need `geometryShader` or
-      `tessellationShader` — both reported `false`, so a conformant
-      application cannot create such a pipeline at all. New probe mode
-      `--manydraws` records 40 captured draws in one render pass; all 43
-      mode combinations pass, the device recovers clean, and the patch
-      script reproduces the tested tree byte-for-byte (23/23). The env
+      works, freed on command-buffer reset and destroy. New probe mode
+      `--manydraws` records 40 captured draws in one render pass. The env
       toggle inverted accordingly: `PANVK_XFB_HIDE=1` now turns the
       extension off.
+      **Primitive restart with an indirect draw landed (2026-08-07)** —
+      the last reachable gap. The kernel already read its index count
+      from the indirect command; only the host, which allocates the
+      restart slot table, was blocked. It turned out never to need the
+      real count, just an upper bound, and the bound index buffer is one:
+      a draw cannot consume more indices than the buffer holds. The one
+      genuinely new piece was `firstIndex`, which a direct draw gets
+      pre-biased by the host but an indirect draw carries in word 2 of
+      its command, so the kernel applies it. That got a negative control
+      — a new `--firstindex` mode pads the index stream with entries the
+      draw must skip, and it fails exactly as predicted with the bias
+      removed. All 48 mode combinations pass, the device recovers clean,
+      and the patch script reproduces the tested tree byte-for-byte
+      (23/23). The only unsupported case left is adjacency/patch-list
+      topologies, which is unreachable: they need `geometryShader` or
+      `tessellationShader` and both are reported `false`.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

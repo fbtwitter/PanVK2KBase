@@ -163,12 +163,19 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
  */
 static void
 dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
-                         uint32_t vertex_count, uint32_t instance_count,
-                         int32_t vertex_base, uint64_t index_buffer,
-                         uint32_t index_size, uint64_t query_ptr,
-                         uint32_t xfb_topology, uint64_t indirect_buffer,
-                         uint32_t restart_index)
+                         const struct panvk_xfb_pending_draw *draw)
 {
+   const uint32_t vertex_count = draw->vertex_count;
+   const uint32_t instance_count = draw->instance_count;
+   const int32_t vertex_base = draw->vertex_base;
+   const uint64_t index_buffer = draw->index_buffer;
+   const uint32_t index_size = draw->index_size;
+   const uint64_t query_ptr = draw->query_ptr;
+   const uint32_t xfb_topology = draw->xfb_topology;
+   const uint64_t indirect_buffer = draw->indirect_buffer;
+   const uint32_t restart_index = draw->restart_index;
+   const uint32_t index_count_bound = draw->index_count_bound;
+
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
 
@@ -209,15 +216,20 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
 
    /* Primitive restart makes slot -> input vertex data-dependent, so the
     * kernel resolves it into this table and the shader reads it directly.
-    * Sized by the worst case: every index could complete a primitive.
+    * Sized by the worst case: every index could complete a primitive, so a
+    * strip needs verts_per_prim entries per index.
+    *
+    * index_count_bound rather than vertex_count, because an indirect draw's
+    * real count is only in the indirect command. It is the capacity of the
+    * bound index buffer there, which over-allocates but is never too small.
     */
    struct pan_ptr slot_table = {0};
-   if (restart_index) {
+   if (restart_index && index_count_bound) {
       uint32_t vpp = xfb_topology == PANVK_XFB_TOPO_POINT_LIST      ? 1
                      : xfb_topology <= PANVK_XFB_TOPO_LINE_STRIP    ? 2
                                                                     : 3;
       slot_table = panvk_cmd_alloc_dev_mem(
-         cmdbuf, desc, (uint64_t)vertex_count * vpp * sizeof(uint32_t),
+         cmdbuf, desc, (uint64_t)index_count_bound * vpp * sizeof(uint32_t),
          sizeof(uint32_t));
       if (!slot_table.gpu) {
          vk_command_buffer_set_error(&cmdbuf->vk,
@@ -524,10 +536,7 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
 
    util_dynarray_foreach(&state->xfb.pending_draws,
                          struct panvk_xfb_pending_draw, d) {
-      dispatch_one_xfb_capture(cmdbuf, d->vertex_count, d->instance_count,
-                               d->vertex_base, d->index_buffer, d->index_size,
-                               d->query_ptr, d->xfb_topology,
-                               d->indirect_buffer, d->restart_index);
+      dispatch_one_xfb_capture(cmdbuf, d);
    }
 
    util_dynarray_clear(&state->xfb.pending_draws);

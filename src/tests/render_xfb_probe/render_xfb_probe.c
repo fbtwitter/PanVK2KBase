@@ -286,6 +286,23 @@ static const uint16_t INDICES_RESTART[RESTART_INDEX_COUNT] = {
    0, 1, 2, 0xFFFF, 1, 2, 3,
 };
 
+/* --firstindex mode: the same restart stream, preceded by padding the draw
+ * must skip. The padding is deliberately *not* the restart sentinel and not a
+ * valid continuation, so a walk starting at 0 assembles different primitives.
+ */
+static bool firstindex_mode;
+#define FIRSTINDEX_PAD 2
+static const uint16_t INDICES_RESTART_PADDED[FIRSTINDEX_PAD +
+                                             RESTART_INDEX_COUNT] = {
+   3, 3, 0, 1, 2, 0xFFFF, 1, 2, 3,
+};
+
+static uint32_t
+first_index(void)
+{
+   return firstindex_mode ? FIRSTINDEX_PAD : 0;
+}
+
 static const float EXPECTED_XFB_RESTART[6][4] = {
    {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
    {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
@@ -313,6 +330,15 @@ draw_vertex_count(void)
 /* Strips and fans assemble n-2 triangles from n vertices; the list topologies
  * assemble n/3.
  */
+/* Indices consumed by an indexed draw. Restart feeds a longer stream than the
+ * vertex count, because the sentinel entries are consumed but never drawn.
+ */
+static uint32_t
+draw_index_count(void)
+{
+   return restart_mode ? RESTART_INDEX_COUNT : draw_vertex_count();
+}
+
 static uint32_t
 draw_prim_count(void)
 {
@@ -392,6 +418,15 @@ main(int argc, char **argv)
          strip_mode = true;  /* shares the 4-vertex setup */
          fan_mode = true;
       }
+      else if (strcmp(argv[i], "--firstindex") == 0) {
+         /* Only meaningful for an indexed draw, and the padded stream is the
+          * restart one, so it implies both.
+          */
+         strip_mode = true;
+         indexed_mode = true;
+         restart_mode = true;
+         firstindex_mode = true;
+      }
       else if (strcmp(argv[i], "--manydraws") == 0)
          manydraws_mode = true;
       else if (strcmp(argv[i], "--multidraw") == 0) {
@@ -423,6 +458,9 @@ main(int argc, char **argv)
              STRIP_VERTS);
    if (restart_mode)
       printf("       + restart (indexed strip split by 0xFFFF)\n");
+   if (firstindex_mode)
+      printf("       + firstindex (%d padding indices the draw must skip)\n",
+             FIRSTINDEX_PAD);
    if (manydraws_mode)
       printf("       + manydraws (%d draws in one render pass, past the old "
              "16-entry queue)\n",
@@ -758,9 +796,9 @@ main(int argc, char **argv)
          if (indexed_mode) {
             VkDrawIndexedIndirectCommand *c =
                (VkDrawIndexedIndirectCommand *)icmd + k;
-            c->indexCount = draw_vertex_count();
+            c->indexCount = draw_index_count();
             c->instanceCount = instance_count();
-            c->firstIndex = 0;
+            c->firstIndex = first_index();
             c->vertexOffset = 0;
             c->firstInstance = 0;
          } else {
@@ -783,7 +821,9 @@ main(int argc, char **argv)
 
       VkBufferCreateInfo ibo_bci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = restart_mode ? sizeof(INDICES_RESTART) : sizeof(INDICES),
+         .size = firstindex_mode ? sizeof(INDICES_RESTART_PADDED)
+                 : restart_mode ? sizeof(INDICES_RESTART)
+                                : sizeof(INDICES),
          .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
@@ -815,7 +855,12 @@ main(int argc, char **argv)
       check(r == VK_SUCCESS, "vkMapMemory (IBO)");
       if (r != VK_SUCCESS)
          return 1;
-      if (restart_mode) {
+      if (firstindex_mode) {
+         memcpy(ibo_mapped, INDICES_RESTART_PADDED,
+                sizeof(INDICES_RESTART_PADDED));
+         printf("  wrote indices {3,3, 0,1,2, 0xFFFF, 1,2,3} - the leading\n"
+                "  two must be skipped via firstIndex=%d\n", FIRSTINDEX_PAD);
+      } else if (restart_mode) {
          memcpy(ibo_mapped, INDICES_RESTART, sizeof(INDICES_RESTART));
          printf("  wrote indices {0,1,2, 0xFFFF, 1,2,3} - two runs of three\n");
       } else {
@@ -1243,9 +1288,9 @@ main(int argc, char **argv)
    } else if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
-      uint32_t nidx = restart_mode ? RESTART_INDEX_COUNT : BASE_VERTS;
+      uint32_t nidx = draw_index_count();
       for (uint32_t d = 0; d < draw_repeat_count(); d++)
-         cmd_draw_indexed(cmdbuf, nidx, instance_count(), 0, 0, 0);
+         cmd_draw_indexed(cmdbuf, nidx, instance_count(), first_index(), 0, 0);
       printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded x%u\n", nidx,
              instance_count(), draw_repeat_count());
    } else {
