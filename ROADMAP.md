@@ -2307,6 +2307,17 @@ Tools worth knowing about before touching any of this:
       question.md`. Sent after the other two, deliberately — it reads as
       a status report with two live questions attached rather than a cold
       introduction.
+- [ ] **READY TO SEND, not yet sent: the modifier NULL-check fix.**
+      `docs/upstream-modifier-null-patch.md` holds the patch, a Mesa-style
+      commit message and an MR description with the hardware evidence.
+      PanVK segfaults instead of returning an error when handed a DRM
+      format modifier it has no handler for - `pan_mod_get_handler()`
+      returns NULL, `panvk_image_init_layouts()` stores it unchecked, and
+      `pan_image_layout_init()` only `assert()`s, which release builds
+      compile out. Not kbase-specific and reachable without Android.
+      Verified on hardware (2026-08-07). Kept local for now deliberately;
+      send when convenient. Rebase onto current main first - this tree is
+      pinned and the anchor may have moved.
 - [ ] If accepted, land behind an env var gate (precedent:
       `PAN_USE_KRAID=1` for the new shader compiler), small reviewable
       MRs per phase, not one large dump.
