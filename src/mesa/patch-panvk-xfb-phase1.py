@@ -130,21 +130,21 @@ LIBPAN_DIR = os.path.join(mesa, "src/panfrost/libpan")
 
 # Whether the patched driver advertises VK_EXT_transform_feedback.
 #
-# Off by default and that is the correct shipping value - the remaining gaps
-# (strip/fan topologies, primitive restart, multi-draw indirect,
-# vkCmdDrawIndirectByteCountEXT) are asserts rather than graceful failures, so
-# advertising the extension would turn "unsupported" into "abort".
+# On by default now. Every entry point the extension defines is implemented and
+# hardware-verified (43 render_xfb_probe mode combinations on a Mali-G720), and
+# the capture queue is growable rather than a fixed array, so a render pass may
+# record any number of captured draws.
 #
-# But tests/render_xfb_probe cannot run without it: vkCreateDevice rejects an
-# extension the driver does not advertise, so the probe cannot even resolve the
-# Cmd*TransformFeedbackEXT entry points. Every hardware result recorded in
-# docs/kbase-notes.md was therefore obtained with this ON. Set it via the
-# environment so that stays a deliberate, visible choice rather than a stray
-# local edit:
+# Two gaps remain, both asserted rather than silently wrong: primitive restart
+# combined with an indirect draw (there is no host index count to size the slot
+# table with), and adjacency/patch-list topologies - which need geometryShader
+# or tessellationShader, both of which this driver reports as false, so a
+# conformant application cannot reach them at all.
 #
-#   PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <mesa-src-dir>
-XFB_EXT_ENABLED = ("PAN_ARCH >= 10" if os.environ.get("PANVK_XFB_ADVERTISE")
-                   else "false")
+# Set PANVK_XFB_HIDE=1 to emit `false` instead and keep the extension out of
+# the reported list without reverting the implementation.
+XFB_EXT_ENABLED = ("false" if os.environ.get("PANVK_XFB_HIDE")
+                   else "PAN_ARCH >= 10")
 
 
 def patch_file(relpath, edits, done_marker, base=None):
@@ -329,48 +329,13 @@ patch_file(
             "       * runs once per render pass, from CmdEndRendering, not per draw. Draws\n"
             "       * recorded while XFB is active are queued here and the actual dispatches\n"
             "       * fire from CmdEndRendering, after flush_tiling(). See docs/kbase-notes.md.\n"
+            "       *\n"
+            "       * Growable: a render pass may record any number of captured draws, and\n"
+            "       * there is no hardware limit to size a fixed array against. Cleared by\n"
+            "       * cmd_flush_pending_xfb_captures(), freed when the command buffer is\n"
+            "       * reset or destroyed.\n"
             "       */\n"
-            "      struct {\n"
-            "         uint32_t vertex_count, instance_count;\n"
-            "\n"
-            "         /* Non-indexed: firstVertex. Indexed: vertexOffset. Either way it\n"
-            "          * is what GLOBAL_ATTRIBUTE_OFFSET gets programmed with, which is\n"
-            "          * exactly the bias hardware attribute fetch applies.\n"
-            "          */\n"
-            "         int32_t vertex_base;\n"
-            "\n"
-            "         /* Phase 2: 0 for a non-indexed draw, otherwise the address of the\n"
-            "          * draw's first index (already biased by firstIndex).\n"
-            "          */\n"
-            "         uint64_t index_buffer;\n"
-            "         uint32_t index_size;\n"
-            "\n"
-            "         /* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: snapshotted per\n"
-            "          * draw, because the query may be ended before CmdEndRendering\n"
-            "          * flushes these captures and clears the live state. 0 = no query.\n"
-            "          */\n"
-            "         uint64_t query_ptr;\n"
-            "\n"
-            "         /* enum panvk_xfb_topology. The kernel derives both\n"
-            "          * verts_per_prim and the primitive count from it, since strips\n"
-            "          * and fans share vertices between adjacent primitives.\n"
-            "          */\n"
-            "         uint32_t xfb_topology;\n"
-            "\n"
-            "         /* Primitive restart: the sentinel index value, 0 when restart is\n"
-            "          * off. panlib_xfb_setup() needs it to split the index stream into\n"
-            "          * runs.\n"
-            "          */\n"
-            "         uint32_t restart_index;\n"
-            "\n"
-            "         /* vkCmdDrawIndirect: address of the VkDrawIndirectCommand. 0 for a\n"
-            "          * direct draw, where vertex_count/instance_count above are already\n"
-            "          * the real counts. When set, panlib_xfb_setup() reads the counts\n"
-            "          * from here instead.\n"
-            "          */\n"
-            "         uint64_t indirect_buffer;\n"
-            "      } pending_draws[16];\n"
-            "      unsigned pending_draw_count;\n"
+            "      struct util_dynarray pending_draws;\n"
             "   } xfb;\n",
         ),
         (
@@ -397,8 +362,58 @@ patch_file(
             "void panvk_per_arch(cmd_flush_pending_xfb_captures)(\n"
             "   struct panvk_cmd_buffer *cmdbuf);\n",
         ),
+        (
+            "struct panvk_cmd_graphics_state {\n",
+            "struct panvk_xfb_pending_draw {\n"
+            "   uint32_t vertex_count, instance_count;\n"
+            "\n"
+            "   /* Non-indexed: firstVertex. Indexed: vertexOffset. Either way it\n"
+            "    * is what GLOBAL_ATTRIBUTE_OFFSET gets programmed with, which is\n"
+            "    * exactly the bias hardware attribute fetch applies.\n"
+            "    */\n"
+            "   int32_t vertex_base;\n"
+            "\n"
+            "   /* Phase 2: 0 for a non-indexed draw, otherwise the address of the\n"
+            "    * draw's first index (already biased by firstIndex).\n"
+            "    */\n"
+            "   uint64_t index_buffer;\n"
+            "   uint32_t index_size;\n"
+            "\n"
+            "   /* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: snapshotted per\n"
+            "    * draw, because the query may be ended before CmdEndRendering\n"
+            "    * flushes these captures and clears the live state. 0 = no query.\n"
+            "    */\n"
+            "   uint64_t query_ptr;\n"
+            "\n"
+            "   /* enum panvk_xfb_topology. The kernel derives both\n"
+            "    * verts_per_prim and the primitive count from it, since strips\n"
+            "    * and fans share vertices between adjacent primitives.\n"
+            "    */\n"
+            "   uint32_t xfb_topology;\n"
+            "\n"
+            "   /* Primitive restart: the sentinel index value, 0 when restart is\n"
+            "    * off. panlib_xfb_setup() needs it to split the index stream into\n"
+            "    * runs.\n"
+            "    */\n"
+            "   uint32_t restart_index;\n"
+            "\n"
+            "   /* vkCmdDrawIndirect: address of the VkDrawIndirectCommand. 0 for a\n"
+            "    * direct draw, where vertex_count/instance_count above are already\n"
+            "    * the real counts. When set, panlib_xfb_setup() reads the counts\n"
+            "    * from here instead.\n"
+            "    */\n"
+            "   uint64_t indirect_buffer;\n"
+            "};\n"
+            "\n"
+            "struct panvk_cmd_graphics_state {\n",
+        ),
+        (
+            '#include "panvk_blend.h"\n',
+            '#include "util/u_dynarray.h"\n'
+            '#include "panvk_blend.h"\n',
+        ),
     ],
-    done_marker="pending_draws[16]",
+    done_marker="panvk_xfb_pending_draw",
 )
 
 # 3. panvk_vX_shader.c: nir_xfb_info.h include, sysval intrinsic lowering,
@@ -1113,20 +1128,15 @@ patch_file(
             "    * panvk_cmd_draw.h.\n"
             "    */\n"
             "   if (cmdbuf->state.gfx.xfb.active) {\n"
-            "      unsigned n = cmdbuf->state.gfx.xfb.pending_draw_count;\n"
-            "      assert(n < ARRAY_SIZE(cmdbuf->state.gfx.xfb.pending_draws));\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_count = vertexCount;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].instance_count = instanceCount;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_base = firstVertex;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].index_buffer = 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].index_size = 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].restart_index = 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].indirect_buffer = 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].query_ptr =\n"
-            "         cmdbuf->state.gfx.xfb_query.ptr;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].xfb_topology =\n"
-            "         xfb_topology(cmdbuf);\n"
-            "      cmdbuf->state.gfx.xfb.pending_draw_count = n + 1;\n"
+            "      struct panvk_xfb_pending_draw *d = xfb_queue_draw(cmdbuf);\n"
+            "\n"
+            "      if (d != NULL) {\n"
+            "         d->vertex_count = vertexCount;\n"
+            "         d->instance_count = instanceCount;\n"
+            "         d->vertex_base = firstVertex;\n"
+            "         d->query_ptr = cmdbuf->state.gfx.xfb_query.ptr;\n"
+            "         d->xfb_topology = xfb_topology(cmdbuf);\n"
+            "      }\n"
             "   }\n"
             "}",
         ),
@@ -1171,27 +1181,25 @@ patch_file(
             "             \"VK_EXT_transform_feedback: primitive restart with transform \"\n"
             "             \"feedback active is not supported yet\");\n"
             "\n"
-            "      unsigned n = cmdbuf->state.gfx.xfb.pending_draw_count;\n"
-            "      assert(n < ARRAY_SIZE(cmdbuf->state.gfx.xfb.pending_draws));\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_count = indexCount;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].instance_count = instanceCount;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].vertex_base = vertexOffset;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].index_buffer =\n"
-            "         gfx->ib.dev_addr + ((uint64_t)firstIndex * gfx->ib.index_size);\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].index_size = gfx->ib.index_size;\n"
-            "      /* The restart sentinel is all-ones at the index width. */\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].restart_index =\n"
-            "         cmdbuf->vk.dynamic_graphics_state.ia.primitive_restart_enable\n"
-            "            ? (gfx->ib.index_size == 4   ? 0xffffffffu\n"
-            "               : gfx->ib.index_size == 2 ? 0xffffu\n"
-            "                                         : 0xffu)\n"
-            "            : 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].indirect_buffer = 0;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].query_ptr =\n"
-            "         cmdbuf->state.gfx.xfb_query.ptr;\n"
-            "      cmdbuf->state.gfx.xfb.pending_draws[n].xfb_topology =\n"
-            "         xfb_topology(cmdbuf);\n"
-            "      cmdbuf->state.gfx.xfb.pending_draw_count = n + 1;\n"
+            "      struct panvk_xfb_pending_draw *d = xfb_queue_draw(cmdbuf);\n"
+            "\n"
+            "      if (d != NULL) {\n"
+            "         d->vertex_count = indexCount;\n"
+            "         d->instance_count = instanceCount;\n"
+            "         d->vertex_base = vertexOffset;\n"
+            "         d->index_buffer =\n"
+            "            gfx->ib.dev_addr + ((uint64_t)firstIndex * gfx->ib.index_size);\n"
+            "         d->index_size = gfx->ib.index_size;\n"
+            "         /* The restart sentinel is all-ones at the index width. */\n"
+            "         d->restart_index =\n"
+            "            cmdbuf->vk.dynamic_graphics_state.ia.primitive_restart_enable\n"
+            "               ? (gfx->ib.index_size == 4   ? 0xffffffffu\n"
+            "                  : gfx->ib.index_size == 2 ? 0xffffu\n"
+            "                                            : 0xffu)\n"
+            "               : 0;\n"
+            "         d->query_ptr = cmdbuf->state.gfx.xfb_query.ptr;\n"
+            "         d->xfb_topology = xfb_topology(cmdbuf);\n"
+            "      }\n"
             "   }\n"
             "}\n",
         ),
@@ -1373,6 +1381,28 @@ patch_file(
         (
             "VKAPI_ATTR void VKAPI_CALL\n"
             "panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,",
+            "/* VK_EXT_transform_feedback: queue one draw for capture at CmdEndRendering.\n"
+            " *\n"
+            " * Returns the slot to fill in, or NULL if it could not be allocated - in which\n"
+            " * case the error is already recorded on the command buffer and the caller just\n"
+            " * skips this capture.\n"
+            " */\n"
+            "static struct panvk_xfb_pending_draw *\n"
+            "xfb_queue_draw(struct panvk_cmd_buffer *cmdbuf)\n"
+            "{\n"
+            "   struct util_dynarray *draws = &cmdbuf->state.gfx.xfb.pending_draws;\n"
+            "   struct panvk_xfb_pending_draw *d = util_dynarray_grow(\n"
+            "      draws, struct panvk_xfb_pending_draw, 1);\n"
+            "\n"
+            "   if (d == NULL) {\n"
+            "      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);\n"
+            "      return NULL;\n"
+            "   }\n"
+            "\n"
+            "   memset(d, 0, sizeof(*d));\n"
+            "   return d;\n"
+            "}\n"
+            "\n"
             "/* VK_EXT_transform_feedback: the current topology, as the capture path sees it.\n"
             " *\n"
             " * Strips and fans are supported now: the kernel derives both verts_per_prim\n"
@@ -1432,30 +1462,24 @@ patch_file(
             "          \"VK_EXT_transform_feedback: primitive restart with an indirect draw \"\n"
             "          \"is not supported - there is no host index count to size the \"\n"
             "          \"slot table with\");\n"
-            "   assert(gfx->xfb.pending_draw_count + draw_count <=\n"
-            "             ARRAY_SIZE(gfx->xfb.pending_draws) &&\n"
-            "          \"VK_EXT_transform_feedback: too many draws captured in one render \"\n"
-            "          \"pass\");\n"
             "\n"
             "   uint32_t topo = xfb_topology(cmdbuf);\n"
             "\n"
             "   for (uint32_t i = 0; i < draw_count; i++) {\n"
-            "      unsigned n = gfx->xfb.pending_draw_count;\n"
+            "      struct panvk_xfb_pending_draw *d = xfb_queue_draw(cmdbuf);\n"
             "\n"
-            "      if (n >= ARRAY_SIZE(gfx->xfb.pending_draws))\n"
-            "         break;\n"
+            "      if (d == NULL)\n"
+            "         return;\n"
             "\n"
-            "      gfx->xfb.pending_draws[n].vertex_count = 0;\n"
-            "      gfx->xfb.pending_draws[n].instance_count = 0;\n"
-            "      gfx->xfb.pending_draws[n].vertex_base = 0;\n"
-            "      gfx->xfb.pending_draws[n].index_buffer = index_buffer;\n"
-            "      gfx->xfb.pending_draws[n].index_size = index_size;\n"
-            "      gfx->xfb.pending_draws[n].query_ptr = gfx->xfb_query.ptr;\n"
-            "      gfx->xfb.pending_draws[n].xfb_topology = topo;\n"
-            "      gfx->xfb.pending_draws[n].restart_index = 0;\n"
-            "      gfx->xfb.pending_draws[n].indirect_buffer =\n"
-            "         cmd_addr + (uint64_t)i * stride;\n"
-            "      gfx->xfb.pending_draw_count = n + 1;\n"
+            "      /* vertex_count/instance_count stay 0: the kernel reads the real\n"
+            "       * counts out of the indirect command instead.\n"
+            "       */\n"
+            "      d->index_buffer = index_buffer;\n"
+            "      d->index_size = index_size;\n"
+            "      d->query_ptr = gfx->xfb_query.ptr;\n"
+            "      d->xfb_topology = topo;\n"
+            "      d->indirect_buffer = cmd_addr + (uint64_t)i * stride;\n"
+            "   }\n"
             "   }\n"
             "}\n"
             "VKAPI_ATTR void VKAPI_CALL\n"
@@ -1477,7 +1501,9 @@ patch_file(
             "          * docs/kbase-notes.md and the xfb.pending_draws comment in\n"
             "          * panvk_cmd_draw.h.\n"
             "          */\n"
-            "         if (cmdbuf->state.gfx.xfb.pending_draw_count)\n"
+            "         if (util_dynarray_num_elements(\n"
+            "                &cmdbuf->state.gfx.xfb.pending_draws,\n"
+            "                struct panvk_xfb_pending_draw))\n"
             "            panvk_per_arch(cmd_flush_pending_xfb_captures)(cmdbuf);\n"
             "\n"
             "         issue_fragment_jobs(cmdbuf);\n"
@@ -1720,7 +1746,8 @@ patch_file(
             "    * publish the query before its counters were written, so hand the\n"
             "    * availability write to the flush instead.\n"
             "    */\n"
-            "   if (cmd->state.gfx.xfb.pending_draw_count) {\n"
+            "   if (util_dynarray_num_elements(&cmd->state.gfx.xfb.pending_draws,\n"
+            "                                  struct panvk_xfb_pending_draw)) {\n"
             "      cmd->state.gfx.xfb_query.deferred_syncobj = syncobj;\n"
             "      return;\n"
             "   }\n"
@@ -2103,6 +2130,41 @@ patch_file(
     ],
     done_marker="panlib_xfb_setup",
     base=LIBPAN_DIR,
+)
+
+
+# 12. csf/panvk_vX_cmd_buffer.c: free the growable capture queue. Reset
+#     memsets the whole state struct, which would otherwise strand the
+#     allocation; a zeroed util_dynarray is a valid empty one, so nothing
+#     needs re-initialising afterwards.
+patch_file(
+    "csf/panvk_vX_cmd_buffer.c",
+    [
+        (
+            "   memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));\n"
+            "   init_cs_builders(cmdbuf);",
+            "   /* Frees the heap allocation before the memset below strands it. A\n"
+            "    * zeroed util_dynarray is a valid empty one, so nothing re-inits it.\n"
+            "    */\n"
+            "   util_dynarray_fini(&cmdbuf->state.gfx.xfb.pending_draws);\n"
+            "\n"
+            "   memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));\n"
+            "   init_cs_builders(cmdbuf);",
+        ),
+        (
+            "   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)\n"
+            "      cs_builder_fini(&cmdbuf->state.cs[i].builder);\n"
+            "\n"
+            "   panvk_pool_cleanup",
+            "   util_dynarray_fini(&cmdbuf->state.gfx.xfb.pending_draws);\n"
+            "\n"
+            "   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)\n"
+            "      cs_builder_fini(&cmdbuf->state.cs[i].builder);\n"
+            "\n"
+            "   panvk_pool_cleanup",
+        ),
+    ],
+    done_marker="util_dynarray_fini(&cmdbuf->state.gfx.xfb.pending_draws)",
 )
 
 

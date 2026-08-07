@@ -2007,11 +2007,24 @@ Tools worth knowing about before touching any of this:
       so it needs its own cache flush in that direction. All 40 probe
       modes pass and the script still reproduces the tested tree
       byte-for-byte, so `transformFeedbackDraw` is now `true`.
-      `.EXT_transform_feedback` is nonetheless still left `false` by
-      default: still unsupported and asserted on are restart combined with
-      an indirect draw, and adjacency/patch-list topologies — so
-      advertising it would turn "unsupported" into "assert/abort".
-      Flipping it on stays a deliberate follow-up.
+      **`.EXT_transform_feedback` is now advertised by default
+      (2026-08-07).** Advertising an extension is a promise that every
+      entry point it defines can be called, so the blocker was not a
+      missing feature but the capture queue: `pending_draws[16]`, guarded
+      by asserts that compile out under `NDEBUG`. A release build
+      recording a 17th captured draw in one render pass wrote past the
+      array. It is now a `util_dynarray`, so any number of captured draws
+      works, freed on command-buffer reset and destroy. Two asserts
+      remain, neither reachable-and-unsafe: restart combined with an
+      indirect draw (wrong data, not a wrong pointer), and
+      adjacency/patch-list topologies, which need `geometryShader` or
+      `tessellationShader` — both reported `false`, so a conformant
+      application cannot create such a pipeline at all. New probe mode
+      `--manydraws` records 40 captured draws in one render pass; all 43
+      mode combinations pass, the device recovers clean, and the patch
+      script reproduces the tested tree byte-for-byte (23/23). The env
+      toggle inverted accordingly: `PANVK_XFB_HIDE=1` now turns the
+      extension off.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

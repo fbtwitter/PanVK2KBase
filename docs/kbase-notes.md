@@ -5170,3 +5170,86 @@ the patch script reproduces the tested tree byte-for-byte (20/20).
 With this, `transformFeedbackDraw` becomes `true`. Still out of scope: primitive
 restart combined with an indirect draw, and adjacency/patch-list topologies
 (which need geometry or tessellation shaders anyway).
+
+## Advertising the extension by default (2026-08-07)
+
+`.EXT_transform_feedback` had been left `false` even as the implementation
+filled in, because advertising an extension is a promise: an application is
+entitled to call every entry point it defines. Turning the bit on meant first
+checking what a well-behaved application could actually reach.
+
+### The blocker: a fixed 16-entry capture queue
+
+Captures cannot be dispatched from `vkCmdDraw`. The compute dispatch waits on
+the render pass's VERTEX_TILER syncobj, and nothing signals that until
+`flush_tiling()` runs from `vkCmdEndRendering`. So each captured draw is queued
+and the dispatches all fire at end-of-render-pass. That queue was:
+
+```c
+} pending_draws[16];
+unsigned pending_draw_count;
+```
+
+guarded by `assert(n < ARRAY_SIZE(...))`. **Asserts compile out under
+`NDEBUG`**, which is how a shipping driver is built — so a release build
+recording a 17th captured draw in one render pass wrote past the array and
+corrupted whatever followed it in `panvk_cmd_graphics_state`. Sixteen is not a
+hardware limit either; it is just the number someone picked. With the extension
+hidden this was unreachable. Advertising it would have made it an ordinary
+thing for an application to do.
+
+It is now a `struct util_dynarray`, so any number of captured draws works. The
+element type had to be hoisted out to a named `struct panvk_xfb_pending_draw`
+(an anonymous struct cannot be named as a dynarray's element type), and one
+helper, `xfb_queue_draw()`, does the append so the three call sites do not each
+need their own out-of-memory handling. On allocation failure it records
+`VK_ERROR_OUT_OF_HOST_MEMORY` on the command buffer and the caller skips that
+capture — the same way the rest of the driver reports a failed recording.
+
+One lifetime trap: `panvk_reset_cmdbuf()` does
+`memset(&cmdbuf->state, 0, sizeof(cmdbuf->state))`, which would strand the
+dynarray's heap allocation. It is freed just before that memset, and again in
+`panvk_destroy_cmdbuf()`. Nothing re-initialises it, because an all-zero
+`util_dynarray` is already a valid empty one.
+
+### What is left unsupported, and why it is safe
+
+Two asserts remain:
+
+- **Primitive restart combined with an indirect draw.** Restart makes the slot
+  table data-dependent, and an indirect draw gives the host no index count to
+  size that table with. Reachable, but memory-safe — it is wrong data, not a
+  wrong pointer.
+- **Adjacency and patch-list topologies.** These are *unreachable* through
+  valid API use: adjacency topologies require the `geometryShader` feature and
+  patch lists require `tessellationShader`, and this driver reports both as
+  `false`, so a pipeline using them cannot legally be created.
+
+### The toggle inverted
+
+`PANVK_XFB_ADVERTISE=1` existed to turn the extension on for probe runs. It is
+now `PANVK_XFB_HIDE=1` to turn it *off*, since on is the default.
+
+### Testing
+
+A new `render_xfb_probe --manydraws` records 40 captured draws in one render
+pass — well past the old ceiling — and checks all 120 captured vertices. Three
+things it turned up were probe bugs, not driver bugs, which is the same pattern
+every previous increment hit:
+
+- the readback array was sized from the XFB buffer's capacity constant, so
+  reading back 1920 bytes smashed the stack and crashed the probe *after* every
+  driver-side check had passed;
+- `--manydraws` only repeated the non-indexed draw, so `--manydraws --indexed`
+  recorded one draw and expected forty;
+- the multi-draw verification never applied the overflow expectation, so
+  `--multidraw --overflow` compared against captured triangles when the correct
+  answer — 32 bytes bound, 48 needed — is that every primitive is dropped whole.
+
+`--strip --indexed` and `--fan --indexed` are now rejected outright: the probe's
+index buffer is a 3-entry list while a strip needs four vertices, so the
+combination was never meaningful. `--restart` is the indexed strip path.
+
+All 43 mode combinations pass, `driver_compute_probe --fill` passes afterwards,
+and the patch script reproduces the tested tree byte-for-byte (23/23, and
+idempotent on a second apply).

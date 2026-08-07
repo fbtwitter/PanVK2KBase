@@ -185,7 +185,16 @@ static bool query_mode;
 static bool instanced_mode;
 #define BASE_VERTS      3
 #define MAX_INSTANCES   2
+#define MANYDRAWS_COUNT 40
+/* Buffer capacity for the modes that deliberately test the clamp. Keep this
+ * as-is: --multidraw --instanced relies on generating more than it holds.
+ */
 #define MAX_CAPTURE_VERTS (BASE_VERTS * MAX_INSTANCES)
+/* Host-side readback array only. --manydraws repeats the draw, so it captures
+ * far more than MAX_CAPTURE_VERTS; sizing the array from that overflowed it
+ * and crashed the probe *after* every driver-side check had already passed.
+ */
+#define MAX_READBACK_VERTS (MAX_CAPTURE_VERTS * MANYDRAWS_COUNT)
 
 static uint32_t
 instance_count(void)
@@ -193,10 +202,23 @@ instance_count(void)
    return instanced_mode ? 2 : 1;
 }
 
+/* --manydraws mode: record more captured draws in one render pass than the
+ * driver's pending-capture queue used to be able to hold (it was a fixed
+ * 16-entry array). Every draw is the same triangle, so the expected capture
+ * is simply that triangle repeated.
+ */
+static bool manydraws_mode;
+
+static uint32_t
+draw_repeat_count(void)
+{
+   return manydraws_mode ? MANYDRAWS_COUNT : 1;
+}
+
 static uint32_t
 capture_verts(void)
 {
-   return BASE_VERTS * instance_count();
+   return BASE_VERTS * instance_count() * draw_repeat_count();
 }
 
 /* --resume mode: start the capture part-way into the buffer, from a counter
@@ -370,11 +392,22 @@ main(int argc, char **argv)
          strip_mode = true;  /* shares the 4-vertex setup */
          fan_mode = true;
       }
+      else if (strcmp(argv[i], "--manydraws") == 0)
+         manydraws_mode = true;
       else if (strcmp(argv[i], "--multidraw") == 0) {
          indirect_mode = true;
          multidraw_mode = true;
       }
    }
+   if (strip_mode && indexed_mode && !restart_mode) {
+      fprintf(stderr,
+              "--strip/--fan have no plain indexed form here: the probe's "
+              "index buffer is a 3-entry list, but a strip needs %d "
+              "vertices. Use --restart for the indexed strip path.\n",
+              STRIP_VERTS);
+      return 2;
+   }
+
    printf("mode: %s%s%s%s\n",
           indexed_mode ? "indexed (vkCmdDrawIndexed)"
                        : "non-indexed (vkCmdDraw)",
@@ -390,6 +423,10 @@ main(int argc, char **argv)
              STRIP_VERTS);
    if (restart_mode)
       printf("       + restart (indexed strip split by 0xFFFF)\n");
+   if (manydraws_mode)
+      printf("       + manydraws (%d draws in one render pass, past the old "
+             "16-entry queue)\n",
+             MANYDRAWS_COUNT);
    if (bytecount_mode)
       printf("       + bytecount (vkCmdDrawIndirectByteCountEXT, %d/%d = %d "
              "vertices)\n",
@@ -792,7 +829,7 @@ main(int argc, char **argv)
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
    const VkDeviceSize xfb_size =
-      (resume_mode || multidraw_mode || strip_mode)
+      (resume_mode || multidraw_mode || strip_mode) && !manydraws_mode
          ? (VkDeviceSize)MAX_CAPTURE_VERTS * sizeof(EXPECTED_XFB[0])
          : (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
@@ -1207,14 +1244,16 @@ main(int argc, char **argv)
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
       uint32_t nidx = restart_mode ? RESTART_INDEX_COUNT : BASE_VERTS;
-      cmd_draw_indexed(cmdbuf, nidx, instance_count(), 0, 0, 0);
-      printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded\n", nidx,
-             instance_count());
+      for (uint32_t d = 0; d < draw_repeat_count(); d++)
+         cmd_draw_indexed(cmdbuf, nidx, instance_count(), 0, 0, 0);
+      printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded x%u\n", nidx,
+             instance_count(), draw_repeat_count());
    } else {
       uint32_t nverts = draw_vertex_count();
-      cmd_draw(cmdbuf, nverts, instance_count(), 0, 0);
-      printf("  vkCmdDraw(%u, %u, 0, 0) recorded\n", nverts,
-             instance_count());
+      for (uint32_t d = 0; d < draw_repeat_count(); d++)
+         cmd_draw(cmdbuf, nverts, instance_count(), 0, 0);
+      printf("  vkCmdDraw(%u, %u, 0, 0) recorded x%u\n", nverts,
+             instance_count(), draw_repeat_count());
    }
 
    if (resume_mode) {
@@ -1336,7 +1375,7 @@ main(int argc, char **argv)
                "render is unaffected by the XFB-capture shader variant");
 
       printf("\n=== readback: XFB buffer ===\n");
-      float captured[MAX_CAPTURE_VERTS][4];
+      float captured[MAX_READBACK_VERTS][4];
       memcpy(captured, xfb_mapped, (size_t)xfb_size);
 
       /* 0.000 at 3 decimals is ambiguous: it prints the same for a real
@@ -1422,6 +1461,22 @@ main(int argc, char **argv)
           * offset k * sizeof(EXPECTED_XFB). Anything else means the write
           * position did not advance between commands.
           */
+         if (overflow_mode) {
+            /* Neither command can fit a whole primitive in the bound 32
+             * bytes, so the correct result is that nothing was captured.
+             * Transform feedback drops whole primitives rather than
+             * truncating them, so this must run *instead of* the
+             * per-command comparison below, not after it.
+             */
+            bool nothing_captured = true;
+            for (size_t i = 0; i < (size_t)xfb_size; i++)
+               nothing_captured = nothing_captured && raw[i] == 0x11;
+
+            check(nothing_captured,
+                  "multi-draw overflow: every primitive dropped whole");
+            goto xfb_done;
+         }
+
          const float(*want)[4] =
             indexed_mode ? EXPECTED_XFB_INDEXED : EXPECTED_XFB;
          bool all_ok = true;
@@ -1528,7 +1583,8 @@ main(int argc, char **argv)
           * the query span both commands, since it is scoped to the render
           * pass rather than to a single draw.
           */
-         const uint64_t draws = multidraw_mode ? MULTIDRAW_COUNT : 1;
+         const uint64_t draws = (multidraw_mode ? MULTIDRAW_COUNT : 1) *
+                                draw_repeat_count();
          const uint64_t want_generated =
             (uint64_t)draw_prim_count() * instance_count() * draws;
 

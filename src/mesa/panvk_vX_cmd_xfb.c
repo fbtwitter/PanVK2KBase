@@ -113,7 +113,7 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
       cs_flush_stores(b);
    }
 
-   state->xfb.pending_draw_count = 0;
+   util_dynarray_clear(&state->xfb.pending_draws);
    state->xfb.active = true;
 }
 
@@ -522,19 +522,15 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
 
-   for (unsigned i = 0; i < state->xfb.pending_draw_count; i++) {
-      dispatch_one_xfb_capture(cmdbuf, state->xfb.pending_draws[i].vertex_count,
-                               state->xfb.pending_draws[i].instance_count,
-                               state->xfb.pending_draws[i].vertex_base,
-                               state->xfb.pending_draws[i].index_buffer,
-                               state->xfb.pending_draws[i].index_size,
-                               state->xfb.pending_draws[i].query_ptr,
-                               state->xfb.pending_draws[i].xfb_topology,
-                               state->xfb.pending_draws[i].indirect_buffer,
-                               state->xfb.pending_draws[i].restart_index);
+   util_dynarray_foreach(&state->xfb.pending_draws,
+                         struct panvk_xfb_pending_draw, d) {
+      dispatch_one_xfb_capture(cmdbuf, d->vertex_count, d->instance_count,
+                               d->vertex_base, d->index_buffer, d->index_size,
+                               d->query_ptr, d->xfb_topology,
+                               d->indirect_buffer, d->restart_index);
    }
 
-   state->xfb.pending_draw_count = 0;
+   util_dynarray_clear(&state->xfb.pending_draws);
 
    /* Deferred counter-buffer writeback, now that every capture has run and the
     * write positions are final. They were last written by panlib_xfb_setup(),
