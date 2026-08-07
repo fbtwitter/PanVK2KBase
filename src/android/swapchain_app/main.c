@@ -638,6 +638,30 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
    if (e != 0)
       return 0;
 
+   /* vkQueueSignalReleaseImageANDROID returns VK_ERROR_UNKNOWN on this
+    * driver. Mesa's implementation first creates a semaphore exportable as a
+    * SYNC_FD (vk_anb_semaphore_init_once) and then exports one from it, and
+    * exportable sync-fd is a known kbase limitation. Those are two different
+    * failures with two different fixes, so ask which it is directly rather
+    * than infer it: create exactly that semaphore here.
+    */
+   {
+      const VkExportSemaphoreCreateInfo export_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      const VkSemaphoreCreateInfo sem_ci = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+         .pNext = &export_info,
+      };
+      VkSemaphore probe = VK_NULL_HANDLE;
+      VkResult sr = create_sem(device, &sem_ci, NULL, &probe);
+      LOGI("  vkCreateSemaphore(export SYNC_FD) -> %d", sr);
+      note(sr == VK_SUCCESS, "driver can create a SYNC_FD-exportable semaphore");
+      if (sr == VK_SUCCESS)
+         destroy_sem(device, probe, NULL);
+   }
+
    VkCommandPool pool = VK_NULL_HANDLE;
    const VkCommandPoolCreateInfo pci = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
