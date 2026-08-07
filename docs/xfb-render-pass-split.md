@@ -36,12 +36,34 @@ the same dependency, sourced differently. No help.
 paper — `docs/kbase-notes.md:4189` says the deferral exists because the
 *wait* had nothing valid to wait on, not because of a data dependency, and
 what a capture reads (`res_table`, descriptors, push uniforms) is CPU-written
-at record time. The known hazard is the shared TLS descriptor, which the
-capture patches via CS and which graphics work is using concurrently; that
-would need the capture to own its TLS descriptor. **Untested.** It is the
-same area that produced the original `VK_ERROR_DEVICE_LOST`, so it may well
-not hold, but it is cheap to check and would make this whole document
-unnecessary. Worth 20 minutes before building the split.
+at record time.
+
+**Tried on hardware, 2026-08-07. Half-answered, and worth continuing.**
+A `wait_vt` flag was threaded through `cmd_flush_pending_xfb_captures()` /
+`dispatch_one_xfb_capture()` to skip the cross-subqueue wait, and
+`CmdDrawIndirectByteCountEXT` called it inline when
+`cmd_xfb_counter_write_pending()` said this draw's counter buffer was still
+owed a write. The existing COMPUTE -> VERTEX_TILER barrier in that entry
+point supplies the ordering for the draw.
+
+- **No fault.** No `VK_ERROR_DEVICE_LOST`, no hang, no reboot. A capture
+  dispatched mid-render-pass with no VERTEX_TILER wait left the device
+  healthy. That was the outcome most expected to kill the idea, and it did
+  not. The TLS hazard did not bite either, at least not here.
+- **No fix.** `backward_dependency` stayed at 9/12 with a byte-identical
+  `received:0 expected:64`. The draw still saw a zero counter.
+
+Which of "the hypothesis is wrong" and "the inline flush has its own
+ordering bug" that shows is **not yet determined**. The specific suspect is
+that a capture ends in an asynchronous `cs_trace_run_compute`, and the
+counter writeback emitted immediately after it does its cache flush and load
+without waiting for that dispatch to retire — a gap that is masked in the
+normal path, where the writeback sits at the end of the render pass with
+everything else already drained. If that is it, the fix is a scoreboard wait
+between the capture dispatch and a following counter op, not a render pass
+split. **Check that before building the split**; it is a much smaller change
+and this experiment is cheap to reconstruct (it was reverted rather than
+committed, precisely because it is unproven).
 
 ## What already exists
 
