@@ -359,3 +359,41 @@ Guessing those is the same mistake as guessing LINEAR. Getting them
 properly means the IMapper backend, i.e. building against real AOSP mapper
 libs instead of `-Dandroid-stub=true` - which is now the critical path for
 correct presentation, not an optimisation.
+
+### Why IMapper is not reachable from this build, and what to do instead
+
+`meson.build:1039-1059` only looks for `android.hardware.graphics.mapper`
+(>= 4.0) and `ui` inside `if not with_android_stub`. This project builds
+with `-Dandroid-stub=true`, so they are never probed, and the IMapper
+backends are never compiled. Turning the stub off means supplying real
+pkg-config deps for cutils/hardware/log/sync/nativewindow *and* the HIDL
+mapper - an AOSP build environment, not an NDK cross build. That is exactly
+what the stub exists to avoid, so "just enable IMapper" is a much larger
+change than it sounds.
+
+**A cheaper route that does not need IMapper: solve for the modifier.**
+
+The allocation size is known exactly from the gralloc handle
+(`int[08] = 14,394,880` for 1280x2768 RGBA_8888). PanVK already knows how
+to compute the size of an AFBC image for a given modifier - it allocates
+them itself. So instead of asking gralloc what the modifier is, enumerate
+the handful of plausible Mali AFBC modifiers, compute the allocation size
+each would imply, and keep the one that matches the measured figure.
+
+    for each candidate modifier:
+        size = pan_image_layout size for 1280x2768 RGBA8888 with that mod
+        if size == 14,394,880: that is the modifier
+
+Candidates are few: `DRM_FORMAT_MOD_ARM_AFBC(BLOCK_SIZE_16x16 | X)` where X
+ranges over the usual combinations of `SPARSE`, `YTR`, `SPLIT`, `TILED`.
+The 16x16 block size is already pinned by the header size (221,440 bytes =
+ceil(1280/16) * ceil(2768/16) * 16).
+
+Why this is not the LINEAR mistake again: that was an assumption with no
+way to check it. This is a hypothesis with an exact numeric test, and a
+candidate that does not reproduce the measured allocation size is rejected.
+If two candidates produce the same size the method is ambiguous and must
+say so rather than pick one - in which case fall back to IMapper.
+
+This also generalises better than it looks: any device whose gralloc cannot
+be queried still hands out a handle with a size in it.
