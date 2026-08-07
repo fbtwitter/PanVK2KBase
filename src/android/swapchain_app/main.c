@@ -698,6 +698,32 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
               (const void *)buf->handle, buf->handle ? buf->handle->numFds : -1);
          check(buf->handle && buf->handle->numFds > 0,
                "dequeued a gralloc buffer with a usable handle");
+
+         /* Dump the ints in the gralloc handle.
+          *
+          * The driver cannot ask gralloc for this buffer's format modifier:
+          * u_gralloc's IMapper backends, the only ones that can, are
+          * compiled out of an -Dandroid-stub build, so the ANB path assumes
+          * LINEAR. Arm gralloc keeps an internal/alloc format in the handle
+          * with the AFBC bits set in it, so if this buffer is AFBC it should
+          * show up here as a 64-bit value with high bits set, split across
+          * two adjacent ints.
+          *
+          * Archaeology, not an API. It exists to confirm or kill the AFBC
+          * hypothesis for the Eden freeze, nothing more.
+          */
+         if (buf->handle) {
+            LOGI("  handle: numFds=%d numInts=%d", buf->handle->numFds,
+                 buf->handle->numInts);
+            const int *ints = &buf->handle->data[buf->handle->numFds];
+            for (int i = 0; i < buf->handle->numInts && i < 64; i += 4) {
+               int a = ints[i];
+               int b = (i + 1 < buf->handle->numInts) ? ints[i + 1] : 0;
+               int c = (i + 2 < buf->handle->numInts) ? ints[i + 2] : 0;
+               int d = (i + 3 < buf->handle->numInts) ? ints[i + 3] : 0;
+               LOGI("    int[%02d] %08x %08x %08x %08x", i, a, b, c, d);
+            }
+         }
       }
 
       /* Wrap the gralloc buffer as a VkImage. This is the step that has never
@@ -1094,7 +1120,7 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          get_queue(device, gfx_family, 0, &queue);
          /* Long enough to outlast the window's buffer count many times
           * over, which is what makes the release fence load-bearing. */
-         present_frames(device, queue, gfx_family, window, gdpa, 600);
+         present_frames(device, queue, gfx_family, window, gdpa, 4);
       } else {
          check(false, "resolved the ANativeWindow producer API");
       }
