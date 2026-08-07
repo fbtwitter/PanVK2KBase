@@ -128,3 +128,48 @@ else:
     print("    patched src/panfrost/vulkan/meson.build")
 
 print("panvk kbase vk_sync patch applied")
+
+# ---------------------------------------------- copy_sync_payloads on kbase
+#
+# panvk_vX_device.c unconditionally sets
+#
+#     device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+#
+# which needs a real DRM syncobj - the one thing kbase does not have, and the
+# reason panvk_kbase_sync.c exists at all.
+#
+# Nothing noticed for months because almost nothing calls it. The path that
+# does is presentation: vk_common_QueueSignalReleaseImageANDROID() prefers
+# copy_sync_payloads over QueueSubmit2 when the device sets it, so every
+# release of a swapchain image went straight into the DRM implementation and
+# came back VK_ERROR_UNKNOWN. Measured from inside the APK:
+#
+#     ANB-RELEASE branch=copy_payloads waits=1
+#     ANB-RELEASE submit result=-13
+#
+# Leaving it NULL on kbase makes that call site take the QueueSubmit2 branch
+# instead, which is the ordinary submit path this driver already runs for
+# everything else.
+DEVICE = os.path.join(mesa, "src/panfrost/vulkan/panvk_vX_device.c")
+src = open(DEVICE).read()
+
+if "copy_sync_payloads =\n      to_panvk_physical_device" in src or \
+   "is_kbase ? NULL : vk_drm_syncobj_copy_payloads" in src:
+    print("    panvk_vX_device.c: copy_sync_payloads already gated")
+else:
+    anchor = "   device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;"
+    assert anchor in src, \
+        "panvk_vX_device.c: copy_sync_payloads assignment not found - PanVK moved"
+
+    src = src.replace(anchor, """   /* vk_drm_syncobj_copy_payloads() needs a DRM syncobj, which kbase has
+    * not got. Leaving this NULL makes callers that offer a choice - notably
+    * vk_common_QueueSignalReleaseImageANDROID(), i.e. presentation - take
+    * the ordinary QueueSubmit2 path instead of failing VK_ERROR_UNKNOWN.
+    */
+   device->vk.copy_sync_payloads =
+      to_panvk_physical_device(device->vk.physical)->is_kbase
+         ? NULL
+         : vk_drm_syncobj_copy_payloads;""", 1)
+
+    open(DEVICE, "w").write(src)
+    print("    panvk_vX_device.c: copy_sync_payloads gated off on kbase")
