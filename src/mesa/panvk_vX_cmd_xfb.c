@@ -27,6 +27,14 @@
  * panvk_per_arch(cmd_flush_pending_xfb_captures)(), called from
  * CmdEndRendering right after flush_tiling() - see that function's
  * comment for why.
+ *
+ * Because of that deferral, a capture is built in two halves at two
+ * different times. Everything host-side happens at record time, in
+ * panvk_per_arch(cmd_prepare_xfb_capture)(), while the state it depends on
+ * is still this draw's; only the command stream is emitted at
+ * CmdEndRendering. Anything moved across that line reintroduces the bug the
+ * split exists to fix, where every capture in a render pass was built from
+ * the last draw's state.
  */
 
 #include "bifrost/bifrost_compile.h"
@@ -64,13 +72,13 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
 
    assert(!state->xfb.active);
 
-   for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++) {
-      state->xfb.counter_buffers[i].present = false;
-      state->xfb.counter_buffers[i].dev_addr = 0;
-   }
-
    /* One write position per buffer, a byte offset, zeroed here. It has to
     * live in GPU memory because panlib_xfb_setup() clamps against it.
+    *
+    * Allocated per Begin rather than per render pass: each Begin/End pair
+    * restarts capture from its own base, and pairs from earlier in this
+    * render pass still have captures queued that refer to their own
+    * allocation. They snapshot the address, so replacing it here is safe.
     */
    struct pan_ptr offsets = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, sizeof(uint32_t) * MAX_XFB_BUFFERS, sizeof(uint32_t));
@@ -113,7 +121,12 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
       cs_flush_stores(b);
    }
 
-   util_dynarray_clear(&state->xfb.pending_draws);
+   /* pending_draws is deliberately NOT cleared here. A render pass may contain
+    * several Begin/End pairs, and captures queued by an earlier pair are still
+    * waiting for CmdEndRendering to dispatch them - clearing would silently
+    * drop them. Only cmd_flush_pending_xfb_captures() clears the queue, once
+    * it has emitted everything in it.
+    */
    state->xfb.active = true;
 }
 
@@ -132,6 +145,11 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
     * captures this End closed, so the writeback cannot happen here. Record the
     * targets and let cmd_flush_pending_xfb_captures() emit the copies - the
     * same deferral the XFB query's availability uses.
+    *
+    * Each entry carries state->xfb.offsets_gpu as it is *now*, because a later
+    * Begin in this same render pass will have replaced it by the time the
+    * copies are emitted. Two pairs writing back the same buffer index are two
+    * independent entries, so this is a queue rather than a per-buffer array.
     */
    for (uint32_t i = 0; pCounterBuffers && i < counterBufferCount; i++) {
       uint32_t buf_idx = firstCounterBuffer + i;
@@ -141,8 +159,17 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 
       VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
 
-      state->xfb.counter_buffers[buf_idx].present = true;
-      state->xfb.counter_buffers[buf_idx].dev_addr = panvk_buffer_gpu_ptr(
+      struct panvk_xfb_counter_write *w =
+         util_dynarray_grow(&state->xfb.pending_counter_writes,
+                            struct panvk_xfb_counter_write, 1);
+      if (w == NULL) {
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         break;
+      }
+
+      w->offsets = state->xfb.offsets_gpu;
+      w->buf_idx = buf_idx;
+      w->dev_addr = panvk_buffer_gpu_ptr(
          cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0);
    }
 
@@ -154,23 +181,27 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
    state->xfb.active = false;
 }
 
-/* Launches shader->xfb_variant as a plain compute job on
- * PANVK_SUBQUEUE_COMPUTE, one thread per (vertex, instance) pair, mirroring
- * GENX(csf_launch_xfb)'s register setup exactly where the two subqueue
- * models allow it to translate directly. Only called from
- * panvk_per_arch(cmd_flush_pending_xfb_captures)() below, never directly
- * from CmdDraw - see that function and the module comment for why.
+/* Host-side half of one capture: snapshot the state it depends on and do
+ * every allocation and upload it needs, at the point the draw is recorded.
+ *
+ * This exists because the command-stream half below runs at CmdEndRendering,
+ * by which point the live state has moved on - a second Begin/End pair, a
+ * different pipeline, or just different push constants, and every capture in
+ * the render pass would otherwise be built from the last draw's inputs. The
+ * split is on that line and no other: anything read from cmdbuf->state here
+ * is per-draw, anything read there is per-render-pass or per-command-buffer.
+ *
+ * Failures are recorded on the command buffer and leave draw->prepared false,
+ * which the flush skips.
  */
-static void
-dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
-                         const struct panvk_xfb_pending_draw *draw)
+void
+panvk_per_arch(cmd_prepare_xfb_capture)(struct panvk_cmd_buffer *cmdbuf,
+                                        struct panvk_xfb_pending_draw *draw)
 {
    const uint32_t vertex_count = draw->vertex_count;
    const uint32_t instance_count = draw->instance_count;
-   const int32_t vertex_base = draw->vertex_base;
    const uint64_t index_buffer = draw->index_buffer;
    const uint32_t index_size = draw->index_size;
-   const uint64_t query_ptr = draw->query_ptr;
    const uint32_t xfb_topology = draw->xfb_topology;
    const uint64_t indirect_buffer = draw->indirect_buffer;
    const uint32_t restart_index = draw->restart_index;
@@ -179,10 +210,21 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
 
-   if (!shader || !shader->xfb_variant)
+   draw->prepared = false;
+
+   if (!shader || !shader->xfb_variant || !state->xfb.offsets_gpu)
       return;
 
    const struct panvk_shader_variant *xfb_variant = shader->xfb_variant;
+
+   /* The three things the dispatch used to read live, and the reason this
+    * function exists: which shader captures, which descriptor table it fetches
+    * attributes through, and which Begin/End pair's write positions it
+    * advances.
+    */
+   draw->xfb_variant = xfb_variant;
+   draw->res_table = state->vs.desc.res_table;
+   draw->offsets = state->xfb.offsets_gpu;
 
    /* Kept for the XFB query: "generated" is what the draw asked for, before
     * the bounds clamp below reduces it to what actually fits ("written").
@@ -204,22 +246,6 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     * The kernel computes the real figure; this just sizes TLS below.
     */
    const uint64_t capture_slots = generated_verts;
-
-   if (!state->xfb.offsets_gpu)
-      return;
-
-   /* Per capture, not per command buffer: these dispatches all run at
-    * CmdEndRendering, so the value the queueing draw left behind is not
-    * necessarily this draw's. Patched from the kernel for an indirect draw,
-    * whose base only exists in the indirect command.
-    */
-   state->sysvals.vs.first_vertex = vertex_base;
-
-   state->sysvals.xfb.num_vertices = vertex_count;
-   state->sysvals.xfb.index_buffer = index_buffer;
-   state->sysvals.xfb.index_size = index_size;
-   state->sysvals.xfb.topology = xfb_topology;
-   state->sysvals.xfb.slot_table = 0;
 
    /* Primitive restart makes slot -> input vertex data-dependent, so the
     * kernel resolves it into this table and the shader reads it directly.
@@ -243,25 +269,48 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return;
       }
-      state->sysvals.xfb.slot_table = slot_table.gpu;
    }
+   draw->slot_table = slot_table.gpu;
 
-
-
-   /* Base only; panlib_xfb_setup() overwrites this slot in the uploaded
-    * push-uniform buffer with base + offset*stride, since only it knows the
-    * GPU-resident write position.
+   /* The push-uniform upload reads cmdbuf->state.gfx.sysvals, so this draw's
+    * capture sysvals have to be in there across the call - and only across the
+    * call. Saving and restoring the whole struct keeps that invisible to the
+    * graphics state: the real draws around this one see exactly what they set,
+    * and no dirty tracking is disturbed because nothing observably changed.
     */
-   for (uint32_t i = 0; i < state->xfb.bound_count; i++)
-      state->sysvals.xfb.buffer_addrs[i] = state->xfb.bufs[i].address;
-
    struct pan_ptr push_uniforms;
-   VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
-      cmdbuf, xfb_variant, &push_uniforms, 1);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmdbuf->vk, result);
-      return;
+   {
+      const struct panvk_graphics_sysvals saved = state->sysvals;
+
+      /* Patched from the kernel for an indirect draw, whose base only exists
+       * in the indirect command.
+       */
+      state->sysvals.vs.first_vertex = draw->vertex_base;
+
+      state->sysvals.xfb.num_vertices = vertex_count;
+      state->sysvals.xfb.index_buffer = index_buffer;
+      state->sysvals.xfb.index_size = index_size;
+      state->sysvals.xfb.topology = xfb_topology;
+      state->sysvals.xfb.slot_table = slot_table.gpu;
+
+      /* Base only; panlib_xfb_setup() overwrites this slot in the uploaded
+       * push-uniform buffer with base + offset*stride, since only it knows the
+       * GPU-resident write position.
+       */
+      for (uint32_t i = 0; i < state->xfb.bound_count; i++)
+         state->sysvals.xfb.buffer_addrs[i] = state->xfb.bufs[i].address;
+
+      VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+         cmdbuf, xfb_variant, &push_uniforms, 1);
+
+      state->sysvals = saved;
+
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return;
+      }
    }
+   draw->push_uniforms = push_uniforms.gpu;
 
    uint32_t tls_slots = (uint32_t)capture_slots;
    if (indirect_buffer) {
@@ -318,47 +367,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                                           : MALI_FLUSH_TO_ZERO_MODE_DX11)
             : MALI_FLUSH_TO_ZERO_MODE_PRESERVE_SUBNORMALS;
    }
-   uint64_t spd_addr = panvk_priv_mem_dev_addr(compute_spd);
-
-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
-   const struct cs_tracing_ctx *tracing_ctx =
-      &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].tracing;
-
-   /* Cross-subqueue dependency: this job reads the vertex attribute state
-    * (vs_desc_state->res_table) and render/TLS state the draw on
-    * PANVK_SUBQUEUE_VERTEX_TILER set up. PanVK never synchronizes
-    * subqueues automatically (see panvk_per_arch(emit_barrier) /
-    * collect_cs_deps in panvk_vX_cmd_buffer.c - it only fires off explicit
-    * VkMemoryBarrier2-family calls), so this has to insert its own wait,
-    * mirroring emit_barrier_insert_waits()'s exact primitives. This is
-    * only valid to do here, after flush_tiling() has just signalled
-    * VERTEX_TILER's syncobj and incremented its relative_sync_point - see
-    * docs/kbase-notes.md and cmd_flush_pending_xfb_captures() below.
-    */
-   {
-      struct cs_index sync_addr = cs_scratch_reg64(b, 0);
-      struct cs_index wait_val = cs_scratch_reg64(b, 2);
-
-      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
-                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
-      cs_add_imm64(b, sync_addr, sync_addr,
-                   sizeof(struct panvk_cs_sync64) * PANVK_SUBQUEUE_VERTEX_TILER);
-
-      cs_add_imm64(b, wait_val,
-                   cs_progress_seqno_reg(b, PANVK_SUBQUEUE_VERTEX_TILER),
-                   cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER].relative_sync_point);
-
-      panvk_instr_sync64_wait(cmdbuf, PANVK_SUBQUEUE_COMPUTE, false,
-                              MALI_CS_CONDITION_GREATER, wait_val, sync_addr);
-   }
-
-   if (xfb_variant->info.tls_size) {
-      cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
-      cs_load64_to(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
-      cs_move64_to(b, cs_scratch_reg64(b, 0), tsd);
-      cs_store64(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
-      cs_flush_stores(b);
-   }
+   draw->spd = panvk_priv_mem_dev_addr(compute_spd);
+   draw->tsd = tsd;
 
    /* Clamp the capture to what fits, in a helper kernel.
     *
@@ -367,6 +377,9 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     * cannot do on this arch. The kernel also owns the XFB query counters and
     * advancing the write position, since both depend on the clamped result.
     * Same division of labour as Asahi hk's setup_xfb_buffer().
+    *
+    * Its inputs are all bound state, so they are gathered here; only the
+    * launch itself is left to the command stream.
     */
    struct pan_ptr xfb_descs = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, sizeof(struct panlib_xfb_buffer_desc) * MAX_XFB_BUFFERS,
@@ -406,43 +419,118 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       };
    }
 
+   draw->descs = xfb_descs.gpu;
+   draw->desc_count = desc_count;
+   draw->out_slots = out_slots.gpu;
+
+   draw->first_vertex_pu =
+      indirect_buffer && push_uniforms.gpu &&
+            shader_uses_sysval(xfb_variant, graphics, vs.first_vertex)
+         ? push_uniforms.gpu +
+              shader_remapped_sysval_offset(
+                 xfb_variant, sysval_offset(graphics, vs.first_vertex))
+         : 0;
+   draw->index_buffer_pu =
+      indirect_buffer && index_size && push_uniforms.gpu &&
+            shader_uses_sysval(xfb_variant, graphics, xfb.index_buffer)
+         ? push_uniforms.gpu +
+              shader_remapped_sysval_offset(
+                 xfb_variant, sysval_offset(graphics, xfb.index_buffer))
+         : 0;
+   draw->num_vertices_pu =
+      push_uniforms.gpu &&
+            shader_uses_sysval(xfb_variant, graphics, xfb.num_vertices)
+         ? push_uniforms.gpu +
+              shader_remapped_sysval_offset(
+                 xfb_variant, sysval_offset(graphics, xfb.num_vertices))
+         : 0;
+
+   draw->prepared = true;
+}
+
+/* Launches the prepared capture as a plain compute job on
+ * PANVK_SUBQUEUE_COMPUTE, one thread per (vertex, instance) pair, mirroring
+ * GENX(csf_launch_xfb)'s register setup exactly where the two subqueue
+ * models allow it to translate directly. Only called from
+ * panvk_per_arch(cmd_flush_pending_xfb_captures)() below, never directly
+ * from CmdDraw - see that function and the module comment for why.
+ *
+ * Everything host-side already happened in cmd_prepare_xfb_capture() above,
+ * at record time. This function must therefore read nothing out of
+ * cmdbuf->state.gfx: by now it describes the last draw of the render pass,
+ * not this one. The two things it does read from cmdbuf->state are legitimate
+ * - the TLS descriptor is per command buffer, and the VERTEX_TILER sync point
+ * is per render pass, which is exactly the granularity of this flush.
+ */
+static void
+dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
+                         const struct panvk_xfb_pending_draw *draw)
+{
+   if (!draw->prepared)
+      return;
+
+   const struct panvk_shader_variant *xfb_variant = draw->xfb_variant;
+
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+   const struct cs_tracing_ctx *tracing_ctx =
+      &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].tracing;
+
+   /* Cross-subqueue dependency: this job reads the vertex attribute state
+    * (vs_desc_state->res_table) and render/TLS state the draw on
+    * PANVK_SUBQUEUE_VERTEX_TILER set up. PanVK never synchronizes
+    * subqueues automatically (see panvk_per_arch(emit_barrier) /
+    * collect_cs_deps in panvk_vX_cmd_buffer.c - it only fires off explicit
+    * VkMemoryBarrier2-family calls), so this has to insert its own wait,
+    * mirroring emit_barrier_insert_waits()'s exact primitives. This is
+    * only valid to do here, after flush_tiling() has just signalled
+    * VERTEX_TILER's syncobj and incremented its relative_sync_point - see
+    * docs/kbase-notes.md and cmd_flush_pending_xfb_captures() below.
+    */
+   {
+      struct cs_index sync_addr = cs_scratch_reg64(b, 0);
+      struct cs_index wait_val = cs_scratch_reg64(b, 2);
+
+      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
+      cs_add_imm64(b, sync_addr, sync_addr,
+                   sizeof(struct panvk_cs_sync64) * PANVK_SUBQUEUE_VERTEX_TILER);
+
+      cs_add_imm64(b, wait_val,
+                   cs_progress_seqno_reg(b, PANVK_SUBQUEUE_VERTEX_TILER),
+                   cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER].relative_sync_point);
+
+      panvk_instr_sync64_wait(cmdbuf, PANVK_SUBQUEUE_COMPUTE, false,
+                              MALI_CS_CONDITION_GREATER, wait_val, sync_addr);
+   }
+
+   if (xfb_variant->info.tls_size) {
+      cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
+      cs_load64_to(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+      cs_move64_to(b, cs_scratch_reg64(b, 0), draw->tsd);
+      cs_store64(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+      cs_flush_stores(b);
+   }
+
+   /* Launch the clamp/counter kernel prepared above. */
    {
       struct panvk_precomp_ctx pctx = panvk_per_arch(precomp_cs)(cmdbuf);
       struct panlib_xfb_setup_args args = {
-         .offsets = state->xfb.offsets_gpu,
-         .descs = xfb_descs.gpu,
-         .desc_count = desc_count,
-         .direct_vertex_count = vertex_count,
-         .direct_instance_count = instance_count,
-         .topology = xfb_topology,
-         .out_slots = out_slots.gpu,
-         .query = query_ptr,
-         .indirect = indirect_buffer,
-         .index_buffer_base = index_buffer,
-         .index_size = index_size,
-         .slot_table = slot_table.gpu,
-         .restart_index = restart_index,
-         .first_vertex_pu =
-            indirect_buffer && push_uniforms.gpu &&
-                  shader_uses_sysval(xfb_variant, graphics, vs.first_vertex)
-               ? push_uniforms.gpu +
-                    shader_remapped_sysval_offset(
-                       xfb_variant, sysval_offset(graphics, vs.first_vertex))
-               : 0,
-         .index_buffer_pu =
-            indirect_buffer && index_size && push_uniforms.gpu &&
-                  shader_uses_sysval(xfb_variant, graphics, xfb.index_buffer)
-               ? push_uniforms.gpu +
-                    shader_remapped_sysval_offset(
-                       xfb_variant, sysval_offset(graphics, xfb.index_buffer))
-               : 0,
-         .num_vertices_pu =
-            push_uniforms.gpu &&
-                  shader_uses_sysval(xfb_variant, graphics, xfb.num_vertices)
-               ? push_uniforms.gpu +
-                    shader_remapped_sysval_offset(
-                       xfb_variant, sysval_offset(graphics, xfb.num_vertices))
-               : 0,
+         .offsets = draw->offsets,
+         .descs = draw->descs,
+         .desc_count = draw->desc_count,
+         .direct_vertex_count = draw->vertex_count,
+         .direct_instance_count = draw->instance_count,
+         .topology = draw->xfb_topology,
+         .out_slots = draw->out_slots,
+         .query = draw->query_ptr,
+         .indirect = draw->indirect_buffer,
+         .index_buffer_base = draw->index_buffer,
+         .index_size = draw->index_size,
+         .slot_table = draw->slot_table,
+         .restart_index = draw->restart_index,
+         .first_vertex_pu = draw->first_vertex_pu,
+         .index_buffer_pu = draw->index_buffer_pu,
+         .num_vertices_pu = draw->num_vertices_pu,
       };
 
       panlib_xfb_setup_struct(&pctx, panlib_1d(1), PANLIB_BARRIER_CSF_WAIT,
@@ -464,33 +552,32 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    }
 
    cs_update_compute_ctx(b) {
-      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SRT),
-                   state->vs.desc.res_table);
+      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SRT), draw->res_table);
 
       uint64_t fau_count = xfb_variant->fau.total_count;
       cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_FAU),
-                   push_uniforms.gpu | (fau_count << 56));
+                   draw->push_uniforms | (fau_count << 56));
 
-      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SPD), spd_addr);
-      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_TSD), tsd);
+      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_SPD), draw->spd);
+      cs_move64_to(b, cs_reg64(b, PANVK_PRECOMP_TSD), draw->tsd);
 
       /* Bias attribute fetch by the draw's firstVertex (non-indexed) or
        * vertexOffset (indexed), matching VERTEX_OFFSET in the real IDVS
        * draw (launch_draw()). This is why the indexed path needs no
        * vertexOffset maths in the shader.
        */
-      if (indirect_buffer) {
+      if (draw->indirect_buffer) {
          /* firstVertex is word 2 of VkDrawIndirectCommand, but the indexed
           * command has vertexOffset at word 3 instead. Reading either from an
           * application buffer needs no cache flush - nothing in our command
           * stream produced it.
           */
-         cs_move64_to(b, cs_scratch_reg64(b, 8), indirect_buffer);
+         cs_move64_to(b, cs_scratch_reg64(b, 8), draw->indirect_buffer);
          cs_load32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                      cs_scratch_reg64(b, 8), index_size ? 12 : 8);
+                      cs_scratch_reg64(b, 8), draw->index_size ? 12 : 8);
       } else {
          cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
-                      (uint32_t)vertex_base);
+                      (uint32_t)draw->vertex_base);
       }
 
       struct mali_compute_size_workgroup_packed wg_size;
@@ -509,7 +596,7 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
-      cs_move64_to(b, cs_scratch_reg64(b, 6), out_slots.gpu);
+      cs_move64_to(b, cs_scratch_reg64(b, 6), draw->out_slots);
       cs_load32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
                    cs_scratch_reg64(b, 6), 0);
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), 1);
@@ -560,47 +647,42 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
     * so the caches have to be cleaned before the command stream can read them
     * - a barrier alone does not make kernel stores visible here.
     */
-   if (state->xfb.offsets_gpu) {
+   if (util_dynarray_num_elements(&state->xfb.pending_counter_writes,
+                                  struct panvk_xfb_counter_write)) {
       struct cs_builder *b =
          panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
-      bool counter_writeback = false;
+      struct cs_index flush_id = cs_scratch_reg32(b, 4);
+      struct cs_index src = cs_scratch_reg64(b, 0);
+      struct cs_index dst = cs_scratch_reg64(b, 2);
+      struct cs_index val = cs_scratch_reg32(b, 5);
 
-      for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
-         counter_writeback |= state->xfb.counter_buffers[i].present;
+      cs_move32_to(b, flush_id, 0);
+      cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                      MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                      cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
+      cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
 
-      if (counter_writeback) {
-         struct cs_index flush_id = cs_scratch_reg32(b, 4);
-         struct cs_index src = cs_scratch_reg64(b, 0);
-         struct cs_index dst = cs_scratch_reg64(b, 2);
-         struct cs_index val = cs_scratch_reg32(b, 5);
-
-         cs_move32_to(b, flush_id, 0);
-         cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
-                         MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
-                         cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
-         cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
-
-         cs_move64_to(b, src, state->xfb.offsets_gpu);
-
-         for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++) {
-            if (!state->xfb.counter_buffers[i].present)
-               continue;
-
-            cs_load32_to(b, val, src, i * sizeof(uint32_t));
-            cs_move64_to(b, dst, state->xfb.counter_buffers[i].dev_addr);
-            cs_store32(b, val, dst, 0);
-         }
-
-         cs_flush_stores(b);
+      /* Each entry names the write positions of its own Begin/End pair, so
+       * the source address is reloaded per entry rather than hoisted.
+       */
+      util_dynarray_foreach(&state->xfb.pending_counter_writes,
+                            struct panvk_xfb_counter_write, w) {
+         cs_move64_to(b, src, w->offsets);
+         cs_load32_to(b, val, src, w->buf_idx * sizeof(uint32_t));
+         cs_move64_to(b, dst, w->dev_addr);
+         cs_store32(b, val, dst, 0);
       }
+
+      cs_flush_stores(b);
    }
 
-   for (uint32_t i = 0; i < MAX_XFB_BUFFERS; i++)
-      state->xfb.counter_buffers[i].present = false;
+   util_dynarray_clear(&state->xfb.pending_counter_writes);
 
    /* Safe to release only now: End runs before CmdEndRendering, so the write
     * positions have to outlive it and survive until the captures that use
-    * them have actually been emitted.
+    * them have actually been emitted. Captures and writebacks both hold their
+    * own copy of the address, so this only drops the current pair's - the
+    * allocation itself lives in the command buffer's pool either way.
     */
    state->xfb.offsets_gpu = 0;
 

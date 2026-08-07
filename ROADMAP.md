@@ -2060,6 +2060,52 @@ Tools worth knowing about before touching any of this:
       (`holes_*`, `max_output_components_64/128`), in the shared compiler
       rather than panvk's XFB glue. Bulk CTS runs froze the device twice
       and needed `adb reboot`, so run them in bounded chunks.
+- [x] **Deferred captures now snapshot their state — `simple` goes from
+      72 failures to 9** (2026-08-07, verified on device). The fix is a
+      split rather than a patch: the host-side half of a capture (push-
+      uniform upload, descriptor and scratch allocations, the resolved
+      `panlib_xfb_setup()` arguments) now runs at *record* time in
+      `panvk_per_arch(cmd_prepare_xfb_capture)()` and leaves its results
+      on the queued `panvk_xfb_pending_draw`; CmdEndRendering is left
+      with pure command-stream emission, which is the only part that
+      genuinely needs the sync point `flush_tiling()` signals there. The
+      dispatch now reads nothing from `cmdbuf->state.gfx` — the shader
+      and its `xfb_variant`, `vs.desc.res_table`, the bound XFB buffers,
+      `offsets_gpu` and push constants were all being read live, i.e.
+      as of the *last* draw in the render pass.
+      Three further bugs fell out of the same reading, all invisible to a
+      single-pair test: `CmdBeginTransformFeedbackEXT` cleared
+      `pending_draws`, so a second Begin/End pair in one render pass
+      silently discarded the first pair's un-dispatched captures;
+      counter-buffer writeback was a per-buffer-index array holding one
+      `dev_addr`, so with two pairs writing back the same index only the
+      last survived, and it read whichever pair's `offsets_gpu` happened
+      to be current — it is now a queue whose entries each carry their
+      own; and `d->index_count_bound = indexCount` sat in `CmdDraw`,
+      which has no `indexCount` (a compile break in the patch script, so
+      the tree on disk had diverged from it) instead of in
+      `CmdDrawIndexed`, where its absence left primitive restart with no
+      slot table.
+      Measured, `simple` in bounded chunks: **233 Pass / 9 Fail /
+      7,651 NotSupported**, against 172/72/7,653 before. `basic_*` — the
+      group whose `basic_1_*`-passes/`basic_2_4_8_*`-fails signature
+      diagnosed this — is 37/38 Pass, 0 Fail, the one skip legitimate.
+      `render_xfb_probe` still passes both phase-1 and phase-2 (indexed),
+      and `render_multidraw_probe` / `driver_compute_probe` confirm
+      nothing outside XFB moved. The six cases that crash the Bifrost
+      backend in `bi_make_vec_to` (`holes_*`,
+      `max_output_components_64/128`) were excluded from the run rather
+      than fixed — still open, still in the shared compiler.
+- [ ] **Next: counter-buffer reads within one render pass.** All 9
+      remaining failures are one class — eight `backward_dependency*` and
+      `draw_indirect_counter_resubmit`. They write a counter buffer at
+      one End and consume it before the render pass is over (a later
+      Begin resuming from it, or a `vkCmdDrawIndirectByteCountEXT`
+      reading it). Writeback happens at CmdEndRendering, after every
+      capture, so the consumer reads the buffer before it is written.
+      This is inherent to deferring the writeback that far, not a
+      snapshot problem, and unpicking it means finding a point where the
+      write positions are final but the render pass is not over.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior
