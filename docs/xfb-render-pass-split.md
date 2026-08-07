@@ -397,3 +397,44 @@ say so rather than pick one - in which case fall back to IMapper.
 
 This also generalises better than it looks: any device whose gralloc cannot
 be queried still hands out a handle with a size in it.
+
+### IMapper5: vtable confirmed, decode and import are the gap
+
+Read the authoritative header (AOSP `hardware/interfaces`, stable-c
+`IMapper.h`). `AIMapperV5` field order:
+
+    1 importBuffer  2 freeBuffer  3 getTransportSize  4 lock  5 unlock
+    6 flushLockedBuffer  7 rereadLockedBuffer  8 getMetadata
+    9 getStandardMetadata  10 setMetadata  11 setStandardMetadata
+    12 listSupportedMetadataTypes  13 dumpBuffer  14 dumpAllBuffers
+    15 getReservedRegion
+
+The hand-written declaration in `src/android/swapchain_app/main.c` matches
+exactly through all nine fields it declares. So the vtable offsets are right
+and that explanation for the `n=77` result is dead.
+
+Two candidates remain, in the order worth testing:
+
+1. **The buffer is probably not imported.** `getStandardMetadata` expects a
+   buffer that has been through `importBuffer()`; the probe passes the raw
+   `ANativeWindowBuffer` handle straight from `dequeueBuffer`. An invalid
+   handle alone could produce a nonsense length, and this is the cheaper
+   test.
+2. **The payload is encoded.** The header says the return is "the number of
+   bytes written, or which would have been written", and directs callers to
+   the encode/decode helpers in `gralloctypes/Gralloc4.h` rather than
+   treating the output as a scalar. So reading the trailing 8 bytes - the
+   next thing that was about to be tried - would have been another
+   plausible-looking guess.
+
+Do (1) first: if the handle was simply invalid, (2) may not arise.
+
+Two things recorded so nobody repeats them:
+
+- Mesa's own `u_gralloc_imapper5_api.cpp` is **not** a model for this route.
+  It includes `<ui/GraphicBufferMapper.h>` and AIDL headers, i.e. the C++
+  AOSP path needing generated headers. The stable-C dlopen approach has no
+  in-tree reference.
+- `andlabs/libui` is an unrelated desktop GUI toolkit that happens to share
+  the name. The real source is `platform/frameworks/native/libs/ui`, with
+  `Gralloc5.cpp` as AOSP's own stable-C consumer.
