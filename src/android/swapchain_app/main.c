@@ -738,9 +738,14 @@ probe_modifiers(VkPhysicalDevice pdev, PFN_vkGetInstanceProcAddr gipa,
  */
 typedef int32_t AIMapper_Error;
 
-/* StandardMetadataType, from AOSP. Only the two used here are named. */
-#define STANDARD_METADATA_PIXEL_FORMAT_MODIFIER 7L
-#define STANDARD_METADATA_ALLOCATION_SIZE 9L
+/* StandardMetadataType.aidl ordinals (hardware/interfaces/graphics/common),
+ * verified against the actual enum rather than remembered - the first
+ * attempt had these wrong (7 and 9), which is why it queried USAGE instead
+ * of ALLOCATION_SIZE and got a plausible-looking but meaningless n=77.
+ * Only the two used here are named; the full enum runs 0-23.
+ */
+#define STANDARD_METADATA_PIXEL_FORMAT_MODIFIER 8L
+#define STANDARD_METADATA_ALLOCATION_SIZE 10L
 
 struct AIMapperV5 {
    /* Order is load-bearing; see the note above. */
@@ -838,42 +843,107 @@ probe_imapper(const native_handle_t *handle, uint64_t known_alloc_size)
       return;
    }
 
-   /* Sanity check first: a value we already know from the handle. If this
-    * disagrees, the hand-written vtable is wrong and the modifier below is
-    * meaningless.
+   /* getStandardMetadata operates on a buffer that has come through
+    * importBuffer(), not on the raw ANativeWindowBuffer handle straight from
+    * dequeueBuffer. The first attempt skipped this and got n=77 for an 8-byte
+    * ask - a strong sign the handle was simply not valid input for this call,
+    * independent of any encoding question. AOSP's IMapper.h: importBuffer
+    * takes the const native_handle_t* and hands back an opaque buffer
+    * handle; every other v5 call, including getStandardMetadata, takes that
+    * opaque handle, not the original one. freeBuffer releases it again.
     */
-   uint64_t alloc_size = 0;
-   int32_t n = mapper->v5.getStandardMetadata(
-      (void *)handle, STANDARD_METADATA_ALLOCATION_SIZE, &alloc_size,
-      sizeof(alloc_size));
-   LOGI("  ALLOCATION_SIZE -> n=%d value=%llu (expected %llu)", n,
-        (unsigned long long)alloc_size,
-        (unsigned long long)known_alloc_size);
-
-   const bool abi_ok = (n == (int32_t)sizeof(alloc_size)) &&
-                       (alloc_size == known_alloc_size);
-   note(abi_ok, "the hand-written IMapper ABI agrees with the known size");
-   if (!abi_ok) {
-      LOGE("  ABI mismatch - not reporting a modifier, it would be a guess");
+   if (!mapper->v5.importBuffer || !mapper->v5.freeBuffer) {
+      note(false, "IMapper5 exposes importBuffer/freeBuffer");
       return;
    }
 
-   uint64_t modifier = 0;
-   n = mapper->v5.getStandardMetadata((void *)handle,
-                                      STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
-                                      &modifier, sizeof(modifier));
-   LOGI("  PIXEL_FORMAT_MODIFIER -> n=%d value=0x%016llx", n,
-        (unsigned long long)modifier);
-   note(n == (int32_t)sizeof(modifier), "gralloc reported a format modifier");
+   void *imported = NULL;
+   AIMapper_Error imp_err = mapper->v5.importBuffer(handle, &imported);
+   LOGI("  importBuffer -> %d (buffer %p)", imp_err, imported);
+   note(imp_err == 0 && imported != NULL, "imported the buffer");
+   if (imp_err != 0 || !imported)
+      return;
 
-   if (n == (int32_t)sizeof(modifier)) {
+   /* AOSP's own doc for this call: the return is "the number of bytes
+    * written to destBuffer, OR WHICH WOULD HAVE BEEN WRITTEN if
+    * destBufferSize was large enough". The first two attempts passed an
+    * 8-byte destBuffer and got n=77 both times - not an error, but the
+    * driver saying the real payload needs 77 bytes and it only wrote (or
+    * would have written) that many. Reading 8 bytes of a 77-byte structure
+    * as a scalar was never going to produce the real value; that is what
+    * this was actually measuring, and the "ABI mismatch" framing before this
+    * was wrong.
+    *
+    * So: pass a buffer big enough for the real payload, then find the known
+    * value inside it by search rather than by guessing the layout. The
+    * allocation size (14,394,880 = 0x00dba400) is already known from the
+    * gralloc handle int dump, so its exact byte position in the 77-byte
+    * blob is discoverable rather than assumed - and once found, the same
+    * offset convention very likely applies to PIXEL_FORMAT_MODIFIER's blob,
+    * since both come from the same encoder.
+    */
+   uint8_t buf1[256] = {0};
+   int32_t n = mapper->v5.getStandardMetadata(
+      imported, STANDARD_METADATA_ALLOCATION_SIZE, buf1, sizeof(buf1));
+   LOGI("  ALLOCATION_SIZE -> n=%d", n);
+
+   if (n <= 0 || n > (int32_t)sizeof(buf1)) {
+      LOGE("  no usable payload (n=%d) - cannot search for the known value",
+           n);
+      note(false, "got a usable ALLOCATION_SIZE payload");
+      mapper->v5.freeBuffer(imported);
+      return;
+   }
+
+   for (int32_t i = 0; i + 8 <= n; i++) {
+      LOGI("    buf1[%3d..%3d]: %02x %02x %02x %02x %02x %02x %02x %02x", i,
+           i + 7, buf1[i], buf1[i + 1], buf1[i + 2], buf1[i + 3], buf1[i + 4],
+           buf1[i + 5], buf1[i + 6], buf1[i + 7]);
+   }
+
+   int32_t value_offset = -1;
+   for (int32_t i = 0; i + 8 <= n; i++) {
+      uint64_t candidate;
+      memcpy(&candidate, buf1 + i, 8);
+      if (candidate == known_alloc_size) {
+         value_offset = i;
+         break;
+      }
+   }
+   LOGI("  known allocation size 0x%016llx found at byte offset %d",
+        (unsigned long long)known_alloc_size, value_offset);
+   note(value_offset >= 0, "located the scalar within the encoded payload");
+   if (value_offset < 0) {
+      mapper->v5.freeBuffer(imported);
+      return;
+   }
+
+   uint8_t buf2[256] = {0};
+   n = mapper->v5.getStandardMetadata(imported,
+                                      STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
+                                      buf2, sizeof(buf2));
+   LOGI("  PIXEL_FORMAT_MODIFIER -> n=%d", n);
+   note(n > 0 && n <= (int32_t)sizeof(buf2), "got a usable modifier payload");
+
+   if (n > 0 && n <= (int32_t)sizeof(buf2) && value_offset + 8 <= n) {
+      uint64_t modifier;
+      memcpy(&modifier, buf2 + value_offset, 8);
       const uint64_t vendor = modifier >> 56;
-      LOGI("  => vendor=0x%02llx payload=0x%012llx%s",
+      LOGI("  modifier @ offset %d = 0x%016llx  vendor=0x%02llx "
+           "payload=0x%012llx%s",
+           value_offset, (unsigned long long)modifier,
            (unsigned long long)vendor,
            (unsigned long long)(modifier & 0x00ffffffffffffffull),
            vendor == 0x08 ? "   (ARM - AFBC family)"
                           : (modifier == 0 ? "   (LINEAR)" : ""));
+   } else {
+      LOGI("  modifier payload shorter than the discovered offset (%d) - "
+           "the two metadata types are not encoded the same way, this "
+           "offset-reuse approach does not apply",
+           value_offset);
    }
+
+   mapper->v5.freeBuffer(imported);
 }
 
 /* Milestone 2: be the swapchain.
@@ -1027,7 +1097,13 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
           * hypothesis for the Eden freeze, nothing more.
           */
          if (buf->handle)
-            probe_imapper(buf->handle, 14394880ull);
+            /* int[08] of the handle dump below is 0x00dba400. That is
+             * 14,394,368 - earlier commits in this session hand-computed it
+             * as 14,394,880, which is simply wrong arithmetic (368 read as
+             * 880). Using the hex literal directly here so there is no more
+             * decimal transcription to get wrong.
+             */
+            probe_imapper(buf->handle, 0x00dba400ull);
 
          if (buf->handle) {
             LOGI("  handle: numFds=%d numInts=%d", buf->handle->numFds,
@@ -1438,10 +1514,19 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          get_queue(device, gfx_family, 0, &queue);
 
          /* Geometry and allocation size measured from the gralloc handle on
-          * this device; see the handle dump in present_frames().
+          * this device; see the handle dump in present_frames(). Corrected
+          * to the actual value of int[08] (0x00dba400) - earlier commits in
+          * this session hand-computed that hex value as 14,394,880, which
+          * is wrong arithmetic (368 misread as 880); it is 14,394,368.
+          *
+          * This candidate-enumeration approach is superseded by
+          * probe_imapper() below, which reads the real modifier from gralloc
+          * directly instead of guessing candidates and matching sizes. Left
+          * in place as a secondary check: probe_imapper()'s answer should
+          * also explain this function's allocation-size target exactly.
           */
          probe_modifiers(pdev, gipa, instance, device, gdpa, 1280, 2768,
-                         14394880ull);
+                         0x00dba400ull);
          /* Long enough to outlast the window's buffer count many times
           * over, which is what makes the release fence load-bearing. */
          present_frames(device, queue, gfx_family, window, gdpa, 4);
