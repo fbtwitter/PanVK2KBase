@@ -1975,11 +1975,32 @@ Tools worth knowing about before touching any of this:
       with `--indirect`; three further probe expectations needed fixing
       and the driver was right in all three. All 35 probe modes pass, and
       the patch script still reproduces the tested tree byte-for-byte.
+      **Primitive restart landed (2026-08-07)** — for direct indexed
+      draws. Restart makes slot → input-vertex *data-dependent*
+      (primitives are runs between restart indices, and the strip parity
+      restarts with each run), so rather than teach the shader to scan,
+      `panlib_xfb_setup()` walks the index buffer once and writes the
+      resolved input vertex for every capture slot into a table the shader
+      reads directly. The same walk yields the primitive count, which
+      restart also makes data-dependent, so the clamp, query counters and
+      grid all follow for free. Costs 4 bytes per captured vertex, small
+      next to the 16-byte `vec4` capture. Two self-inflicted ordering bugs
+      on the way: the probe never actually enabled
+      `primitiveRestartEnable` (it was omitted from the struct, so
+      zero-initialised, and a text replace against it matched nothing);
+      and the `slot_table` sysval was written *after*
+      `cmd_prepare_gfx_push_uniforms()` had snapshotted `state->sysvals`,
+      so the shader read 0 and silently took the computed path — unlike
+      `xfb.buffer_addrs[]`, this one cannot be patched into the uploaded
+      buffer afterwards, since the host knows the address and only the
+      contents are unknown. Tested by `--restart` with indices
+      `{0,1,2,0xFFFF,1,2,3}`. All 37 probe modes pass; script still
+      reproduces the tested tree byte-for-byte.
       `.EXT_transform_feedback` is nonetheless still left `false` by
-      default: still unsupported and asserted on are primitive restart
-      with XFB active, `vkCmdDrawIndirectByteCountEXT` and
-      adjacency/patch-list topologies — so advertising it would turn
-      "unsupported" into "assert/abort". Flipping it on stays a
+      default: still unsupported and asserted on are
+      `vkCmdDrawIndirectByteCountEXT`, restart combined with an indirect
+      draw, and adjacency/patch-list topologies — so advertising it would
+      turn "unsupported" into "assert/abort". Flipping it on stays a
       deliberate follow-up.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see

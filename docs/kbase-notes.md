@@ -5004,9 +5004,61 @@ probe now derives both its vertex count and its primitive count from the mode.
 
 All 35 probe-mode combinations pass, device healthy.
 
-Still out of scope: primitive restart, `vkCmdDrawIndirectByteCountEXT`, and
-adjacency/patch-list topologies (the latter need geometry or tessellation
-shaders anyway).
+## Primitive restart (2026-08-07, WORKING)
+
+Without restart the input vertex a capture slot reads is a closed-form function
+of the slot. With restart it is **data-dependent**: primitives are runs between
+restart indices, so primitive *p* no longer starts at a fixed offset, and the
+triangle-strip parity restarts with every run.
+
+Rather than teach the shader to scan, `panlib_xfb_setup()` walks the index
+buffer once and writes the fully resolved input vertex index for **every
+capture slot** into a table; the shader then just reads `slot_table[s]`. That
+removes all topology maths from the restart path and is correct by
+construction. The cost is 4 bytes per captured vertex — small next to the
+capture itself, which is 16 bytes per vertex for a `vec4`. The walk is a single
+invocation like the rest of the kernel; XFB is already the slow path and
+correctness matters more than throughput here.
+
+The same walk produces the primitive count, which restart also makes
+data-dependent — so the clamp, the query counters and the grid all follow from
+it for free.
+
+**Scope**: direct indexed draws. An indirect draw gives the host no index count
+to size the table with, so that combination stays asserted.
+
+### Two ordering bugs, both self-inflicted
+
+**The probe never enabled restart.** `VkPipelineInputAssemblyStateCreateInfo`
+omitted `primitiveRestartEnable` entirely, so it zero-initialised to `VK_FALSE`
+and a `s.replace()` against it silently matched nothing. The capture came back
+as the *computed* path's output, which looked almost plausible.
+
+**The sysval was written after the upload.** `state->sysvals` is snapshotted by
+`cmd_prepare_gfx_push_uniforms()`, and the table was being allocated further
+down in the kernel-dispatch block — so the shader read `slot_table == 0` and
+quietly took the non-restart path. Note the distinction from
+`xfb.buffer_addrs[]` and `xfb.num_vertices`, which the kernel *patches into the
+uploaded buffer* afterwards: here the host knows the address, only the contents
+are unknown, so it must be set before the upload rather than patched after.
+
+What made both quick to find was the *shape* of the wrong data:
+`A B C  C B <garbage>` is exactly what the computed strip mapping produces over
+a 7-index stream, with slot 5 reading index `0xFFFF` out of range. That named
+the failing path immediately.
+
+**Test**: `render_xfb_probe --restart` uses indices `{0,1,2, 0xFFFF, 1,2,3}` —
+two runs of three, so two triangles with the parity restarting in the second
+run. Expected `A B C  B C D`. If restart were ignored the stream would be one
+six-vertex strip whose `0xFFFF` index reads out of bounds, so it fails loudly
+rather than subtly.
+
+All 37 probe-mode combinations pass, device healthy, and the patch script still
+reproduces the tested tree byte-for-byte.
+
+Still out of scope: `vkCmdDrawIndirectByteCountEXT`, primitive restart combined
+with an indirect draw, and adjacency/patch-list topologies (the latter need
+geometry or tessellation shaders anyway).
 
 ## Verifying the patch script reproduces what was tested (2026-08-07)
 

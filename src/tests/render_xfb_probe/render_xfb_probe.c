@@ -246,6 +246,25 @@ static bool strip_mode;
  */
 static bool fan_mode;
 
+/* --restart mode: an indexed TRIANGLE_STRIP split by a restart index into two
+ * runs of three, so two triangles with the strip parity restarting in the
+ * second run.
+ */
+static bool restart_mode;
+#define RESTART_INDEX_COUNT 7
+static const uint16_t INDICES_RESTART[RESTART_INDEX_COUNT] = {
+   0, 1, 2, 0xFFFF, 1, 2, 3,
+};
+
+static const float EXPECTED_XFB_RESTART[6][4] = {
+   {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
+   {-0.8f, 0.8f, 0.0f, 1.0f},  /* C */
+   {0.8f, 0.8f, 0.0f, 1.0f},   /* D */
+};
+
 static const float EXPECTED_XFB_FAN[6][4] = {
    {-0.8f, -0.8f, 0.0f, 1.0f}, /* A */
    {0.8f, -0.8f, 0.0f, 1.0f},  /* B */
@@ -332,6 +351,11 @@ main(int argc, char **argv)
          indirect_mode = true;
       else if (strcmp(argv[i], "--strip") == 0)
          strip_mode = true;
+      else if (strcmp(argv[i], "--restart") == 0) {
+         strip_mode = true;   /* 4 vertices, TRIANGLE_STRIP */
+         indexed_mode = true;
+         restart_mode = true;
+      }
       else if (strcmp(argv[i], "--fan") == 0) {
          strip_mode = true;  /* shares the 4-vertex setup */
          fan_mode = true;
@@ -354,6 +378,8 @@ main(int argc, char **argv)
       printf("       + %s (%d verts -> 2 triangles)\n",
              fan_mode ? "fan (TRIANGLE_FAN)" : "strip (TRIANGLE_STRIP)",
              STRIP_VERTS);
+   if (restart_mode)
+      printf("       + restart (indexed strip split by 0xFFFF)\n");
    if (indirect_mode)
       printf("       + indirect (vkCmdDrawIndirect%s)\n",
              multidraw_mode ? ", drawCount=2" : "");
@@ -702,7 +728,7 @@ main(int argc, char **argv)
 
       VkBufferCreateInfo ibo_bci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = sizeof(INDICES),
+         .size = restart_mode ? sizeof(INDICES_RESTART) : sizeof(INDICES),
          .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
@@ -734,9 +760,14 @@ main(int argc, char **argv)
       check(r == VK_SUCCESS, "vkMapMemory (IBO)");
       if (r != VK_SUCCESS)
          return 1;
-      memcpy(ibo_mapped, INDICES, sizeof(INDICES));
-      printf("  wrote indices {2, 0, 1} - a cyclic rotation, so the render\n"
-             "  result must be unchanged while the capture order permutes\n");
+      if (restart_mode) {
+         memcpy(ibo_mapped, INDICES_RESTART, sizeof(INDICES_RESTART));
+         printf("  wrote indices {0,1,2, 0xFFFF, 1,2,3} - two runs of three\n");
+      } else {
+         memcpy(ibo_mapped, INDICES, sizeof(INDICES));
+         printf("  wrote indices {2, 0, 1} - a cyclic rotation, so the render\n"
+                "  result must be unchanged while the capture order permutes\n");
+      }
    }
 
    /* ------------------------------------------------------------ XFB buffer */
@@ -955,6 +986,7 @@ main(int argc, char **argv)
       .topology = fan_mode      ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
                   : strip_mode ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
                                : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+      .primitiveRestartEnable = restart_mode ? VK_TRUE : VK_FALSE,
    };
 
    VkViewport viewport = {
@@ -1151,8 +1183,9 @@ main(int argc, char **argv)
    } else if (indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
-      cmd_draw_indexed(cmdbuf, BASE_VERTS, instance_count(), 0, 0, 0);
-      printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded\n", BASE_VERTS,
+      uint32_t nidx = restart_mode ? RESTART_INDEX_COUNT : BASE_VERTS;
+      cmd_draw_indexed(cmdbuf, nidx, instance_count(), 0, 0, 0);
+      printf("  vkCmdDrawIndexed(%u, %u, 0, 0, 0) recorded\n", nidx,
              instance_count());
    } else {
       uint32_t nverts = draw_vertex_count();
@@ -1318,6 +1351,20 @@ main(int argc, char **argv)
          check(final_counter == want_counter,
                "counter buffer holds the final byte offset");
 
+         goto xfb_done;
+      }
+
+      if (restart_mode) {
+         bool ok = memcmp(raw, EXPECTED_XFB_RESTART,
+                          sizeof(EXPECTED_XFB_RESTART)) == 0;
+         float(*got)[4] = (float(*)[4])raw;
+
+         for (int v = 0; v < 6; v++)
+            printf("  captured[%d] = (%.3f, %.3f) expected (%.3f, %.3f)\n", v,
+                   got[v][0], got[v][1], EXPECTED_XFB_RESTART[v][0],
+                   EXPECTED_XFB_RESTART[v][1]);
+
+         check(ok, "restart split the strip into two runs correctly");
          goto xfb_done;
       }
 
@@ -1523,7 +1570,11 @@ main(int argc, char **argv)
    }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && strip_mode)
+   if (failures == 0 && restart_mode)
+      printf("\n=> VK_EXT_transform_feedback primitive restart works:\n"
+             "   the index stream split into two runs, each assembled\n"
+             "   independently with its own strip parity.\n");
+   else if (failures == 0 && strip_mode)
       printf("\n=> VK_EXT_transform_feedback %s capture works:\n"
              "   4 input vertices assembled into 2 triangles and captured as\n"
              "   6 vertices in assembled-primitive order.\n",

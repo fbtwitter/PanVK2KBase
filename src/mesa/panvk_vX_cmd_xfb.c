@@ -166,7 +166,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
                          uint32_t vertex_count, uint32_t instance_count,
                          int32_t vertex_base, uint64_t index_buffer,
                          uint32_t index_size, uint64_t query_ptr,
-                         uint32_t xfb_topology, uint64_t indirect_buffer)
+                         uint32_t xfb_topology, uint64_t indirect_buffer,
+                         uint32_t restart_index)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
    const struct panvk_shader *shader = state->vs.shader;
@@ -204,6 +205,29 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
    state->sysvals.xfb.index_buffer = index_buffer;
    state->sysvals.xfb.index_size = index_size;
    state->sysvals.xfb.topology = xfb_topology;
+   state->sysvals.xfb.slot_table = 0;
+
+   /* Primitive restart makes slot -> input vertex data-dependent, so the
+    * kernel resolves it into this table and the shader reads it directly.
+    * Sized by the worst case: every index could complete a primitive.
+    */
+   struct pan_ptr slot_table = {0};
+   if (restart_index) {
+      uint32_t vpp = xfb_topology == PANVK_XFB_TOPO_POINT_LIST      ? 1
+                     : xfb_topology <= PANVK_XFB_TOPO_LINE_STRIP    ? 2
+                                                                    : 3;
+      slot_table = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, (uint64_t)vertex_count * vpp * sizeof(uint32_t),
+         sizeof(uint32_t));
+      if (!slot_table.gpu) {
+         vk_command_buffer_set_error(&cmdbuf->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      state->sysvals.xfb.slot_table = slot_table.gpu;
+   }
+
+
 
    /* Base only; panlib_xfb_setup() overwrites this slot in the uploaded
     * push-uniform buffer with base + offset*stride, since only it knows the
@@ -377,6 +401,8 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          .indirect = indirect_buffer,
          .index_buffer_base = index_buffer,
          .index_size = index_size,
+         .slot_table = slot_table.gpu,
+         .restart_index = restart_index,
          .index_buffer_pu =
             indirect_buffer && index_size && push_uniforms.gpu &&
                   shader_uses_sysval(xfb_variant, graphics, xfb.index_buffer)
@@ -504,7 +530,8 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
                                state->xfb.pending_draws[i].index_size,
                                state->xfb.pending_draws[i].query_ptr,
                                state->xfb.pending_draws[i].xfb_topology,
-                               state->xfb.pending_draws[i].indirect_buffer);
+                               state->xfb.pending_draws[i].indirect_buffer,
+                               state->xfb.pending_draws[i].restart_index);
    }
 
    state->xfb.pending_draw_count = 0;
