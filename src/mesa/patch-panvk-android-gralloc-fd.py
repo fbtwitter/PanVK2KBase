@@ -181,6 +181,11 @@ u_gralloc_fallback_dmabuf_fd(const native_handle_t *handle)
 # rowPitch is exactly width * 4 for an RGBA_8888 buffer, i.e. an ordinary
 # linear stride, and there is one plane. So the buffer is linear; the fallback
 # simply has no way to assert it. Say so, rather than crash.
+#
+# UPDATE: that LINEAR assumption turned out to be wrong on this exact device -
+# see the "real modifier" section below, which replaces it with an actual
+# query. Left here as the very-last-resort fallback for a device where the
+# query itself cannot be answered.
 src = open(ANDROID).read()
 
 if "DRM_FORMAT_MOD_INVALID" in src:
@@ -211,6 +216,227 @@ else:
 
     open(ANDROID, "w").write(src)
     print("    panvk_android.c: ANB modifier INVALID mapped to LINEAR")
+
+# --------------------------------------------- panvk_android.c: real modifier
+#
+# Replaces the DRM_FORMAT_MOD_INVALID -> LINEAR guess above with an actual
+# query of gralloc's real modifier via IMapper5's stable-C ABI
+# (AIMapper_loadIMapper).
+#
+# Why this exists: u_gralloc's IMapper backends - the only components that
+# can normally ask gralloc for a buffer's modifier - need AOSP-generated
+# HIDL/AIDL headers and are compiled out of an -Dandroid-stub build, so the
+# section above always hit its LINEAR fallback on this build. That guess is
+# wrong whenever gralloc actually allocated AFBC - measured on a Poco X8 Pro
+# (MediaTek): the buffer was AFBC (BLOCK_SIZE_32x8 | YTR | SPLIT | SPARSE),
+# 0x0800000000000072, one of PAN_SUPPORTED_MODIFIERS's own entries and the
+# modifier PanVK's own comments call the intended choice for WSI images.
+# Rendering LINEAR content into it looked fine on a flat clear (the failure
+# mode that made the guess look correct for an entire session) but is the
+# leading explanation for a real emulator (Eden) freezing the whole device
+# under actual presentation load - the compositor's AFBC decoder choking on
+# content described incorrectly.
+#
+# IMapper5 has a stable *C* ABI, unlike the C++/AIDL object APIs u_gralloc's
+# compiled-out backends use, so it is reachable with dlopen and a locally
+# declared vtable instead of AOSP-generated headers. The vtable layout,
+# metadata ordinals and payload encoding below were all verified against
+# real sources or real captured bytes, not assumed - see the commit history
+# of src/android/swapchain_app/main.c's probe_imapper() for the derivation,
+# including three wrong guesses along the way (metadata ordinals, a
+# WebFetch-hallucinated function signature, and an arithmetic slip in the
+# "known" comparison value) that this ports the corrected result of, not the
+# guesses themselves.
+#
+# A plain dlopen() (not android_dlopen_ext with an explicit namespace object,
+# which the APK probe needed) is enough here: this code runs inside the
+# driver's own .so, already loaded through a namespace with /system/lib64 and
+# /vendor/lib64/hw on its search path (see tools/package-driver.sh), so it
+# inherits that resolution rather than needing to reconstruct it.
+#
+# Placed BEFORE the vk_android.c section below deliberately: that section's
+# "already patched" branch calls sys.exit(0), which would silently skip
+# anything appended after it. Same hazard its own comment warns about.
+src = open(ANDROID).read()
+
+if "panvk_android_query_gralloc_modifier" in src:
+    print("    panvk_android.c: real-modifier query already added")
+else:
+    if "#include <dlfcn.h>" not in src:
+        src = src.replace("#include <unistd.h>",
+                          "#include <dlfcn.h>\n#include <string.h>\n"
+                          "#include <unistd.h>", 1)
+
+    query_code = '''typedef int32_t AIMapper_Error;
+
+/* StandardMetadataType.aidl (hardware/interfaces/graphics/common), verified
+ * against the real enum rather than remembered - an earlier attempt at this
+ * had these wrong (7 and 9) and silently queried an unrelated field.
+ */
+#define PANVK_ANDROID_STANDARD_METADATA_PIXEL_FORMAT_MODIFIER 8L
+
+struct panvk_android_aimapper_v5 {
+   /* Field order is load-bearing - verified against AOSP's stable-c
+    * IMapper.h source directly (curl + base64 decode, not a paraphrase),
+    * after a fetch tool's summary of the same header hallucinated a wrong
+    * return type for importBuffer. Only the fields this code calls are
+    * named for their real purpose; the rest exist purely to keep every
+    * later field, in particular getStandardMetadata, at its real offset.
+    */
+   AIMapper_Error (*importBuffer)(const native_handle_t *handle,
+                                  void **outBufferHandle);
+   AIMapper_Error (*freeBuffer)(void *buffer);
+   AIMapper_Error (*getTransportSize)(void *buffer, uint32_t *outNumFds,
+                                      uint32_t *outNumInts);
+   AIMapper_Error (*lock)(void *buffer, uint64_t cpuUsage,
+                          int32_t accessRegion[4], int acquireFence,
+                          void **outData);
+   AIMapper_Error (*unlock)(void *buffer, int *outReleaseFence);
+   AIMapper_Error (*flushLockedBuffer)(void *buffer);
+   AIMapper_Error (*rereadLockedBuffer)(void *buffer);
+   int32_t (*getMetadata)(void *buffer, uint64_t metadataType,
+                          void *destBuffer, size_t destBufferSize);
+   int32_t (*getStandardMetadata)(void *buffer, int64_t standardMetadataType,
+                                  void *destBuffer, size_t destBufferSize);
+};
+
+struct panvk_android_aimapper {
+   uint32_t version;
+   struct panvk_android_aimapper_v5 v5;
+};
+
+typedef AIMapper_Error (*panvk_android_load_imapper_fn)(
+   struct panvk_android_aimapper **out);
+
+/* Decodes one getStandardMetadata() payload. This vendor mapper wraps even a
+ * plain scalar in a self-describing envelope - an int32 name length, 4 bytes
+ * padding, the UTF-8 type name
+ * "android.hardware.graphics.common.StandardMetadataType", then an int64
+ * holding the StandardMetadataType ordinal itself - before the actual value.
+ * Found by capturing a full payload and searching it for an independently
+ * known value (the gralloc allocation size) rather than parsing the
+ * envelope from documentation; the return doc for getStandardMetadata
+ * explains why a naive 8-byte read fails ("the number of bytes written, OR
+ * WHICH WOULD HAVE BEEN WRITTEN if destBufferSize was large enough" - not an
+ * error, a size query answer).
+ *
+ * The header length is read from the buffer rather than hardcoded, since
+ * only the type-name string is guaranteed constant for a given vendor
+ * build, not the envelope's total size.
+ */
+static bool
+panvk_android_decode_metadata_scalar(const uint8_t *payload, int32_t len,
+                                     uint64_t *out_value)
+{
+   if (len < 8)
+      return false;
+
+   int32_t name_len;
+   memcpy(&name_len, payload, sizeof(name_len));
+
+   const int64_t header_size = 4 + 4 + (int64_t)name_len + 8;
+   if (name_len < 0 || header_size < 0 || header_size + 8 != (int64_t)len)
+      return false;
+
+   memcpy(out_value, payload + header_size, 8);
+   return true;
+}
+
+/* Returns the real DRM format modifier for an Android gralloc buffer, or
+ * DRM_FORMAT_MOD_INVALID if it could not be determined. Callers must treat
+ * that exactly like vk_android_get_anb_layout() itself reporting it - not
+ * every device is guaranteed to expose a reachable vendor IMapper5, and this
+ * function failing is that case, not a hard error.
+ */
+static uint64_t
+panvk_android_query_gralloc_modifier(const native_handle_t *handle)
+{
+   /* libui.so is where AOSP intends AIMapper_loadIMapper to be found, since
+    * it is the one that calls it; the vendor implementation exporting the
+    * actual symbol varies, so the same small candidate search the APK probe
+    * used is repeated here rather than hardcoding one vendor's filename.
+    */
+   static const char *libs[] = {
+      "libui.so",
+      "mapper.mediatek.so",
+      "android.hardware.graphics.mapper@4.0.so",
+      "gralloc.default.so",
+   };
+
+   panvk_android_load_imapper_fn load = NULL;
+   for (uint32_t i = 0; i < sizeof(libs) / sizeof(libs[0]) && !load; i++) {
+      void *lib = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL);
+      if (lib)
+         load = (panvk_android_load_imapper_fn)dlsym(
+            lib, "AIMapper_loadIMapper");
+   }
+   if (!load)
+      return DRM_FORMAT_MOD_INVALID;
+
+   struct panvk_android_aimapper *mapper = NULL;
+   if (load(&mapper) != 0 || !mapper || mapper->version != 5 ||
+       !mapper->v5.importBuffer || !mapper->v5.freeBuffer ||
+       !mapper->v5.getStandardMetadata)
+      return DRM_FORMAT_MOD_INVALID;
+
+   void *imported = NULL;
+   if (mapper->v5.importBuffer(handle, &imported) != 0 || !imported)
+      return DRM_FORMAT_MOD_INVALID;
+
+   uint8_t buf[256];
+   int32_t n = mapper->v5.getStandardMetadata(
+      imported, PANVK_ANDROID_STANDARD_METADATA_PIXEL_FORMAT_MODIFIER, buf,
+      sizeof(buf));
+
+   uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+   if (n > 0 && n <= (int32_t)sizeof(buf))
+      panvk_android_decode_metadata_scalar(buf, n, &modifier);
+
+   mapper->v5.freeBuffer(imported);
+   return modifier;
+}
+
+'''
+
+    fn_anchor = "panvk_android_anb_init("
+    idx = src.find(fn_anchor)
+    assert idx != -1, "panvk_android.c: panvk_android_anb_init not found"
+    start = src.rfind("\nstatic VkResult", 0, idx)
+    assert start != -1, \
+        "panvk_android.c: could not find panvk_android_anb_init's start"
+    src = src[:start + 1] + query_code + src[start + 1:]
+
+    assert_anchor = (
+        "   assert(vk_find_struct_const(create_info->pNext, "
+        "NATIVE_BUFFER_ANDROID));")
+    assert assert_anchor in src, \
+        "panvk_android.c: NATIVE_BUFFER_ANDROID assert not found - PanVK moved"
+    src = src.replace(assert_anchor,
+                      "   const VkNativeBufferANDROID *native_buffer =\n"
+                      "      vk_find_struct_const(create_info->pNext, "
+                      "NATIVE_BUFFER_ANDROID);\n"
+                      "   assert(native_buffer);", 1)
+
+    invalid_anchor = (
+        "   if (mod_info.drmFormatModifier == DRM_FORMAT_MOD_INVALID)\n"
+        "      mod_info.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;")
+    assert invalid_anchor in src, \
+        "panvk_android.c: DRM_FORMAT_MOD_INVALID fallback not found - moved"
+    src = src.replace(invalid_anchor,
+                      "   if (mod_info.drmFormatModifier == "
+                      "DRM_FORMAT_MOD_INVALID) {\n"
+                      "      const uint64_t queried =\n"
+                      "         panvk_android_query_gralloc_modifier("
+                      "native_buffer->handle);\n"
+                      "      mod_info.drmFormatModifier =\n"
+                      "         queried != DRM_FORMAT_MOD_INVALID ? queried\n"
+                      "                                           : "
+                      "DRM_FORMAT_MOD_LINEAR;\n"
+                      "   }", 1)
+
+    open(ANDROID, "w").write(src)
+    print("    panvk_android.c: real modifier queried from gralloc via "
+          "IMapper5, LINEAR is now last resort")
 
 # ------------------------------------------------------------- vk_android.c
 #
