@@ -677,6 +677,12 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
 
    int presented = 0;
 
+   const bool sync_every_frame = getenv("PANVK_APP_SYNC_EVERY_FRAME") != NULL;
+#define KEEP_MAX 512
+   VkImage keep_img[KEEP_MAX];
+   VkSemaphore keep_acq[KEEP_MAX], keep_rnd[KEEP_MAX];
+   uint32_t kept = 0;
+
    for (int frame = 0; frame < frames; frame++) {
       ANativeWindowBuffer_t *buf = NULL;
       int fence_fd = -1;
@@ -723,6 +729,8 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
 
       VkImage image = VK_NULL_HANDLE;
       r = create_image(device, &ici, NULL, &image);
+      if (r != VK_SUCCESS && frame != 0)
+         LOGE("  frame %d: vkCreateImage -> %d", frame, r);
       if (frame == 0) {
          LOGI("  vkCreateImage(VkNativeBufferANDROID) -> %d", r);
          check(r == VK_SUCCESS, "wrapped the gralloc buffer as a VkImage");
@@ -741,6 +749,8 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
       create_sem(device, &sci, NULL, &render_sem);
 
       r = acquire_image(device, image, fence_fd, acquire_sem, VK_NULL_HANDLE);
+      if (r != VK_SUCCESS && frame != 0)
+         LOGE("  frame %d: vkAcquireImageANDROID -> %d", frame, r);
       if (frame == 0) {
          LOGI("  vkAcquireImageANDROID -> %d", r);
          check(r == VK_SUCCESS, "acquired the image");
@@ -823,11 +833,16 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
       r = queue_submit(queue, 1, &si, VK_NULL_HANDLE);
       if (frame == 0)
          check(r == VK_SUCCESS, "submitted the clear");
+      else if (r != VK_SUCCESS)
+         LOGE("  frame %d: vkQueueSubmit -> %d", frame, r);
 
       /* Give ownership back and get a fence saying when the GPU is done. */
       int release_fd = -1;
-      if (r == VK_SUCCESS)
+      if (r == VK_SUCCESS) {
          r = signal_release(queue, 1, &render_sem, image, &release_fd);
+         if (r != VK_SUCCESS && frame != 0)
+            LOGE("  frame %d: vkQueueSignalReleaseImageANDROID -> %d", frame, r);
+      }
       if (frame == 0) {
          LOGI("  vkQueueSignalReleaseImageANDROID -> %d (fence fd %d)", r,
               release_fd);
@@ -842,13 +857,51 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
             presented++;
       }
 
-      queue_wait_idle(queue);
-      destroy_sem(device, acquire_sem, NULL);
-      destroy_sem(device, render_sem, NULL);
-      destroy_image(device, image, NULL);
+      /* PANVK_APP_SYNC_EVERY_FRAME=1 restores the original behaviour: block
+       * until the GPU is idle before touching the next frame.
+       *
+       * The default is deliberately NOT to do that. Draining the queue every
+       * frame hides whether the release fence handed to queueBuffer actually
+       * means anything, and this driver hands back -1 ("already signalled")
+       * because kbase cannot export a real fence. An emulator presenting
+       * continuously does rely on it - Eden froze the whole device with
+       * SurfaceFlinger and hwcomposer stuck in waitForever on unsignalled
+       * mali kcpu fences. Presenting without the drain is the smallest thing
+       * that reproduces that shape of workload in a harness we control.
+       *
+       * Per-frame objects therefore have to outlive the iteration; they are
+       * kept and destroyed after the loop. Bounded by frame count, so a long
+       * run is a deliberate choice rather than a leak.
+       */
+      if (sync_every_frame) {
+         queue_wait_idle(queue);
+         destroy_sem(device, acquire_sem, NULL);
+         destroy_sem(device, render_sem, NULL);
+         destroy_image(device, image, NULL);
+      } else {
+         if (kept < KEEP_MAX) {
+            keep_img[kept] = image;
+            keep_acq[kept] = acquire_sem;
+            keep_rnd[kept] = render_sem;
+            kept++;
+         }
+      }
+
+      if ((frame % 30) == 0)
+         LOGI("  ... frame %d ok", frame);
 
       if (r != VK_SUCCESS)
          break;
+   }
+
+   if (!sync_every_frame) {
+      /* One drain at the end, then release everything the loop held. */
+      queue_wait_idle(queue);
+      for (uint32_t i = 0; i < kept; i++) {
+         destroy_sem(device, keep_acq[i], NULL);
+         destroy_sem(device, keep_rnd[i], NULL);
+         destroy_image(device, keep_img[i], NULL);
+      }
    }
 
    LOGI("  presented %d/%d frames", presented, frames);
@@ -1025,7 +1078,9 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          check(true, "resolved the ANativeWindow producer API");
          VkQueue queue = VK_NULL_HANDLE;
          get_queue(device, gfx_family, 0, &queue);
-         present_frames(device, queue, gfx_family, window, gdpa, 4);
+         /* Long enough to outlast the window's buffer count many times
+          * over, which is what makes the release fence load-bearing. */
+         present_frames(device, queue, gfx_family, window, gdpa, 240);
       } else {
          check(false, "resolved the ANativeWindow producer API");
       }
