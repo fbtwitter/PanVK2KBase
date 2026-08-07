@@ -208,6 +208,21 @@ replacement = """   const native_handle_t *handle = AHardwareBuffer_getNativeHan
 
 src = src.replace(anchor, replacement, 1)
 
+# The same assumption again, in vk_android_import_anb_memory() - the path that
+# turns an ANativeWindow buffer into VkDeviceMemory, i.e. presentation.
+#
+# It was missed the first time round for a reason worth recording: nothing had
+# ever driven it. The AHardwareBuffer path above is reachable from a shell
+# binary (tests/driver_android_wsi_probe), so it got found and fixed; this one
+# needs a real swapchain, which needs a real window, which needs an APK. The
+# app in src/android/swapchain_app/ is what finally reached it - it dequeues a
+# buffer with numFds=3 and then dies here.
+anb_anchor = "   int dma_buf_fd = anb->handle->data[0];"
+assert anb_anchor in src, \
+    "vk_android.c: ANB import fd handling not found - Mesa moved"
+src = src.replace(anb_anchor,
+                  "   int dma_buf_fd = vk_android_dmabuf_fd(anb->handle);", 1)
+
 vk_helper = '''/* The dma-buf is not necessarily handle->data[0].
  *
  * That index is a convention, not a guarantee. On at least one MediaTek
@@ -236,9 +251,13 @@ vk_android_dmabuf_fd(const native_handle_t *handle)
 
 '''
 
-fn_anchor = "vk_common_GetAndroidHardwareBufferPropertiesANDROID("
+# Insert the helper above its *earliest* caller, which is the ANB import path
+# near the top of the file - not the AHardwareBuffer one much further down.
+# C needs the definition first, and Mesa builds with
+# -Werror=missing-prototypes, so a forward declaration alone would not do.
+fn_anchor = "vk_android_import_anb_memory("
 idx = src.find(fn_anchor)
-assert idx != -1, "vk_android.c: vk_common_GetAndroidHardwareBufferPropertiesANDROID not found"
+assert idx != -1, "vk_android.c: vk_android_import_anb_memory not found"
 start = src.rfind("\nVkResult", 0, idx)
 assert start != -1, "vk_android.c: could not find the function's start"
 src = src[:start + 1] + vk_helper + src[start + 1:]

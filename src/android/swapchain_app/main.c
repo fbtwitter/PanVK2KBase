@@ -174,6 +174,146 @@ typedef struct hwvulkan_device_t {
 #define HWVULKAN_DEVICE_0 "vk0"
 
 /* ------------------------------------------------------------------ */
+/* The ANativeWindow producer API and VK_ANDROID_native_buffer: between them,
+ * everything the platform's Vulkan loader does to implement a swapchain.
+ *
+ * None of this is in the NDK. ANativeWindow_dequeueBuffer and friends exist
+ * in libnativewindow.so on device (verified with strings) but are VNDK, so
+ * they are declared here and resolved with dlsym. VkNativeBufferANDROID is
+ * from Mesa's include/vulkan/vk_android_native_buffer.h, spec version 11.
+ */
+
+typedef struct native_handle {
+   int version;
+   int numFds;
+   int numInts;
+   int data[0];
+} native_handle_t;
+
+typedef struct android_native_base_t {
+   int magic;
+   int version;
+   void *reserved[4];
+   void (*incRef)(struct android_native_base_t *base);
+   void (*decRef)(struct android_native_base_t *base);
+} android_native_base_t;
+
+/* Field order and padding must match AOSP's ANativeWindowBuffer exactly -
+ * this is read, not allocated, so a wrong offset silently yields garbage
+ * rather than failing to compile.
+ */
+typedef struct ANativeWindowBuffer {
+   android_native_base_t common;
+   int width;
+   int height;
+   int stride;
+   int format;
+   int usage_deprecated;
+   uintptr_t layerCount;
+   void *reserved[1];
+   const native_handle_t *handle;
+   uint64_t usage;
+   void *reserved_proc[8 - (sizeof(uint64_t) / sizeof(void *))];
+} ANativeWindowBuffer_t;
+
+/* The producer side of a window has to be "connected" to an API before it
+ * will hand out buffers - without it dequeueBuffer returns -ENODEV, which is
+ * exactly what the first attempt hit. There is no ANativeWindow_connect in
+ * libnativewindow (checked with strings on device), because connecting goes
+ * through the struct's own perform() hook. So the struct layout has to be
+ * mirrored from AOSP's system/window.h, in full and in order, to reach it.
+ */
+struct ANativeWindowFull {
+   android_native_base_t common;
+   const uint32_t flags;
+   const int minSwapInterval;
+   const int maxSwapInterval;
+   const float xdpi;
+   const float ydpi;
+   intptr_t oem[4];
+   int (*setSwapInterval)(struct ANativeWindowFull *, int);
+   int (*dequeueBuffer_DEPRECATED)(struct ANativeWindowFull *, void **);
+   int (*lockBuffer_DEPRECATED)(struct ANativeWindowFull *, void *);
+   int (*queueBuffer_DEPRECATED)(struct ANativeWindowFull *, void *);
+   int (*query)(const struct ANativeWindowFull *, int, int *);
+   int (*perform)(struct ANativeWindowFull *, int, ...);
+   int (*cancelBuffer_DEPRECATED)(struct ANativeWindowFull *, void *);
+   int (*dequeueBuffer)(struct ANativeWindowFull *, ANativeWindowBuffer_t **,
+                        int *);
+   int (*queueBuffer)(struct ANativeWindowFull *, ANativeWindowBuffer_t *, int);
+   int (*cancelBuffer)(struct ANativeWindowFull *, ANativeWindowBuffer_t *, int);
+};
+
+#define NATIVE_WINDOW_API_CONNECT 13
+#define NATIVE_WINDOW_API_DISCONNECT 14
+#define NATIVE_WINDOW_API_EGL 1
+
+typedef int (*anw_dequeue_fn)(ANativeWindow *, ANativeWindowBuffer_t **,
+                              int *fence_fd);
+typedef int (*anw_queue_fn)(ANativeWindow *, ANativeWindowBuffer_t *,
+                            int fence_fd);
+typedef int (*anw_set_usage_fn)(ANativeWindow *, uint64_t usage);
+typedef int (*anw_set_format_fn)(ANativeWindow *, int format);
+typedef int (*anw_set_dims_fn)(ANativeWindow *, uint32_t w, uint32_t h);
+
+static anw_dequeue_fn anw_dequeue;
+static anw_queue_fn anw_queue;
+static anw_set_usage_fn anw_set_usage;
+static anw_set_format_fn anw_set_format;
+static anw_set_dims_fn anw_set_dims;
+
+static bool
+load_native_window_api(void)
+{
+   void *h = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
+   if (!h)
+      return false;
+
+   anw_dequeue = (anw_dequeue_fn)dlsym(h, "ANativeWindow_dequeueBuffer");
+   anw_queue = (anw_queue_fn)dlsym(h, "ANativeWindow_queueBuffer");
+   anw_set_usage = (anw_set_usage_fn)dlsym(h, "ANativeWindow_setUsage");
+   anw_set_format = (anw_set_format_fn)dlsym(h, "ANativeWindow_setBuffersFormat");
+   anw_set_dims = (anw_set_dims_fn)dlsym(h, "ANativeWindow_setBuffersDimensions");
+
+   return anw_dequeue && anw_queue && anw_set_usage && anw_set_format &&
+          anw_set_dims;
+}
+
+#define VK_STRUCTURE_TYPE_NATIVE_BUFFER_ANDROID ((VkStructureType)1000010000)
+
+typedef struct {
+   uint64_t consumer;
+   uint64_t producer;
+} VkNativeBufferUsage2ANDROID;
+
+typedef struct {
+   VkStructureType sType;
+   const void *pNext;
+   const native_handle_t *handle;
+   int stride;
+   int format;
+   int usage;
+   VkNativeBufferUsage2ANDROID usage2;
+   uint64_t usage3;
+   struct AHardwareBuffer *ahb;
+} VkNativeBufferANDROID;
+
+typedef VkResult(VKAPI_PTR *PFN_vkGetSwapchainGrallocUsageANDROID)(
+   VkDevice device, VkFormat format, VkImageUsageFlags imageUsage,
+   int *grallocUsage);
+typedef VkResult(VKAPI_PTR *PFN_vkAcquireImageANDROID)(
+   VkDevice device, VkImage image, int nativeFenceFd, VkSemaphore semaphore,
+   VkFence fence);
+typedef VkResult(VKAPI_PTR *PFN_vkQueueSignalReleaseImageANDROID)(
+   VkQueue queue, uint32_t waitSemaphoreCount,
+   const VkSemaphore *pWaitSemaphores, VkImage image, int *pNativeFenceFd);
+
+/* HAL_PIXEL_FORMAT_RGBA_8888, the gralloc format matching
+ * VK_FORMAT_R8G8B8A8_UNORM.
+ */
+#define HAL_PIXEL_FORMAT_RGBA_8888 1
+
+/* ------------------------------------------------------------------ */
 
 /* Copies a file. Used to try loading the driver out of the app's own private
  * directory, which is what a picker that downloads a driver at runtime would
@@ -420,9 +560,283 @@ load_driver_from_anywhere(const char *internal_path)
 
 /* ------------------------------------------------------------------ */
 
+/* Milestone 2: be the swapchain.
+ *
+ * Presents `frames` frames of a solid colour straight to the ANativeWindow,
+ * doing what libvulkan.so would do if the app had gone through it: ask the
+ * driver what gralloc usage it needs, dequeue a buffer from the window, wrap
+ * it as a VkImage via VK_ANDROID_native_buffer, clear it, hand ownership
+ * back with vkQueueSignalReleaseImageANDROID, and queue the buffer.
+ *
+ * Returns the number of frames that made it all the way to queueBuffer.
+ */
+static int
+present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
+               ANativeWindow *window, PFN_vkGetDeviceProcAddr gdpa, int frames)
+{
+   LOGI("=== present (milestone 2) ===");
+
+#define DEV_FN(var, name)                                                    \
+   PFN_##name var = (PFN_##name)gdpa(device, #name);                         \
+   if (!var) {                                                               \
+      LOGE("  missing device entrypoint: %s", #name);                        \
+      check(false, "resolved " #name);                                       \
+      return 0;                                                              \
+   }
+
+   DEV_FN(get_gralloc_usage, vkGetSwapchainGrallocUsageANDROID);
+   DEV_FN(acquire_image, vkAcquireImageANDROID);
+   DEV_FN(signal_release, vkQueueSignalReleaseImageANDROID);
+   DEV_FN(create_image, vkCreateImage);
+   DEV_FN(destroy_image, vkDestroyImage);
+   DEV_FN(create_pool, vkCreateCommandPool);
+   DEV_FN(destroy_pool, vkDestroyCommandPool);
+   DEV_FN(alloc_cbs, vkAllocateCommandBuffers);
+   DEV_FN(begin_cb, vkBeginCommandBuffer);
+   DEV_FN(end_cb, vkEndCommandBuffer);
+   DEV_FN(cmd_barrier, vkCmdPipelineBarrier);
+   DEV_FN(cmd_clear, vkCmdClearColorImage);
+   DEV_FN(create_sem, vkCreateSemaphore);
+   DEV_FN(destroy_sem, vkDestroySemaphore);
+   DEV_FN(queue_submit, vkQueueSubmit);
+   DEV_FN(queue_wait_idle, vkQueueWaitIdle);
+   check(true, "resolved the VK_ANDROID_native_buffer entrypoints");
+
+   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   /* The driver decides what gralloc usage bits its images need; the window
+    * has to be told before it allocates anything.
+    */
+   int gralloc_usage = 0;
+   VkResult r = get_gralloc_usage(device, format, usage, &gralloc_usage);
+   LOGI("  vkGetSwapchainGrallocUsageANDROID -> %d (usage 0x%x)", r,
+        gralloc_usage);
+   check(r == VK_SUCCESS, "driver reported its gralloc usage");
+   if (r != VK_SUCCESS)
+      return 0;
+
+   const int w = ANativeWindow_getWidth(window);
+   const int h = ANativeWindow_getHeight(window);
+
+   /* Connect as the EGL producer. Nothing will dequeue before this; the
+    * platform loader does the same thing when it creates a swapchain.
+    */
+   struct ANativeWindowFull *wnd = (struct ANativeWindowFull *)window;
+   int connected = wnd->perform(wnd, NATIVE_WINDOW_API_CONNECT,
+                                NATIVE_WINDOW_API_EGL);
+   LOGI("  api_connect(EGL) -> %d", connected);
+   check(connected == 0, "connected to the window as a producer");
+   if (connected != 0)
+      return 0;
+
+   int e = anw_set_usage(window, (uint64_t)gralloc_usage);
+   e |= anw_set_format(window, HAL_PIXEL_FORMAT_RGBA_8888);
+   e |= anw_set_dims(window, (uint32_t)w, (uint32_t)h);
+   check(e == 0, "configured the ANativeWindow");
+   if (e != 0)
+      return 0;
+
+   VkCommandPool pool = VK_NULL_HANDLE;
+   const VkCommandPoolCreateInfo pci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      .queueFamilyIndex = queue_family,
+   };
+   r = create_pool(device, &pci, NULL, &pool);
+   check(r == VK_SUCCESS, "created a command pool");
+   if (r != VK_SUCCESS)
+      return 0;
+
+   int presented = 0;
+
+   for (int frame = 0; frame < frames; frame++) {
+      ANativeWindowBuffer_t *buf = NULL;
+      int fence_fd = -1;
+
+      int rc = anw_dequeue(window, &buf, &fence_fd);
+      if (rc != 0 || !buf) {
+         LOGE("  frame %d: dequeueBuffer failed: %d", frame, rc);
+         break;
+      }
+      if (frame == 0) {
+         LOGI("  buffer: %dx%d stride=%d format=%d handle=%p numFds=%d",
+              buf->width, buf->height, buf->stride, buf->format,
+              (const void *)buf->handle, buf->handle ? buf->handle->numFds : -1);
+         check(buf->handle && buf->handle->numFds > 0,
+               "dequeued a gralloc buffer with a usable handle");
+      }
+
+      /* Wrap the gralloc buffer as a VkImage. This is the step that has never
+       * run on this driver: it is where the driver turns a native_handle_t
+       * into memory it can render to.
+       */
+      const VkNativeBufferANDROID anb = {
+         .sType = VK_STRUCTURE_TYPE_NATIVE_BUFFER_ANDROID,
+         .handle = buf->handle,
+         .stride = buf->stride,
+         .format = buf->format,
+         .usage = gralloc_usage,
+         .usage3 = (uint64_t)gralloc_usage,
+      };
+      const VkImageCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .pNext = &anb,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = format,
+         .extent = {(uint32_t)buf->width, (uint32_t)buf->height, 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = usage,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
+      VkImage image = VK_NULL_HANDLE;
+      r = create_image(device, &ici, NULL, &image);
+      if (frame == 0) {
+         LOGI("  vkCreateImage(VkNativeBufferANDROID) -> %d", r);
+         check(r == VK_SUCCESS, "wrapped the gralloc buffer as a VkImage");
+      }
+      if (r != VK_SUCCESS)
+         break;
+
+      /* Take ownership. The fence from dequeueBuffer says when the compositor
+       * is finished with the buffer; handing it to the driver transfers the
+       * wait onto the GPU instead of blocking here.
+       */
+      VkSemaphore acquire_sem = VK_NULL_HANDLE, render_sem = VK_NULL_HANDLE;
+      const VkSemaphoreCreateInfo sci = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+      create_sem(device, &sci, NULL, &acquire_sem);
+      create_sem(device, &sci, NULL, &render_sem);
+
+      r = acquire_image(device, image, fence_fd, acquire_sem, VK_NULL_HANDLE);
+      if (frame == 0) {
+         LOGI("  vkAcquireImageANDROID -> %d", r);
+         check(r == VK_SUCCESS, "acquired the image");
+      }
+      if (r != VK_SUCCESS) {
+         destroy_sem(device, acquire_sem, NULL);
+         destroy_sem(device, render_sem, NULL);
+         destroy_image(device, image, NULL);
+         break;
+      }
+
+      VkCommandBuffer cb = VK_NULL_HANDLE;
+      const VkCommandBufferAllocateInfo cbai = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool = pool,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = 1,
+      };
+      alloc_cbs(device, &cbai, &cb);
+
+      const VkCommandBufferBeginInfo cbbi = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      };
+      begin_cb(cb, &cbbi);
+
+      const VkImageSubresourceRange range = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .levelCount = 1,
+         .layerCount = 1,
+      };
+
+      VkImageMemoryBarrier to_dst = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = 0,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = image,
+         .subresourceRange = range,
+      };
+      cmd_barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+                  &to_dst);
+
+      /* A colour that changes per frame, so a human watching the screen can
+       * tell presentation is live rather than one stuck frame.
+       */
+      const VkClearColorValue colour = {
+         .float32 = {frame & 1 ? 0.9f : 0.1f, 0.4f, frame & 1 ? 0.1f : 0.9f,
+                     1.0f}};
+      cmd_clear(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1,
+                &range);
+
+      VkImageMemoryBarrier to_present = to_dst;
+      to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_present.dstAccessMask = 0;
+      to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      cmd_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1,
+                  &to_present);
+
+      end_cb(cb);
+
+      const VkPipelineStageFlags wait_stage =
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      const VkSubmitInfo si = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .waitSemaphoreCount = 1,
+         .pWaitSemaphores = &acquire_sem,
+         .pWaitDstStageMask = &wait_stage,
+         .commandBufferCount = 1,
+         .pCommandBuffers = &cb,
+         .signalSemaphoreCount = 1,
+         .pSignalSemaphores = &render_sem,
+      };
+      r = queue_submit(queue, 1, &si, VK_NULL_HANDLE);
+      if (frame == 0)
+         check(r == VK_SUCCESS, "submitted the clear");
+
+      /* Give ownership back and get a fence saying when the GPU is done. */
+      int release_fd = -1;
+      if (r == VK_SUCCESS)
+         r = signal_release(queue, 1, &render_sem, image, &release_fd);
+      if (frame == 0) {
+         LOGI("  vkQueueSignalReleaseImageANDROID -> %d (fence fd %d)", r,
+              release_fd);
+         check(r == VK_SUCCESS, "released the image back to the window");
+      }
+
+      if (r == VK_SUCCESS) {
+         rc = anw_queue(window, buf, release_fd);
+         if (frame == 0)
+            check(rc == 0, "queued the buffer to the window");
+         if (rc == 0)
+            presented++;
+      }
+
+      queue_wait_idle(queue);
+      destroy_sem(device, acquire_sem, NULL);
+      destroy_sem(device, render_sem, NULL);
+      destroy_image(device, image, NULL);
+
+      if (r != VK_SUCCESS)
+         break;
+   }
+
+   LOGI("  presented %d/%d frames", presented, frames);
+   check(presented == frames, "presented every frame");
+
+   destroy_pool(device, pool, NULL);
+   wnd->perform(wnd, NATIVE_WINDOW_API_DISCONNECT, NATIVE_WINDOW_API_EGL);
+   return presented;
+
+#undef DEV_FN
+}
+
 /* Brings up Vulkan far enough to prove the driver is usable in this process,
- * and reports what would be needed to present. Deliberately stops short of a
- * swapchain - see the milestone note at the top of this file.
+ * then hands off to present_frames() to do the platform loader's job.
  */
 static void
 run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
@@ -535,10 +949,16 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
       .queueCount = 1,
       .pQueuePriorities = &prio,
    };
+   /* VK_ANDROID_native_buffer is what makes presentation possible at all -
+    * without it there is no way to turn a window buffer into a VkImage.
+    */
+   const char *dev_exts[] = {"VK_ANDROID_native_buffer"};
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
+      .enabledExtensionCount = has_native_buffer ? 1 : 0,
+      .ppEnabledExtensionNames = dev_exts,
    };
 
    VkDevice device = VK_NULL_HANDLE;
@@ -552,6 +972,25 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
       check(true, "have a real ANativeWindow to present to");
    } else {
       check(false, "have a real ANativeWindow to present to");
+   }
+
+   /* Milestone 2. Everything above is setup; this is the part that has never
+    * run against a real window on this driver.
+    */
+   if (device != VK_NULL_HANDLE && window && has_native_buffer) {
+      PFN_vkGetDeviceProcAddr gdpa =
+         (PFN_vkGetDeviceProcAddr)gipa(instance, "vkGetDeviceProcAddr");
+      PFN_vkGetDeviceQueue get_queue =
+         (PFN_vkGetDeviceQueue)gipa(instance, "vkGetDeviceQueue");
+
+      if (gdpa && get_queue && load_native_window_api()) {
+         check(true, "resolved the ANativeWindow producer API");
+         VkQueue queue = VK_NULL_HANDLE;
+         get_queue(device, gfx_family, 0, &queue);
+         present_frames(device, queue, gfx_family, window, gdpa, 4);
+      } else {
+         check(false, "resolved the ANativeWindow producer API");
+      }
    }
 
    if (device != VK_NULL_HANDLE)
