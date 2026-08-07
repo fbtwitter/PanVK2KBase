@@ -678,10 +678,10 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
    int presented = 0;
 
    const bool sync_every_frame = getenv("PANVK_APP_SYNC_EVERY_FRAME") != NULL;
-#define KEEP_MAX 512
-   VkImage keep_img[KEEP_MAX];
-   VkSemaphore keep_acq[KEEP_MAX], keep_rnd[KEEP_MAX];
-   uint32_t kept = 0;
+#define RING 4
+   VkImage keep_img[RING];
+   VkSemaphore keep_acq[RING], keep_rnd[RING];
+   bool ring_used[RING] = {false};
 
    for (int frame = 0; frame < frames; frame++) {
       ANativeWindowBuffer_t *buf = NULL;
@@ -879,12 +879,24 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
          destroy_sem(device, render_sem, NULL);
          destroy_image(device, image, NULL);
       } else {
-         if (kept < KEEP_MAX) {
-            keep_img[kept] = image;
-            keep_acq[kept] = acquire_sem;
-            keep_rnd[kept] = render_sem;
-            kept++;
+         /* Recycle through a small ring instead of hoarding every frame.
+          * Slot (frame % RING) held a frame RING presents ago; dequeueBuffer
+          * blocks until the window hands a buffer back, so by then that
+          * frame has been through the compositor and its objects are done.
+          * This is what a real app does, and it is the difference that
+          * separates "the harness holds too much" from "the driver leaks
+          * per present".
+          */
+         uint32_t slot = (uint32_t)frame % RING;
+         if (ring_used[slot]) {
+            destroy_sem(device, keep_acq[slot], NULL);
+            destroy_sem(device, keep_rnd[slot], NULL);
+            destroy_image(device, keep_img[slot], NULL);
          }
+         keep_img[slot] = image;
+         keep_acq[slot] = acquire_sem;
+         keep_rnd[slot] = render_sem;
+         ring_used[slot] = true;
       }
 
       if ((frame % 30) == 0)
@@ -897,7 +909,9 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
    if (!sync_every_frame) {
       /* One drain at the end, then release everything the loop held. */
       queue_wait_idle(queue);
-      for (uint32_t i = 0; i < kept; i++) {
+      for (uint32_t i = 0; i < RING; i++) {
+         if (!ring_used[i])
+            continue;
          destroy_sem(device, keep_acq[i], NULL);
          destroy_sem(device, keep_rnd[i], NULL);
          destroy_image(device, keep_img[i], NULL);
@@ -1080,7 +1094,7 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          get_queue(device, gfx_family, 0, &queue);
          /* Long enough to outlast the window's buffer count many times
           * over, which is what makes the release fence load-bearing. */
-         present_frames(device, queue, gfx_family, window, gdpa, 240);
+         present_frames(device, queue, gfx_family, window, gdpa, 600);
       } else {
          check(false, "resolved the ANativeWindow producer API");
       }
