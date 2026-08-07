@@ -53,6 +53,20 @@ echo "=== 1. compile the native library ==="
   -u ANativeActivity_onCreate \
   -landroid -llog -ldl -lnativewindow
 
+echo "=== 1b. bundle the driver ==="
+# The APK's native library directory is the one place an app may always
+# execute from, so the driver rides along in it. Without this the app can
+# still be built, and will report that it could not load a driver from
+# anywhere - which is a legitimate thing to test, hence the warning rather
+# than a hard failure.
+DRIVER="${DRIVER:-$REPO/build/libvulkan_panfrost.so}"
+if [ -f "$DRIVER" ]; then
+  cp "$DRIVER" "$OUT/lib/arm64-v8a/libvulkan_panfrost.so"
+  echo "  bundled: $DRIVER"
+else
+  echo "  WARNING: no driver at $DRIVER - the app will have nothing to load"
+fi
+
 echo "=== 2. link resources into a base APK ==="
 "$BUILD_TOOLS/aapt2.exe" link \
   -I "$PLATFORM" \

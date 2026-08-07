@@ -4,9 +4,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="org.panvk2kbase.swapchainapp">
 
+    <!-- extractNativeLibs=true so the bundled driver lands in the app's
+         native library directory as a real file. An app is always allowed to
+         execute from there, which is not true of its own writable data dir
+         under Android's W^X policy. -->
     <application android:label="PanVK kbase probe"
                  android:hasCode="false"
-                 android:debuggable="true">
+                 android:debuggable="true"
+                 android:extractNativeLibs="true">
 
         <activity android:name="android.app.NativeActivity"
                   android:label="PanVK kbase probe"

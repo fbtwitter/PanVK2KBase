@@ -1303,24 +1303,62 @@ Tools worth knowing about before touching any of this:
       Needed because `libdrm.so`/`libhardware.so` are not Android public
       libraries. Recipe (both halves non-obvious) in `docs/kbase-notes.md`;
       `tools/package-driver.sh` produces the Adrenotools-convention zip.
-      **Caveat:** demonstrated from a shell process, not from inside an app.
+      ~~**Caveat:** demonstrated from a shell process, not from inside an
+      app.~~ **Caveat lifted 2026-08-07 — it now runs from inside a real
+      app.** `src/android/swapchain_app/` is a NativeActivity APK (no Java;
+      `main.c` plus the NDK glue) that does the picker's job from an app
+      process: namespace, HAL walk, instance, device. On device: **9 checks,
+      0 failed**, `Mali-G720 MC8`, API 1.4.354, 144 device extensions,
+      `VK_ANDROID_native_buffer` present, against a real 1268x2756
+      `ANativeWindow`.
+      The part worth keeping is the survey of *where* an app may execute a
+      driver from, which the shell probe could not ask:
+      | location | loadable from an app |
+      |---|---|
+      | the APK's native library dir | yes |
+      | the app's private files dir | yes |
+      | `/data/local/tmp` | **no** - W^X, `couldn't map segment 2` |
+      The middle row is the one that matters for a picker that *downloads* a
+      driver rather than shipping it, and it is a yes. The last row is why
+      the first attempt failed: `adb push` puts the driver somewhere an app
+      may read but never execute.
 - [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
       targeting phones, or DRM/kmsro if targeting an embedded board still
       on kbase.
-- [ ] Once WSI actually presents to a real `Surface`/`ANativeWindow`:
-      cross-compile Mesa for Android via a Meson Android cross-file
-      (NDK toolchain, same shape as the community's Turnip-for-Android
-      builds), producing a standalone Vulkan ICD `.so` — not a full
-      system image integration, a droppable driver file.
-- [ ] Package that `.so` with a `meta.json` manifest matching the
-      Adrenotool/Turnip convention that custom-driver pickers in
-      Eden/Azahar/Skyline/Winlator already know how to consume — this is
-      what actually makes the driver "swap in" usable rather than just
-      "builds for Android."
+- [x] **Cross-compile for Android — done, and has been for a while.**
+      `src/mesa/wsl-build-android.sh` + `android-aarch64-wsl.cross` produce
+      `libvulkan_panfrost.so` (~19MB, arm64-v8a) against the NDK, and every
+      CTS run in Phase 7 is that binary. The item was written as "once WSI
+      presents…" but does not actually depend on presentation, which is why
+      it sat open while being continuously used. Check the code before
+      trusting this file, as the Phase 2 note says.
+- [x] **Adrenotools-convention packaging — done** (verified 2026-08-07).
+      `tools/package-driver.sh` emits `meta.json` beside the `.so` and zips
+      them; run it and it produces e.g.
+      `build/panvk-kbase-26.3.0-devel-<sha>.zip`. The `meta.json`
+      description says presentation does not work yet, deliberately - the
+      package should not claim more than the driver does.
 - [ ] Sanity-test the packaged driver in at least one of those pickers
       before assuming the packaging step itself is correct — a `.so`
       that loads is not the same as a `.so` that gets recognized and
       selected correctly by a given emulator's driver manager.
+      Half of this is now answered: the *loading* half works from an app
+      process (see the APK above), so what is left is whether a given
+      picker's manifest parsing and UI accept the zip. Worth doing against
+      Azahar, since that is the emulator this project actually targets.
+- [ ] **Milestone 2: present.** The APK stops short of a swapchain, and
+      the reason is structural rather than lazy: on Android
+      `VK_KHR_swapchain` is implemented by the platform loader
+      (`libvulkan.so`) on top of the driver's `VK_ANDROID_native_buffer`,
+      so a process that loads a driver *directly* - this APK, and any
+      driver picker - has to do the loader's job itself. That means
+      dequeuing a gralloc buffer from the `ANativeWindow`, importing it as
+      a `VkImage`, rendering, `vkQueueSignalReleaseImageANDROID`, and
+      queueing the buffer back. Every piece is individually proven
+      (`tests/driver_android_wsi_probe` imports an AHardwareBuffer as
+      `VkDeviceMemory`; `panvk_kbase_sync.c` does both sync-fd halves);
+      none has been driven against a real window. The APK is the harness
+      for it now that it exists.
 
 ## Phase 7 — CTS-driven hardening
 - [x] **CTS integration path proven** (2026-08-01): standard Vulkan loader

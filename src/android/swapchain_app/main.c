@@ -72,6 +72,16 @@ check(bool ok, const char *what)
    LOGI("  [%s] %s", ok ? "ok" : "FAIL", what);
 }
 
+/* Reports a measurement without passing judgement on it. Used for the "which
+ * directories may an app execute from" survey, where a "no" is a legitimate
+ * finding about Android rather than a defect in this driver.
+ */
+static void
+note(bool yes, const char *what)
+{
+   LOGI("  [%s] %s", yes ? "yes" : "no", what);
+}
+
 /* ------------------------------------------------------------------ */
 /* Bionic's namespace API.
  *
@@ -165,6 +175,62 @@ typedef struct hwvulkan_device_t {
 
 /* ------------------------------------------------------------------ */
 
+/* Copies a file. Used to try loading the driver out of the app's own private
+ * directory, which is what a picker that downloads a driver at runtime would
+ * have to do.
+ */
+static bool
+copy_file(const char *src, const char *dst)
+{
+   FILE *in = fopen(src, "rb");
+   if (!in)
+      return false;
+
+   FILE *out = fopen(dst, "wb");
+   if (!out) {
+      fclose(in);
+      return false;
+   }
+
+   char buf[64 * 1024];
+   size_t n;
+   bool ok = true;
+   while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+      if (fwrite(buf, 1, n, out) != n) {
+         ok = false;
+         break;
+      }
+   }
+
+   fclose(in);
+   fclose(out);
+   return ok;
+}
+
+/* The directory this app's own .so was loaded from, i.e. the APK's extracted
+ * native library directory. Found by asking the dynamic linker where a
+ * function in this library lives, which avoids having to guess at the
+ * /data/app/~~hash~~/pkg-hash/lib/arm64 layout.
+ *
+ * That directory is the one place an app is always allowed to execute from,
+ * so it is where a bundled driver goes.
+ */
+static bool
+native_lib_dir(char *out, size_t out_sz)
+{
+   Dl_info info;
+   if (!dladdr((const void *)&copy_file, &info) || !info.dli_fname)
+      return false;
+
+   snprintf(out, out_sz, "%s", info.dli_fname);
+   char *slash = strrchr(out, '/');
+   if (!slash)
+      return false;
+
+   *slash = '\0';
+   return true;
+}
+
 /* Loads the driver the way a driver picker does and returns its
  * vkGetInstanceProcAddr, or NULL. The two steps are independent failures and
  * are checked separately, because they fail for completely different reasons:
@@ -174,8 +240,7 @@ typedef struct hwvulkan_device_t {
 static PFN_vkGetInstanceProcAddr
 load_driver(const char *path)
 {
-   LOGI("=== load the driver from inside an app ===");
-   LOGI("  driver: %s", path);
+   LOGI("  trying: %s", path);
 
    /* Split the path: the directory goes on the namespace search path, the
     * basename is what we dlopen through it.
@@ -193,6 +258,7 @@ load_driver(const char *path)
 
    void *libdl = dlopen("libdl.so", RTLD_NOW | RTLD_LOCAL);
 
+   static bool api_checked;
    create_ns_fn create_ns = NULL;
    link_ns_fn link_ns = NULL;
    static const char *create_names[] = {"__loader_android_create_namespace",
@@ -215,7 +281,11 @@ load_driver(const char *path)
          link_ns = (link_ns_fn)s;
    }
 
-   check(create_ns && link_ns, "bionic namespace API reachable from an app");
+   /* Only worth reporting once, however many locations get tried. */
+   if (!api_checked) {
+      check(create_ns && link_ns, "bionic namespace API reachable from an app");
+      api_checked = true;
+   }
    if (!create_ns || !link_ns)
       return NULL;
 
@@ -232,14 +302,16 @@ load_driver(const char *path)
    struct android_namespace_t *ns = create_ns(
       "panvk-kbase-app", search_path, NULL, ANDROID_NAMESPACE_TYPE_SHARED,
       NULL, NULL);
-   check(ns != NULL, "created a linker namespace");
-   if (!ns)
+   if (!ns) {
+      LOGE("    android_create_namespace failed");
       return NULL;
+   }
 
    bool linked = link_ns(ns, NULL, PUBLIC_SONAMES);
-   check(linked, "linked it to the platform's public libraries");
-   if (!linked)
+   if (!linked) {
+      LOGE("    android_link_namespaces failed");
       return NULL;
+   }
 
    android_dlextinfo info = {
       .flags = ANDROID_DLEXT_USE_NAMESPACE,
@@ -247,33 +319,103 @@ load_driver(const char *path)
    };
    void *h = android_dlopen_ext(base, RTLD_NOW | RTLD_LOCAL, &info);
    if (!h) {
-      LOGE("  android_dlopen_ext(%s) failed: %s", base, dlerror());
-      check(false, "driver loaded through that namespace");
+      LOGE("    dlopen failed: %s", dlerror());
       return NULL;
    }
-   check(true, "driver loaded through that namespace");
+   LOGI("    loaded");
 
    /* Now the HAL walk. */
    hw_module_t *mod = (hw_module_t *)dlsym(h, "HMI");
    if (!mod || !mod->methods || !mod->methods->open) {
-      check(false, "driver exports a usable hwvulkan HMI module");
+      LOGE("    no usable HMI module");
       return NULL;
    }
-   check(true, "driver exports a usable hwvulkan HMI module");
-   LOGI("  HMI: id=%s name=%s", mod->id ? mod->id : "(null)",
+   LOGI("    HMI: id=%s name=%s", mod->id ? mod->id : "(null)",
         mod->name ? mod->name : "(null)");
 
    hw_device_t *hwdev = NULL;
    if (mod->methods->open(mod, HWVULKAN_DEVICE_0, &hwdev) != 0 || !hwdev) {
-      check(false, "HAL open(\"vk0\") succeeded");
+      LOGE("    HAL open(\"vk0\") failed");
       return NULL;
    }
-   check(true, "HAL open(\"vk0\") succeeded");
 
-   PFN_vkGetInstanceProcAddr gipa =
-      ((hwvulkan_device_t *)hwdev)->GetInstanceProcAddr;
-   check(gipa != NULL, "got a real vkGetInstanceProcAddr");
-   return gipa;
+   return ((hwvulkan_device_t *)hwdev)->GetInstanceProcAddr;
+}
+
+/* Tries each place a driver could live, in the order a picker would care
+ * about, and reports which ones an app is actually allowed to execute from.
+ *
+ * This is the part worth measuring. Android's W^X policy means an app may
+ * not map executable pages out of an arbitrary world-readable directory, and
+ * a driver picker that downloads a driver at runtime has to put it somewhere
+ * that is both writable by the app and executable - which is not obviously
+ * the same place.
+ */
+static PFN_vkGetInstanceProcAddr
+load_driver_from_anywhere(const char *internal_path)
+{
+   LOGI("=== load the driver from inside an app ===");
+
+   PFN_vkGetInstanceProcAddr first = NULL, gipa;
+   char path[512];
+
+   /* All three are tried even after one works. Which locations an app may
+    * execute from is the question a driver picker actually needs answered,
+    * and stopping at the first success would leave it unanswered.
+    */
+
+   /* 1. Bundled in the APK's native library directory. Always executable,
+    * and the arrangement a picker that ships a driver would use.
+    */
+   char libdir[512];
+   if (native_lib_dir(libdir, sizeof(libdir))) {
+      snprintf(path, sizeof(path), "%s/libvulkan_panfrost.so", libdir);
+      gipa = load_driver(path);
+      note(gipa != NULL, "executable: the APK's native library dir");
+      if (gipa && !first)
+         first = gipa;
+   }
+
+   /* 2. Copied into the app's own private files directory. This is the case
+    * a picker that downloads drivers depends on, and the one Android's W^X
+    * policy is most likely to refuse.
+    */
+   if (internal_path && *internal_path) {
+      char src[512];
+      const char *env = getenv("PANVK_KBASE_ICD_DRIVER");
+
+      /* Prefer the bundled copy as the source: /data/local/tmp may not exist
+       * on a device that only ever had the APK installed.
+       */
+      if (env)
+         snprintf(src, sizeof(src), "%s", env);
+      else if (native_lib_dir(libdir, sizeof(libdir)))
+         snprintf(src, sizeof(src), "%s/libvulkan_panfrost.so", libdir);
+      else
+         snprintf(src, sizeof(src), "%s", DEFAULT_DRIVER);
+
+      snprintf(path, sizeof(path), "%s/libvulkan_panfrost.so", internal_path);
+
+      if (copy_file(src, path)) {
+         gipa = load_driver(path);
+         note(gipa != NULL, "executable: the app's private files dir");
+         if (gipa && !first)
+            first = gipa;
+      } else {
+         LOGI("  (could not copy %s -> %s)", src, path);
+         note(false, "executable: the app's private files dir (copy failed)");
+      }
+   }
+
+   /* 3. Straight out of /data/local/tmp, where adb push puts it. Expected to
+    * fail in an app - kept because the failure is the informative part.
+    */
+   gipa = load_driver(DEFAULT_DRIVER);
+   note(gipa != NULL, "executable: /data/local/tmp");
+   if (gipa && !first)
+      first = gipa;
+
+   return first;
 }
 
 /* ------------------------------------------------------------------ */
@@ -420,16 +562,12 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
 }
 
 static void
-run_everything(ANativeWindow *window)
+run_everything(ANativeWindow *window, const char *internal_path)
 {
    g_checks_run = 0;
    g_checks_failed = 0;
 
-   const char *path = getenv("PANVK_KBASE_ICD_DRIVER");
-   if (!path)
-      path = DEFAULT_DRIVER;
-
-   PFN_vkGetInstanceProcAddr gipa = load_driver(path);
+   PFN_vkGetInstanceProcAddr gipa = load_driver_from_anywhere(internal_path);
    if (gipa)
       run_vulkan(window, gipa);
 
@@ -450,7 +588,7 @@ on_app_cmd(struct android_app *app, int32_t cmd)
     * which is exactly what this app is here to get hold of.
     */
    if (cmd == APP_CMD_INIT_WINDOW && app->window != NULL)
-      run_everything(app->window);
+      run_everything(app->window, app->activity->internalDataPath);
 }
 
 void
