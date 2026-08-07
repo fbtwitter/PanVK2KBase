@@ -2159,12 +2159,27 @@ Tools worth knowing about before touching any of this:
       at the dependency**: on recording a `vkCmdDrawIndirectByteCountEXT`
       whose counter buffer has a writeback still owed in this render
       pass, close the tiling batch early, flush the pending captures and
-      counter ops, and open a new batch for the rest. That is real
-      surgery on `panvk_vX_cmd_draw.c`'s render-pass handling and should
-      not start without agreement on the approach - the fallback (reading
-      the write position directly instead of the app's counter buffer)
-      does not help, because it is the same value with the same
-      dependency, just sourced differently.
+      counter ops, and open a new batch for the rest.
+      **Designed, not implemented: `docs/xfb-render-pass-split.md`.** The
+      useful find is that PanVK already stores and reloads attachments
+      mid-render-pass for tiler-heap exhaustion - `fb.spill.load/store`
+      and the three `render.ir.fbds[]` sets - so the preload half is
+      solved and tested. What is missing is a host-side trigger:
+      incremental rendering is driven entirely from the tiler-OOM
+      exception handler on the FRAGMENT subqueue and never signals the
+      VERTEX_TILER syncobj, which is the one thing a capture needs. The
+      doc has the step-by-step, the four places it is likely to go wrong
+      (the tiler-descriptor reset most of all), and the test order -
+      including measuring `dEQP-VK.renderpass.*` /
+      `dynamic_rendering.*` *before* the change, since those are what
+      would catch a botched attachment reload and have never been run
+      against this driver.
+      One cheaper thing to try first, ~20 minutes: dispatch the capture
+      inline without waiting on the tiler at all. The deferral exists
+      because the *wait* had nothing valid to wait on, not because of a
+      data dependency, and everything a capture reads is CPU-written at
+      record time. The known hazard is the shared TLS descriptor. If that
+      holds, the split is unnecessary.
 - [ ] **Superseded: counter-buffer reads within one render pass.** All 9
       remaining failures are one class — eight `backward_dependency*` and
       `draw_indirect_counter_resubmit`. They write a counter buffer at
