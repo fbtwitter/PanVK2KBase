@@ -732,13 +732,31 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
    util_dynarray_clear(&state->xfb.pending_draws);
    util_dynarray_clear(&state->xfb.pending_counter_ops);
 
-   /* Safe to release only now: End runs before CmdEndRendering, so the write
-    * positions have to outlive it and survive until the captures that use
-    * them have actually been emitted. Captures and writebacks both hold their
-    * own copy of the address, so this only drops the current pair's - the
-    * allocation itself lives in the command buffer's pool either way.
+   /* Safe to release only if no Begin/End pair is currently open: End runs
+    * before CmdEndRendering, so the write positions have to outlive it and
+    * survive until the captures that use them have actually been emitted.
+    * Captures and writebacks both hold their own copy of the address, so
+    * this only drops the current pair's - the allocation itself lives in
+    * the command buffer's pool either way.
+    *
+    * This function also runs mid-render-pass, from
+    * split_render_pass_for_xfb() (csf/panvk_vX_cmd_draw.c) closing a
+    * backward dependency - see docs/xfb-render-pass-split.md. There, the
+    * pair that triggered the split (a Begin resuming from the counter
+    * buffer this same flush's writeback just produced) is still open:
+    * its own Begin already replaced offsets_gpu with its own allocation,
+    * and cmd_prepare_xfb_capture() for its own draw runs moments after
+    * this call returns, in the same CmdDrawIndirectByteCountEXT. Zeroing
+    * unconditionally here would null out that live allocation before it
+    * is ever read, and cmd_prepare_xfb_capture() silently leaves the draw
+    * unprepared (offsets_gpu is one of its own early-return checks) -
+    * found via dEQP-VK.transform_feedback.simple.backward_dependency*,
+    * where pair 2 read as unprepared despite everything upstream of it
+    * (the counter buffer's value, the byte-count draw's own kernel) being
+    * correct.
     */
-   state->xfb.offsets_gpu = 0;
+   if (!state->xfb.active)
+      state->xfb.offsets_gpu = 0;
 
    /* An XFB query ended before the render pass did had its availability write
     * deferred to here, so it lands after the counts above - see
@@ -749,4 +767,31 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
          cmdbuf, state->xfb_query.deferred_syncobj);
       state->xfb_query.deferred_syncobj = 0;
    }
+}
+
+/* True if this render pass still owes a write to the counter buffer at
+ * dev_addr - i.e. reading it now, before CmdEndRendering, would read a value
+ * the captures have not produced yet.
+ *
+ * This is exactly the vkCmdDrawIndirectByteCountEXT backward dependency
+ * (dEQP-VK.transform_feedback.simple.backward_dependency*): that draw's own
+ * vertex count comes from a counter buffer an earlier End in this same
+ * render pass wrote, and normally nothing makes that write final until
+ * CmdEndRendering flushes every capture - too late for a draw recorded
+ * before it. See docs/xfb-render-pass-split.md for what the caller does
+ * with a true answer.
+ */
+bool
+panvk_per_arch(cmd_xfb_counter_write_pending)(struct panvk_cmd_buffer *cmdbuf,
+                                              uint64_t dev_addr)
+{
+   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+
+   util_dynarray_foreach(&state->xfb.pending_counter_ops,
+                         struct panvk_xfb_counter_op, op) {
+      if (op->type == PANVK_XFB_COUNTER_WRITEBACK && op->dev_addr == dev_addr)
+         return true;
+   }
+
+   return false;
 }

@@ -280,6 +280,17 @@ static bool bytecount_mode;
 #define BYTECOUNT_BYTES 48
 #define BYTECOUNT_STRIDE 16
 
+/* --backward mode: the dEQP-VK.transform_feedback.simple.backward_dependency
+ * shape in one render pass - an unseeded Begin -> draw -> End(counter)
+ * writeback, a barrier, then a resuming Begin(counter) whose
+ * vkCmdDrawIndirectByteCountEXT reads the SAME counter buffer that writeback
+ * just produced, all before CmdEndRendering. Unlike --bytecount and --resume,
+ * which each seed the counter buffer from the host, here nothing ever writes
+ * it but the driver itself - so a stale/zero read here is a real backward-
+ * dependency bug, not a probe setup error.
+ */
+static bool backward_mode;
+
 static bool restart_mode;
 #define RESTART_INDEX_COUNT 7
 static const uint16_t INDICES_RESTART[RESTART_INDEX_COUNT] = {
@@ -433,6 +444,8 @@ main(int argc, char **argv)
          indirect_mode = true;
          multidraw_mode = true;
       }
+      else if (strcmp(argv[i], "--backward") == 0)
+         backward_mode = true;
    }
    if (strip_mode && indexed_mode && !restart_mode) {
       fprintf(stderr,
@@ -473,6 +486,9 @@ main(int argc, char **argv)
    if (indirect_mode)
       printf("       + indirect (vkCmdDrawIndirect%s)\n",
              multidraw_mode ? ", drawCount=2" : "");
+   if (backward_mode)
+      printf("       + backward (draw -> End writeback -> resuming Begin -> "
+             "DrawIndirectByteCount, all in one render pass)\n");
 
    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
    if (!h) {
@@ -706,7 +722,7 @@ main(int argc, char **argv)
    VkBuffer counter_buf = VK_NULL_HANDLE;
    VkDeviceMemory counter_memory = VK_NULL_HANDLE;
    uint32_t *counter_mapped = NULL;
-   if (resume_mode || bytecount_mode) {
+   if (resume_mode || bytecount_mode || backward_mode) {
       printf("\n=== counter buffer: 1 x uint32, host-visible ===\n");
 
       VkBufferCreateInfo cbci = {
@@ -743,9 +759,17 @@ main(int argc, char **argv)
       if (r != VK_SUCCESS)
          return 1;
 
-      *counter_mapped = bytecount_mode ? BYTECOUNT_BYTES : RESUME_START_BYTES;
-      printf("  seeded counter buffer with %u bytes (%u vertices)\n",
-             *counter_mapped, *counter_mapped / 16);
+      /* backward_mode deliberately leaves this at 0: nothing but the
+       * driver's own End(counter) writeback may ever produce its value.
+       */
+      *counter_mapped =
+         bytecount_mode ? BYTECOUNT_BYTES : resume_mode ? RESUME_START_BYTES : 0;
+      if (backward_mode)
+         printf("  counter buffer left unseeded (0) - only the driver's own\n"
+                "  writeback may set it\n");
+      else
+         printf("  seeded counter buffer with %u bytes (%u vertices)\n",
+                *counter_mapped, *counter_mapped / 16);
    }
 
    /* ------------------------------------------------------- indirect buffer */
@@ -874,7 +898,8 @@ main(int argc, char **argv)
    printf("\n=== XFB buffer: 3 x vec4 (48 bytes), host-visible ===\n");
 
    const VkDeviceSize xfb_size =
-      (resume_mode || multidraw_mode || strip_mode) && !manydraws_mode
+      (resume_mode || multidraw_mode || strip_mode || backward_mode) &&
+            !manydraws_mode
          ? (VkDeviceSize)MAX_CAPTURE_VERTS * sizeof(EXPECTED_XFB[0])
          : (VkDeviceSize)capture_verts() * sizeof(EXPECTED_XFB[0]);
    VkBufferCreateInfo xfb_bci = {
@@ -1259,6 +1284,56 @@ main(int argc, char **argv)
       printf("  vkCmdBeginQueryIndexedEXT recorded (stream 0)\n");
    }
 
+   if (backward_mode) {
+      /* Pair 1: unseeded Begin -> draw -> End(counter), a plain writeback -
+       * nothing has read the counter buffer yet, so this half is exactly
+       * the no-counter path every other mode already exercises.
+       */
+      cmd_begin_xfb(cmdbuf, 0, 0, NULL, NULL);
+      printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer) "
+             "[pair 1]\n");
+
+      cmd_draw(cmdbuf, BASE_VERTS, 1, 0, 0);
+      printf("  vkCmdDraw(%d, 1, 0, 0) recorded [pair 1]\n", BASE_VERTS);
+
+      VkDeviceSize czero = 0;
+      cmd_end_xfb(cmdbuf, 0, 1, &counter_buf, &czero);
+      printf("  vkCmdEndTransformFeedbackEXT recorded (counter buffer) "
+             "[pair 1, writeback]\n");
+
+      /* Same self-dependency barrier the CTS test records between the
+       * writeback and the resuming Begin.
+       */
+      VkMemoryBarrier tfc_barrier = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_WRITE_BIT_EXT,
+         .dstAccessMask = VK_ACCESS_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT,
+      };
+      cmd_barrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
+                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &tfc_barrier, 0,
+                 NULL, 0, NULL);
+      printf("  vkCmdPipelineBarrier recorded (TRANSFORM_FEEDBACK -> "
+             "DRAW_INDIRECT)\n");
+
+      /* Pair 2: resume from the SAME counter buffer pair 1 just wrote, then
+       * immediately read it back via vkCmdDrawIndirectByteCountEXT - the
+       * backward dependency under test. Nothing outside the driver ever
+       * touches counter_buf between the writeback above and this read.
+       */
+      cmd_begin_xfb(cmdbuf, 0, 1, &counter_buf, &czero);
+      printf("  vkCmdBeginTransformFeedbackEXT recorded (counter buffer) "
+             "[pair 2, resume]\n");
+
+      cmd_draw_byte_count(cmdbuf, 1, 0, counter_buf, 0, 0, BYTECOUNT_STRIDE);
+      printf("  vkCmdDrawIndirectByteCountEXT recorded (stride %d) "
+             "[pair 2]\n", BYTECOUNT_STRIDE);
+
+      cmd_end_xfb(cmdbuf, 0, 0, NULL, NULL);
+      printf("  vkCmdEndTransformFeedbackEXT recorded [pair 2]\n");
+
+      goto record_done;
+   }
+
    if (resume_mode) {
       VkDeviceSize czero = 0;
       cmd_begin_xfb(cmdbuf, 0, 1, &counter_buf, &czero);
@@ -1310,6 +1385,7 @@ main(int argc, char **argv)
       printf("  vkCmdEndTransformFeedbackEXT recorded\n");
    }
 
+record_done:
    cmd_end_rendering(cmdbuf);
 
    if (query_mode) {
@@ -1433,6 +1509,51 @@ main(int argc, char **argv)
       for (size_t i = 0; i < (size_t)xfb_size; i++)
          printf("%02x", raw[i]);
       printf("\n");
+
+      if (backward_mode) {
+         /* Pair 1's 3 vertices, then pair 2's - captured via
+          * vkCmdDrawIndirectByteCountEXT reading the counter buffer pair 1's
+          * End just wrote, entirely within one render pass and before
+          * CmdEndRendering ever runs. If the driver's synchronization for
+          * that backward dependency is broken, pair 2 reads a stale/zero
+          * counter and either draws nothing (region 2 stays poison) or the
+          * wrong count.
+          */
+         bool region1_ok = memcmp(raw, EXPECTED_XFB, sizeof(EXPECTED_XFB)) == 0;
+         bool region2_ok =
+            memcmp(raw + sizeof(EXPECTED_XFB), EXPECTED_XFB,
+                   sizeof(EXPECTED_XFB)) == 0;
+         bool region2_poison = true;
+         for (size_t i = sizeof(EXPECTED_XFB); i < 2 * sizeof(EXPECTED_XFB); i++)
+            region2_poison = region2_poison && raw[i] == 0x11;
+
+         check(region1_ok, "pair 1 captured the expected triangle");
+         check(region2_ok, "pair 2 (byte-count draw) captured the expected "
+                           "triangle");
+         if (!region2_ok && region2_poison)
+            printf("  NOTE: pair 2's region is untouched poison - the "
+                   "byte-count draw drew nothing, meaning it read the "
+                   "counter buffer as 0 or its vertex count as 0.\n");
+
+         uint32_t final_counter = *counter_mapped;
+         uint32_t want_counter = (uint32_t)sizeof(EXPECTED_XFB);
+         printf("  counter buffer (final) = %u (expected %u)\n",
+                final_counter, want_counter);
+         check(final_counter == want_counter,
+               "counter buffer holds pair 1's writeback after full "
+               "completion");
+         if (final_counter == want_counter && !region2_ok)
+            printf("  NOTE: the writeback landed correctly by the time the "
+                   "host reads it, but pair 2 still failed - this is a "
+                   "genuine mid-batch visibility gap, not a broken "
+                   "writeback.\n");
+         else if (final_counter != want_counter)
+            printf("  NOTE: the writeback itself is wrong even after full "
+                   "completion - not a visibility gap, the write position "
+                   "advance or the writeback copy is broken.\n");
+
+         goto xfb_done;
+      }
 
       if (resume_mode) {
          /* The capture must start at the seeded offset, so the first half of
@@ -1684,7 +1805,7 @@ main(int argc, char **argv)
       destroy_buffer(device, ibo, NULL);
       free_mem(device, ibo_memory, NULL);
    }
-   if (resume_mode || bytecount_mode) {
+   if (resume_mode || bytecount_mode || backward_mode) {
       destroy_buffer(device, counter_buf, NULL);
       free_mem(device, counter_memory, NULL);
    }
@@ -1694,7 +1815,12 @@ main(int argc, char **argv)
    }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && bytecount_mode)
+   if (failures == 0 && backward_mode)
+      printf("\n=> VK_EXT_transform_feedback backward dependency works:\n"
+             "   a vkCmdDrawIndirectByteCountEXT read the counter buffer an\n"
+             "   earlier End in the same render pass wrote, entirely before\n"
+             "   CmdEndRendering.\n");
+   else if (failures == 0 && bytecount_mode)
       printf("\n=> VK_EXT_transform_feedback draw-by-byte-count works:\n"
              "   the vertex count came from a counter buffer and never\n"
              "   existed on the host, and its own capture round-tripped.\n");

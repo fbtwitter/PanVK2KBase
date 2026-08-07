@@ -1,7 +1,16 @@
 # Splitting a render pass so XFB captures can be consumed inside it
 
-Design note, 2026-08-07. Not implemented — this is the plan, written while
-the surrounding code was fresh, plus the evidence behind it.
+Design note, 2026-08-07. Implemented the same day
+(`patch-panvk-xfb-render-pass-split.py`) — this is the plan as originally
+written, plus the evidence behind it.
+
+**Status (2026-08-07, later the same day)**: the split's control flow and
+its XFB *capture* are both correct and verified on hardware — see "The
+render-pass split's capture bug" in `docs/kbase-notes.md` for the real bug
+(an `offsets_gpu` field zeroed while a Begin/End pair was still open,
+mid-render-pass) and the fix. A **separate**, still-open bug remains in
+pair 2's *rendered* color output for the plain (non-query) variants — see
+"Open: pair 2's rendered output is still wrong" in the same doc.
 
 ## The problem
 

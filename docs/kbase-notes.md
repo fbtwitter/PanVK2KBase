@@ -5420,3 +5420,159 @@ distinct from the process-level segfaults above, since `adb` itself stops
 responding. Run CTS in bounded chunks with a responsiveness check between them
 so a freeze is attributable, and confirm recovery with
 `driver_compute_probe --fill` before trusting later results.
+
+## The render-pass split's capture bug: `offsets_gpu` zeroed while a Begin is still open (2026-08-07)
+
+`docs/xfb-render-pass-split.md`'s render-pass split (fixing
+`dEQP-VK.transform_feedback.simple.backward_dependency*`) compiled clean and
+its control flow ran correctly - the trigger fired, `flush_tiling()` signalled,
+`cmd_flush_pending_xfb_captures()` ran and returned success - but the target
+tests still failed with the exact same `received:0 expected:64` as before the
+split existed. The debugging chain to the real bug went through five wrong
+turns first; recording all of them because each one looked exactly as
+plausible as the real fix until tested on hardware.
+
+**Five wrong hypotheses, each disproved by a hardware test, not by reasoning
+about the code:**
+
+1. **`emit_xfb_counter_op()`'s WRITEBACK missing a cache flush after its
+   store.** Added `cs_flush_caches(CLEAN, CLEAN, NONE)` + wait after the
+   store. No change.
+2. **`cs_flush_stores()` needed before the cache flush**, so the flush isn't
+   racing the store's own retirement. Added both, in order. No change.
+3. **The flush needed `MALI_CS_OTHER_FLUSH_MODE_INVALIDATE`, not `NONE`** -
+   confirmed genxml has this value and no other flush in the driver uses it,
+   a real candidate for "a kernel dispatch reads through a cache a plain CS
+   load never touches." Verified via a bit-level decode of the dumped
+   instruction stream that the flag really was encoded correctly on
+   hardware. No change.
+4. **The kernel's `counter`/`indirect` parameters were `constant`, not
+   `global`.** `panlib_xfb_byte_count_draw`'s `counter` and
+   `panlib_xfb_setup`'s `indirect` (`draw_helper.cl`) both read addresses a
+   GPU-side writeback can produce mid-command-buffer - `constant` is for
+   read-only, unchanging data. Changed both to `global`. No change - and the
+   compiled `.so` came out **byte-identical** before and after, proving this
+   compiler/architecture combination does not distinguish the two qualifiers
+   at all. (Both reverted.)
+5. **A full syncobj signal+wait**, the same primitive
+   `CmdDrawIndirectByteCountEXT`'s own COMPUTE -> VERTEX_TILER handoff uses
+   for this exact class of hazard, self-referentially on COMPUTE instead of
+   the cache-flush encoding. No change.
+
+Five different fixes producing the byte-identical failure is itself a
+signal: nothing in the cache/sync domain was ever the problem.
+
+**What actually resolved it**: a debug build of `panlib_xfb_byte_count_draw`
+that wrote its own inputs and output back into the counter buffer
+(`*counter = (bytes << 16) | vertexCount`) so a host readback could see
+exactly what the kernel saw. It read `bytes=48` (correct) and computed
+`vertexCount=3` (correct) - the kernel had been working all along, on every
+attempt. `tests/render_xfb_probe --backward` (new mode, added during this
+investigation - see below) then proved the same for the downstream kernel:
+`counter buffer (final) = 48 (expected 48)` after full completion, but
+region 2 (the byte-count draw's own capture) stayed poison. The value was
+right at every point checked; something else was silently refusing to use
+it.
+
+Added `mesa_logi()` diagnostics directly to `cmd_flush_pending_xfb_captures()`
+(temporary, never committed) and found it: `draw[0] prepared=0` for pair 2's
+queued capture. `cmd_prepare_xfb_capture()` bails out early whenever
+`state->xfb.offsets_gpu` is NULL - and `cmd_flush_pending_xfb_captures()`
+unconditionally zeroes that field at its own end:
+
+```c
+state->xfb.offsets_gpu = 0;
+```
+
+That line is correct when this function runs from the real
+`CmdEndRendering` - by then the render pass's last `End` has already run, so
+nothing still needs the allocation. It is **wrong** when the split calls the
+same function mid-render-pass: pair 2's `Begin` (the one that triggered the
+split, by resuming from the counter buffer pair 1's `End` just wrote) had
+*already* installed its own fresh `offsets_gpu` before the split ever ran.
+The unconditional zero destroyed that live allocation, and
+`cmd_prepare_xfb_capture()` for pair 2's own draw - called moments later, in
+the same `CmdDrawIndirectByteCountEXT` - silently left the draw unprepared.
+
+**The fix** (`panvk_vX_cmd_xfb.c`, `cmd_flush_pending_xfb_captures()`):
+
+```c
+if (!state->xfb.active)
+   state->xfb.offsets_gpu = 0;
+```
+
+`state->xfb.active` is false exactly when it's safe to release: for the real
+`CmdEndRendering` call, the last `End` already cleared it. For the split's
+mid-render-pass call, the pair that triggered it is still open (`active` is
+true), so the field survives - correctly, since it hasn't been consumed yet.
+
+Verified: all 15 `render_xfb_probe` modes (including the new `--backward`)
+pass with 0 failures, no regression. The plain
+`dEQP-VK.transform_feedback.simple.backward_dependency` case's XFB-buffer
+check (`verifyTransformFeedbackBuffer`) now passes - it was the thing
+failing before this fix.
+
+### New test: `render_xfb_probe --backward`
+
+Reproduces the CTS backward-dependency shape directly - unseeded
+`Begin -> draw -> End(counter)` writeback, the same self-dependency
+`vkCmdPipelineBarrier` the CTS test records, then a resuming
+`Begin(counter) -> vkCmdDrawIndirectByteCountEXT -> End` - with a fully
+host-visible counter buffer so both the final counter value and the second
+capture's contents can be inspected directly after full completion. This is
+what made the "constant vs global had zero effect" and "the writeback is
+correct, only pair 2 fails" findings possible; the CTS test's own
+`--deqp-log-images=disable` default and lack of intermediate-state readback
+would not have shown either.
+
+### Open: pair 2's *rendered* output is still wrong
+
+With the capture bug fixed, the plain `backward_dependency` and
+`backward_dependency_indirect` cases (and two of their sub-variants) still
+fail - but differently: `Image comparison failed: max difference = (0, 0, 1,
+0), threshold = (0, 0, 0, 0)`. That is exactly `geomColor (0,0,1,1)` minus
+`clearColor (0,0,0,1)` - every pixel is showing the clear colour, not the
+capture-verified-correct geometry. Decoding the actual PNG pixel data
+embedded in the QPA log (the driver's own Sub-filtered PNG rows, not just
+the "unexpected results" text) confirmed this is not a partial/off-by-one
+gap: the **entire** 64x1 result image is uniformly the clear colour, zero
+pixels of pair 2's geometry made it into the final store, despite pair 2's
+XFB capture (a separate dispatch reading the same synthesised
+`VkDrawIndirectCommand`) proving all 64 vertex invocations ran with correct
+`gl_VertexIndex`.
+
+Progress made ruling things out, each verified on hardware rather than
+assumed:
+
+- **Not AFBC.** `PANVK_DEBUG=noafbc` produces the identical
+  `(0, 0, 1, 0)` diff.
+- **Not a general point-list-full-coverage bug.** The historical suspicion
+  in this doc (`many_indirect_draws_on_secondary`, a different, unrelated
+  CTS case, "point-list full-coverage... a bigger, more speculative next
+  step") does not hold here: `dEQP-VK.transform_feedback.simple.basic*`
+  (37/38 passing) already uses `VK_PRIMITIVE_TOPOLOGY_POINT_LIST` via the
+  same test file's shared pipeline setup.
+- **Not multi-tile triangle coverage.** Temporarily widening
+  `render_xfb_probe`'s render target from 16x16 to 128x128 (well past a
+  single tile) still captured and rendered pair 2's triangle correctly.
+- **`get_tiler_desc()` and `get_fb_descs()` both rebuild correctly for pair
+  2**, confirmed via temporary diagnostics: `tiler=0x0` at entry (triggers a
+  fresh build, not a stale reuse) and `load_eq_spill=1` (the split's
+  `render->fb.load = render->fb.spill.load` override is still in place by
+  the time the lazy rebuild reads it - not stomped by anything in between).
+
+Narrowed to `launch_indirect_draw()` (`csf/panvk_vX_cmd_draw.c`): the actual
+vertex/instance count for an indirect draw is read via a plain `cs_load_to`
+inside a `cs_while (draw_count > 0)` block, from the same
+`cmd.gpu`/`VkDrawIndirectCommand` buffer the byte-count kernel wrote and the
+XFB capture kernel already reads correctly. `CmdDrawIndirectByteCountEXT`
+does have an explicit COMPUTE -> VERTEX_TILER cache-flush-and-syncobj-wait
+before calling `panvk_cmd_draw()`, so a same-class visibility gap is
+plausible but **not yet confirmed** - given how many cache/sync hypotheses
+turned out to be dead ends for the capture bug (all five above), this needs
+its own hardware-verified isolation, not another round of reading the
+mechanism and assuming it's the same class of problem. Next step: dump
+`launch_indirect_draw()`'s register loads the same way the counter-op stream
+was dumped (`PANVK_KBASE_DUMP=1`, `kbase dump summary`) to see what
+`INDEX_COUNT`/vertex-count register actually holds at the point the loop
+runs, rather than continuing to reason about it from source.

@@ -2289,6 +2289,32 @@ Tools worth knowing about before touching any of this:
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior
       art, ~11,000+ lines, multi-month even reused).
+- [x] **Render-pass split implemented; its XFB capture bug found and fixed
+      (2026-08-07).** `patch-panvk-xfb-render-pass-split.py` implements
+      `docs/xfb-render-pass-split.md`'s design. The capture-correctness bug
+      that survived it — `cmd_flush_pending_xfb_captures()` unconditionally
+      zeroing `state->xfb.offsets_gpu`, which is correct when called from
+      the real `CmdEndRendering` but destroys a still-live allocation when
+      the split calls it mid-render-pass while a later Begin/End pair is
+      still open — is fixed (`panvk_vX_cmd_xfb.c`): only zero it when
+      `!state->xfb.active`. Five other hypotheses (four CS-level cache-
+      flush/sync variants, one `constant`→`global` kernel-parameter change)
+      were tried and disproved on hardware first — see "The render-pass
+      split's capture bug" in `docs/kbase-notes.md` for the full chain,
+      worth reading before re-deriving any of them. All 15
+      `render_xfb_probe` modes (new: `--backward`) pass, 0 regressions; the
+      plain `backward_dependency` case's XFB-buffer check now passes.
+      **Still open**: pair 2's *rendered* color output, not its capture, is
+      wrong for the plain (non-query) `backward_dependency` /
+      `backward_dependency_indirect` variants — the entire result image
+      comes back as the clear colour, despite the capture proving every
+      vertex invocation ran correctly. Narrowed to `launch_indirect_draw()`
+      reading the synthesised `VkDrawIndirectCommand` via a plain
+      `cs_load_to`, not yet confirmed as a visibility gap — see
+      "Open: pair 2's rendered output is still wrong" in
+      `docs/kbase-notes.md` for what's ruled out (AFBC, general point-list
+      rendering, multi-tile coverage, `get_tiler_desc`/`get_fb_descs`
+      rebuild timing) and the concrete next step.
 
 ## Phase 8 — Real-app validation
 - [ ] apitrace/gfxreconstruct captures of actual apps/games once CTS is
