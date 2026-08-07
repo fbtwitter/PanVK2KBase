@@ -202,3 +202,38 @@ between those two; the fixes are in different projects.
 Note this path had never executed before 2026-08-07: it needs a swapchain,
 which needs a window, which needs an APK. The same blind spot hid the
 `anb->handle->data[0]` bug fixed in the same session.
+
+## Presentation: the -13 is the queue submit, not the export
+
+Measured 2026-08-07 by logging either side of the submit in
+`vk_common_QueueSignalReleaseImageANDROID` (`vk_android.c:578-602`):
+
+    ANB-RELEASE submit result=-13
+
+The export line never printed, so `GetSemaphoreFdKHR` is never reached.
+`VK_ERROR_UNKNOWN` comes out of the `QueueSubmit2` (or
+`vk_device_copy_semaphore_payloads`) that signals the SYNC_FD-exportable
+semaphore `vk_anb_semaphore_init_once()` created.
+
+Ruled out, each by direct measurement rather than inference:
+
+- semaphore *creation* with `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`
+  succeeds (the app creates one itself: returns 0)
+- device creation with `VK_KHR_external_semaphore_fd` / `external_fence_fd` /
+  `external_memory_fd` enabled succeeds (`vkCreateDevice -> 0`)
+- the fd export is not the failure - it never runs
+
+Also worth noting: `panvk_kbase_sync.c` and `panvk_vX_kbase_queue.c` contain
+no `VK_ERROR_UNKNOWN` of their own, so the error is being produced by the
+shared runtime's submit path rather than returned directly by the kbase
+backend. That points at a `vk_sync_type` capability check - the exportable
+semaphore's sync type likely lacks a feature the submit path requires -
+rather than at an outright "not implemented" in the backend.
+
+**Next:** instrument or step `vk_queue_submit` / the panvk `QueueSubmit2`
+entrypoint to find which check produces `VK_ERROR_UNKNOWN` for a semaphore
+whose sync type is the kbase one. If it is a missing `vk_sync_features` bit
+on the kbase sync type, that is a small, local fix; if the submit path
+genuinely requires a real exportable fence, this runs into the documented
+`KBASE_IOCTL_STREAM_CREATE` limitation and presentation needs a different
+design on this kernel driver.
