@@ -120,6 +120,12 @@ typedef bool (*link_ns_fn)(struct android_namespace_t *from,
  * libhardware pulls in libvndksupport, which needs libdl_android.so out of
  * the runtime apex, and a namespace cannot reach into the apex itself.
  */
+/* The namespace the driver was loaded through. Kept because anything else
+ * that needs a non-public system library - libui for IMapper, say - has to
+ * go through the same one; the app default namespace cannot see them.
+ */
+static struct android_namespace_t *g_driver_ns;
+
 static const char *PUBLIC_SONAMES =
    "libc.so:libm.so:libdl.so:liblog.so:libz.so:libnativewindow.so:"
    "libsync.so:libandroid.so:libvulkan.so:"
@@ -455,6 +461,8 @@ load_driver(const char *path)
       return NULL;
    }
 
+   g_driver_ns = ns;
+
    android_dlextinfo info = {
       .flags = ANDROID_DLEXT_USE_NAMESPACE,
       .library_namespace = ns,
@@ -711,6 +719,163 @@ probe_modifiers(VkPhysicalDevice pdev, PFN_vkGetInstanceProcAddr gipa,
            matches);
 }
 
+/* Ask gralloc for the buffer's real format modifier, via IMapper5.
+ *
+ * The driver cannot do this: u_gralloc's IMapper backends need AOSP-generated
+ * HIDL headers and are compiled out of an -Dandroid-stub build, so the ANB
+ * import path has been assuming LINEAR. But IMapper5 has a stable *C* entry
+ * point, AIMapper_loadIMapper, exported by libui.so and implemented here by
+ * /vendor/lib64/hw/mapper.mediatek.so. That is loadable with dlopen and a
+ * locally declared ABI - the same technique this app already uses for the
+ * ANativeWindow producer functions and the bionic namespace API.
+ *
+ * The ABI below is hand-written from AOSP's IMapper.h. Getting the vtable
+ * order wrong would mean calling the wrong function pointer, so this does not
+ * trust it blindly: it queries ALLOCATION_SIZE as well, whose correct answer
+ * is already known independently from the gralloc handle (14,394,880). If
+ * that matches, the offsets are right and the modifier beside it is real. If
+ * it does not, the ABI is wrong and nothing here should be believed.
+ */
+typedef int32_t AIMapper_Error;
+
+/* StandardMetadataType, from AOSP. Only the two used here are named. */
+#define STANDARD_METADATA_PIXEL_FORMAT_MODIFIER 7L
+#define STANDARD_METADATA_ALLOCATION_SIZE 9L
+
+struct AIMapperV5 {
+   /* Order is load-bearing; see the note above. */
+   AIMapper_Error (*importBuffer)(const native_handle_t *, void **);
+   AIMapper_Error (*freeBuffer)(void *);
+   AIMapper_Error (*getTransportSize)(void *, uint32_t *, uint32_t *);
+   AIMapper_Error (*lock)(void *, uint64_t, int32_t[4], int, void **);
+   AIMapper_Error (*unlock)(void *, int *);
+   AIMapper_Error (*flushLockedBuffer)(void *);
+   AIMapper_Error (*rereadLockedBuffer)(void *);
+   int32_t (*getMetadata)(void *, uint64_t, void *, size_t);
+   int32_t (*getStandardMetadata)(void *buffer, int64_t type, void *dest,
+                                  size_t dest_size);
+};
+
+struct AIMapper {
+   uint32_t version;
+   struct AIMapperV5 v5;
+};
+
+typedef AIMapper_Error (*load_imapper_fn)(struct AIMapper **out);
+
+static void
+probe_imapper(const native_handle_t *handle, uint64_t known_alloc_size)
+{
+   LOGI("=== ask gralloc for the modifier (IMapper5 stable C) ===");
+
+   /* libui.so is not an Android public library, so a plain dlopen from an
+    * app fails exactly as libdrm/libhardware do. android_load_sphal_library()
+    * exists for this: it loads out of the sphal namespace, which is how apps
+    * are meant to reach vendor libraries. It lives in libvndksupport, which
+    * this app already links into its driver namespace.
+    */
+   /* libui.so is not an Android public library, so neither a plain dlopen
+    * nor libvndksupport is reachable from the app default namespace - both
+    * were tried and both failed. The driver namespace already has
+    * /system/lib64 on its search path, so load through that instead.
+    */
+   void *lib = NULL;
+   if (g_driver_ns) {
+      android_dlextinfo ns_info = {
+         .flags = ANDROID_DLEXT_USE_NAMESPACE,
+         .library_namespace = g_driver_ns,
+      };
+      lib = android_dlopen_ext("libui.so", RTLD_NOW | RTLD_LOCAL, &ns_info);
+      if (!lib)
+         lib = android_dlopen_ext("mapper.mediatek.so",
+                                  RTLD_NOW | RTLD_LOCAL, &ns_info);
+   }
+   if (!lib)
+      lib = dlopen("libui.so", RTLD_NOW | RTLD_LOCAL);
+
+   if (!lib) {
+      LOGE("  could not load a mapper library: %s", dlerror());
+      note(false, "loaded a library exporting AIMapper_loadIMapper");
+      return;
+   }
+
+   /* libui.so *references* AIMapper_loadIMapper (it is the caller); the
+    * symbol is exported by the vendor implementation. So if it is not in
+    * whichever library loaded first, try the vendor mapper explicitly.
+    */
+   load_imapper_fn load =
+      (load_imapper_fn)dlsym(lib, "AIMapper_loadIMapper");
+   if (!load && g_driver_ns) {
+      android_dlextinfo ns_info = {
+         .flags = ANDROID_DLEXT_USE_NAMESPACE,
+         .library_namespace = g_driver_ns,
+      };
+      static const char *impls[] = {"mapper.mediatek.so",
+                                    "android.hardware.graphics.mapper@4.0.so",
+                                    "gralloc.default.so"};
+      for (uint32_t i = 0; i < ARRAY_LEN(impls) && !load; i++) {
+         void *h = android_dlopen_ext(impls[i], RTLD_NOW | RTLD_LOCAL,
+                                      &ns_info);
+         LOGI("  %s -> %p", impls[i], h);
+         if (h)
+            load = (load_imapper_fn)dlsym(h, "AIMapper_loadIMapper");
+      }
+   }
+   note(load != NULL, "found AIMapper_loadIMapper");
+   if (!load)
+      return;
+
+   struct AIMapper *mapper = NULL;
+   AIMapper_Error err = load(&mapper);
+   LOGI("  AIMapper_loadIMapper -> %d (mapper %p)", err, (void *)mapper);
+   note(err == 0 && mapper != NULL, "loaded the vendor IMapper5");
+   if (err != 0 || !mapper)
+      return;
+
+   LOGI("  mapper version: %u", mapper->version);
+   if (!mapper->v5.getStandardMetadata) {
+      note(false, "IMapper5 exposes getStandardMetadata");
+      return;
+   }
+
+   /* Sanity check first: a value we already know from the handle. If this
+    * disagrees, the hand-written vtable is wrong and the modifier below is
+    * meaningless.
+    */
+   uint64_t alloc_size = 0;
+   int32_t n = mapper->v5.getStandardMetadata(
+      (void *)handle, STANDARD_METADATA_ALLOCATION_SIZE, &alloc_size,
+      sizeof(alloc_size));
+   LOGI("  ALLOCATION_SIZE -> n=%d value=%llu (expected %llu)", n,
+        (unsigned long long)alloc_size,
+        (unsigned long long)known_alloc_size);
+
+   const bool abi_ok = (n == (int32_t)sizeof(alloc_size)) &&
+                       (alloc_size == known_alloc_size);
+   note(abi_ok, "the hand-written IMapper ABI agrees with the known size");
+   if (!abi_ok) {
+      LOGE("  ABI mismatch - not reporting a modifier, it would be a guess");
+      return;
+   }
+
+   uint64_t modifier = 0;
+   n = mapper->v5.getStandardMetadata((void *)handle,
+                                      STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
+                                      &modifier, sizeof(modifier));
+   LOGI("  PIXEL_FORMAT_MODIFIER -> n=%d value=0x%016llx", n,
+        (unsigned long long)modifier);
+   note(n == (int32_t)sizeof(modifier), "gralloc reported a format modifier");
+
+   if (n == (int32_t)sizeof(modifier)) {
+      const uint64_t vendor = modifier >> 56;
+      LOGI("  => vendor=0x%02llx payload=0x%012llx%s",
+           (unsigned long long)vendor,
+           (unsigned long long)(modifier & 0x00ffffffffffffffull),
+           vendor == 0x08 ? "   (ARM - AFBC family)"
+                          : (modifier == 0 ? "   (LINEAR)" : ""));
+   }
+}
+
 /* Milestone 2: be the swapchain.
  *
  * Presents `frames` frames of a solid colour straight to the ANativeWindow,
@@ -861,6 +1026,9 @@ present_frames(VkDevice device, VkQueue queue, uint32_t queue_family,
           * Archaeology, not an API. It exists to confirm or kill the AFBC
           * hypothesis for the Eden freeze, nothing more.
           */
+         if (buf->handle)
+            probe_imapper(buf->handle, 14394880ull);
+
          if (buf->handle) {
             LOGI("  handle: numFds=%d numInts=%d", buf->handle->numFds,
                  buf->handle->numInts);
