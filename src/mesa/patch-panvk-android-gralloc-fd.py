@@ -166,6 +166,52 @@ u_gralloc_fallback_dmabuf_fd(const native_handle_t *handle)
     print("    u_gralloc_fallback.c: dma-buf located in the handle, "
           "not assumed at data[0]")
 
+# ---------------------------------------------- panvk_android.c: ANB modifier
+#
+# Third site, same root cause as the other two: a gralloc that cannot describe
+# itself. u_gralloc's fallback backend cannot determine this device's format
+# modifier, so vk_android_get_anb_layout() hands back DRM_FORMAT_MOD_INVALID
+# while still returning VK_SUCCESS. panvk_image_init() passes that straight to
+# pan_image_layout_init(), which looks up a modifier description, gets NULL,
+# and dereferences it - a SIGSEGV inside vkCreateImage, measured on device:
+#
+#     ANB-LAYOUT result=0 modifier=0xffffffffffffff planes=1
+#                l0.offset=0 l0.size=0 l0.rowPitch=5120
+#
+# rowPitch is exactly width * 4 for an RGBA_8888 buffer, i.e. an ordinary
+# linear stride, and there is one plane. So the buffer is linear; the fallback
+# simply has no way to assert it. Say so, rather than crash.
+src = open(ANDROID).read()
+
+if "DRM_FORMAT_MOD_INVALID" in src:
+    print("    panvk_android.c: ANB modifier already handled")
+else:
+    anchor = """   result = vk_android_get_anb_layout(create_info, &mod_info, layouts,
+                                      PANVK_MAX_PLANES);
+   if (result != VK_SUCCESS)
+      return result;
+"""
+    assert anchor in src, "panvk_android.c: anb layout call not found - PanVK moved"
+
+    src = src.replace(anchor, anchor + """
+   /* u_gralloc's fallback backend cannot work out this device's modifier and
+    * reports DRM_FORMAT_MOD_INVALID while still returning success. Passing
+    * that on null-derefs in pan_image_layout_init(). Measured on device: one
+    * plane, rowPitch exactly width * 4 - a linear buffer the fallback cannot
+    * name. See docs/kbase-notes.md.
+    */
+   if (mod_info.drmFormatModifier == DRM_FORMAT_MOD_INVALID)
+      mod_info.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+""", 1)
+
+    if "drm_fourcc.h" not in src:
+        src = src.replace('#include "panvk_android.h"',
+                          '#include "drm-uapi/drm_fourcc.h"\n'
+                          '#include "panvk_android.h"', 1)
+
+    open(ANDROID, "w").write(src)
+    print("    panvk_android.c: ANB modifier INVALID mapped to LINEAR")
+
 # ------------------------------------------------------------- vk_android.c
 #
 # The widest of the three. This is Mesa's shared Vulkan runtime, not PanVK
