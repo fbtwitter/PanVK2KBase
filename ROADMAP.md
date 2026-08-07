@@ -2125,7 +2125,47 @@ Tools worth knowing about before touching any of this:
       the device is *not* a usable baseline. It predates the
       `load_raw_vertex_offset` fix and segfaults on the first
       `primitive_restart` case.
-- [ ] **Next: counter-buffer reads within one render pass.** All 9
+- [x] **Counter-buffer *reads* deferred too — `primitive_restart` is
+      4/4** (2026-08-07). `CmdBeginTransformFeedbackEXT` emitted its
+      resume copy (counter buffer -> write position) at record time,
+      while the captures and the End writeback that produce that value
+      are deferred to CmdEndRendering. In the finished command stream the
+      read therefore ran *before* the write, so every Begin in a render
+      pass resumed from the same stale counter and the pairs overwrote
+      each other — `primitive_restart` does three Begin/End pairs in one
+      render pass and got one triangle where five were expected.
+      Both directions are now recorded as `struct panvk_xfb_counter_op`
+      in one queue and replayed by the flush in record order, interleaved
+      with the captures by a `draw_pos` stamp. Reading the kernel to
+      check this also settled a stale comment: `offsets[]` is a byte
+      offset, the same unit a counter buffer uses, not "capture slots".
+      `basic_*` still 37/38, `fuzz` unchanged.
+- [ ] **Next: `vkCmdDrawIndirectByteCountEXT` reading a counter written
+      in the same render pass.** The 9 `backward_dependency*` /
+      `draw_indirect_counter_resubmit` failures survive the fix above,
+      and reading the test shows why they are a harder problem rather
+      than the same one. The sequence is `Begin -> draw -> End(tfc) ->
+      barrier -> Begin(tfc) -> vkCmdDrawIndirectByteCountEXT(tfc) ->
+      End`. The consumer is not a counter read that can be reordered: it
+      is the *draw itself*, deriving its own vertex count from that
+      buffer, on PANVK_SUBQUEUE_VERTEX_TILER, in the middle of the render
+      pass. `received:0` is that draw drawing nothing.
+      This is circular as the architecture stands. The capture dispatch
+      that makes the counter final cannot run before `flush_tiling()`,
+      which happens at CmdEndRendering; the draw that consumes the
+      counter runs before that. Nothing can be reordered within the
+      existing single tiling batch to satisfy both.
+      The only sound resolution seen so far is to **split the render pass
+      at the dependency**: on recording a `vkCmdDrawIndirectByteCountEXT`
+      whose counter buffer has a writeback still owed in this render
+      pass, close the tiling batch early, flush the pending captures and
+      counter ops, and open a new batch for the rest. That is real
+      surgery on `panvk_vX_cmd_draw.c`'s render-pass handling and should
+      not start without agreement on the approach - the fallback (reading
+      the write position directly instead of the app's counter buffer)
+      does not help, because it is the same value with the same
+      dependency, just sourced differently.
+- [ ] **Superseded: counter-buffer reads within one render pass.** All 9
       remaining failures are one class — eight `backward_dependency*` and
       `draw_indirect_counter_resubmit`. They write a counter buffer at
       one End and consume it before the render pass is over (a later

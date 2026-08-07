@@ -61,6 +61,37 @@ panvk_per_arch(CmdBindTransformFeedbackBuffersEXT)(
    uint32_t bindingCount, const VkBuffer *pBuffers,
    const VkDeviceSize *pOffsets, const VkDeviceSize *pSizes);
 
+/* Records one counter-buffer transfer for CmdEndRendering to replay, stamped
+ * with its position in the capture queue so the replay keeps record order.
+ * Returns false if it could not be queued, with the error already on the
+ * command buffer.
+ */
+static bool
+xfb_queue_counter_op(struct panvk_cmd_buffer *cmdbuf,
+                     enum panvk_xfb_counter_op_type type, uint64_t offsets,
+                     uint32_t buf_idx, uint64_t dev_addr)
+{
+   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+   struct panvk_xfb_counter_op *op = util_dynarray_grow(
+      &state->xfb.pending_counter_ops, struct panvk_xfb_counter_op, 1);
+
+   if (op == NULL) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+
+   *op = (struct panvk_xfb_counter_op){
+      .type = type,
+      .offsets = offsets,
+      .dev_addr = dev_addr,
+      .buf_idx = buf_idx,
+      .draw_pos = util_dynarray_num_elements(&state->xfb.pending_draws,
+                                             struct panvk_xfb_pending_draw),
+   };
+
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBeginTransformFeedbackEXT)(
    VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
@@ -93,32 +124,26 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
    /* Resume: a counter buffer holds a byte offset, which is exactly the unit
     * the write position uses, so seeding it is a plain copy. Buffers without
     * a counter buffer keep the zero written above.
+    *
+    * The copy is recorded, not emitted. If it were emitted here it would run
+    * before the captures and the End writeback that produce the value it
+    * reads - those are all deferred to CmdEndRendering - and every Begin in
+    * the render pass would resume from the same stale counter. Recording it
+    * lets the flush replay it in the position it was written in.
     */
-   if (counterBufferCount && pCounterBuffers) {
-      struct cs_builder *b =
-         panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
-      struct cs_index dst = cs_scratch_reg64(b, 0);
-      struct cs_index src = cs_scratch_reg64(b, 2);
-      struct cs_index val = cs_scratch_reg32(b, 4);
+   for (uint32_t i = 0; pCounterBuffers && i < counterBufferCount; i++) {
+      uint32_t buf_idx = firstCounterBuffer + i;
 
-      cs_move64_to(b, dst, offsets.gpu);
+      if (buf_idx >= MAX_XFB_BUFFERS || !pCounterBuffers[i])
+         continue;
 
-      for (uint32_t i = 0; i < counterBufferCount; i++) {
-         uint32_t buf_idx = firstCounterBuffer + i;
+      VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
 
-         if (buf_idx >= MAX_XFB_BUFFERS || !pCounterBuffers[i])
-            continue;
-
-         VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
-         uint64_t caddr = panvk_buffer_gpu_ptr(
-            cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0);
-
-         cs_move64_to(b, src, caddr);
-         cs_load32_to(b, val, src, 0);
-         cs_store32(b, val, dst, buf_idx * sizeof(uint32_t));
-      }
-
-      cs_flush_stores(b);
+      if (!xfb_queue_counter_op(
+             cmdbuf, PANVK_XFB_COUNTER_SEED, offsets.gpu, buf_idx,
+             panvk_buffer_gpu_ptr(
+                cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0)))
+         break;
    }
 
    /* pending_draws is deliberately NOT cleared here. A render pass may contain
@@ -159,18 +184,12 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
 
       VK_FROM_HANDLE(panvk_buffer, cbuf, pCounterBuffers[i]);
 
-      struct panvk_xfb_counter_write *w =
-         util_dynarray_grow(&state->xfb.pending_counter_writes,
-                            struct panvk_xfb_counter_write, 1);
-      if (w == NULL) {
-         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      if (!xfb_queue_counter_op(
+             cmdbuf, PANVK_XFB_COUNTER_WRITEBACK, state->xfb.offsets_gpu,
+             buf_idx,
+             panvk_buffer_gpu_ptr(
+                cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0)))
          break;
-      }
-
-      w->offsets = state->xfb.offsets_gpu;
-      w->buf_idx = buf_idx;
-      w->dev_addr = panvk_buffer_gpu_ptr(
-         cbuf, pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0);
    }
 
    /* offsets_gpu deliberately survives here: End runs before CmdEndRendering,
@@ -619,6 +638,49 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
     */
 }
 
+/* Emits one recorded counter-buffer transfer, in either direction.
+ *
+ * Both directions read something the command stream itself produced earlier -
+ * a WRITEBACK reads write positions last written by panlib_xfb_setup(), a
+ * SEED reads a counter buffer last written by a WRITEBACK - so both need the
+ * caches cleaned first. A barrier alone does not make those stores visible
+ * here. The flush is per op rather than hoisted because the ops interleave
+ * with capture dispatches that write in between.
+ */
+static void
+emit_xfb_counter_op(struct panvk_cmd_buffer *cmdbuf,
+                    const struct panvk_xfb_counter_op *op)
+{
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+   struct cs_index src = cs_scratch_reg64(b, 0);
+   struct cs_index dst = cs_scratch_reg64(b, 2);
+   struct cs_index flush_id = cs_scratch_reg32(b, 4);
+   struct cs_index val = cs_scratch_reg32(b, 5);
+
+   cs_move32_to(b, flush_id, 0);
+   cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                   MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                   cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
+   cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
+
+   /* The only difference between the two directions is which end is the
+    * counter buffer and which is the write position for this buffer index.
+    */
+   if (op->type == PANVK_XFB_COUNTER_SEED) {
+      cs_move64_to(b, src, op->dev_addr);
+      cs_load32_to(b, val, src, 0);
+      cs_move64_to(b, dst, op->offsets);
+      cs_store32(b, val, dst, op->buf_idx * sizeof(uint32_t));
+   } else {
+      cs_move64_to(b, src, op->offsets);
+      cs_load32_to(b, val, src, op->buf_idx * sizeof(uint32_t));
+      cs_move64_to(b, dst, op->dev_addr);
+      cs_store32(b, val, dst, 0);
+   }
+
+   cs_flush_stores(b);
+}
+
 /* Called from panvk_per_arch(CmdEndRendering) (csf/panvk_vX_cmd_draw.c),
  * right after flush_tiling() - which is the only thing that signals
  * PANVK_SUBQUEUE_VERTEX_TILER's syncobj and gives a compute dispatch on
@@ -635,48 +697,40 @@ panvk_per_arch(cmd_flush_pending_xfb_captures)(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
 
-   util_dynarray_foreach(&state->xfb.pending_draws,
-                         struct panvk_xfb_pending_draw, d) {
-      dispatch_one_xfb_capture(cmdbuf, d);
+   /* Replay captures and counter-buffer ops in the order they were recorded.
+    *
+    * The two queues are separate but their order is one order: an op stamped
+    * draw_pos == i was recorded before capture i, so emitting every such op
+    * first reproduces the application's sequence. That matters because a
+    * Begin resuming from a counter buffer must observe the End that wrote it,
+    * with the captures of the intervening pair in between - which is the
+    * whole reason both directions are deferred to here.
+    */
+   const uint32_t num_draws = util_dynarray_num_elements(
+      &state->xfb.pending_draws, struct panvk_xfb_pending_draw);
+   const uint32_t num_ops = util_dynarray_num_elements(
+      &state->xfb.pending_counter_ops, struct panvk_xfb_counter_op);
+   const struct panvk_xfb_pending_draw *draws =
+      util_dynarray_begin(&state->xfb.pending_draws);
+   const struct panvk_xfb_counter_op *ops =
+      util_dynarray_begin(&state->xfb.pending_counter_ops);
+   uint32_t next_op = 0;
+
+   for (uint32_t i = 0; i < num_draws; i++) {
+      while (next_op < num_ops && ops[next_op].draw_pos <= i)
+         emit_xfb_counter_op(cmdbuf, &ops[next_op++]);
+
+      dispatch_one_xfb_capture(cmdbuf, &draws[i]);
    }
+
+   /* Everything after the last capture - in particular the End that closes the
+    * final pair, which is where a single-pair render pass does all its work.
+    */
+   while (next_op < num_ops)
+      emit_xfb_counter_op(cmdbuf, &ops[next_op++]);
 
    util_dynarray_clear(&state->xfb.pending_draws);
-
-   /* Deferred counter-buffer writeback, now that every capture has run and the
-    * write positions are final. They were last written by panlib_xfb_setup(),
-    * so the caches have to be cleaned before the command stream can read them
-    * - a barrier alone does not make kernel stores visible here.
-    */
-   if (util_dynarray_num_elements(&state->xfb.pending_counter_writes,
-                                  struct panvk_xfb_counter_write)) {
-      struct cs_builder *b =
-         panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
-      struct cs_index flush_id = cs_scratch_reg32(b, 4);
-      struct cs_index src = cs_scratch_reg64(b, 0);
-      struct cs_index dst = cs_scratch_reg64(b, 2);
-      struct cs_index val = cs_scratch_reg32(b, 5);
-
-      cs_move32_to(b, flush_id, 0);
-      cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
-                      MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
-                      cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_FLUSH)));
-      cs_wait_slot(b, SB_ID(DEFERRED_FLUSH));
-
-      /* Each entry names the write positions of its own Begin/End pair, so
-       * the source address is reloaded per entry rather than hoisted.
-       */
-      util_dynarray_foreach(&state->xfb.pending_counter_writes,
-                            struct panvk_xfb_counter_write, w) {
-         cs_move64_to(b, src, w->offsets);
-         cs_load32_to(b, val, src, w->buf_idx * sizeof(uint32_t));
-         cs_move64_to(b, dst, w->dev_addr);
-         cs_store32(b, val, dst, 0);
-      }
-
-      cs_flush_stores(b);
-   }
-
-   util_dynarray_clear(&state->xfb.pending_counter_writes);
+   util_dynarray_clear(&state->xfb.pending_counter_ops);
 
    /* Safe to release only now: End runs before CmdEndRendering, so the write
     * positions have to outlive it and survive until the captures that use
