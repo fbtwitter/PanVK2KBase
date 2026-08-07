@@ -1684,7 +1684,7 @@ patch_file(
             "      }",
         ),
     ],
-    done_marker="cmd_flush_pending_xfb_captures)(cmdbuf);",
+    done_marker="cmd_flush_pending_xfb_captures)(cmdbuf, true);",
 )
 
 # 6. panvk_vX_physical_device.c: extension table entry (explicitly disabled
