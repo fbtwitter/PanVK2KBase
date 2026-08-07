@@ -30,13 +30,101 @@ to be applied by hand.
 | `pan_kmod_kbase.h` | Declares `kbase_kmod_ops` and `pan_kmod_fd_is_kbase()`. Mirrors `panthor_kmod.h`. Not optional — Mesa builds with `-Werror=missing-prototypes`. |
 | `pan_kmod.c.kbase.patch` | The dispatch change: `pan_kmod_dev_create()` must probe for kbase *before* calling `drmGetVersion()`, which fails on a misc device. Kept as a readable patch rather than auto-applied, since upstream `pan_kmod.c` moves. |
 | `meson.build.kbase.patch` | The `meson.build` hunk: adds the source file, the kbase UAPI include path, `-DMALI_USE_CSF=1`, and the kconfig shim. |
-| `patch-panvk-kbase-*.py` | Hand-run, idempotent patches to PanVK itself (not to `pan_kmod`). Scripts rather than diffs because upstream moves. `enumeration` finds the device, `queue` / `subqueue-init` / `sync` bring up submission, `external-memory` stops the driver claiming dma-buf sharing it cannot do. They share target files, so changing one means restoring its targets in `/opt/mesa-src` and re-running **all** of them. |
+| `patch-panvk-kbase-*.py` | Hand-run, idempotent patches to PanVK itself (not to `pan_kmod`). Scripts rather than diffs because upstream moves. `enumeration` finds the device, `queue` / `subqueue-init` / `sync` bring up submission, `external-memory` stops the driver claiming dma-buf sharing it cannot do. They share target files, so changing one means restoring its targets in `/opt/mesa-src` and re-running **all** of them — see "Restoring and re-patching the tree" below; `git checkout` alone is not enough. |
 | `patch-panvk-null-device-destroy.py` | Same hand-run/idempotent convention, but **not** kbase-specific: fixes `panvk_DestroyDevice()` segfaulting on `vkDestroyDevice(VK_NULL_HANDLE, ...)`, a real Mesa/PanVK correctness bug (`panvk_physical_device.c`, shared with panthor/panfrost) found via `dEQP-VK.api.null_handle.destroy_device` and verified on hardware. Named without `kbase` since the bug and fix aren't specific to this backend — a candidate for upstreaming once confirmed against real Mesa, not just this repo's vendored checkout. |
 | `patch-panvk-xfb-phase1.py` | Also not kbase-specific: `VK_EXT_transform_feedback` scaffolding (single-stream, no GS/tess) — command-buffer state, the three `Cmd*TransformFeedbackEXT` entry points, and the sysvals a future XFB-capture shader variant needs. **Not yet a working feature** — the extension stays reported unsupported (`.EXT_transform_feedback = false`) until the shader-side two-variant compile and the compute dispatch that actually captures vertex data (reusing `vs_desc_state->res_table` for hardware attribute fetch, mirroring Panfrost GL's `csf_launch_xfb`) land and are verified on real hardware. See `docs/kbase-notes.md` for the investigation this is based on. |
 | `panvk_vX_cmd_xfb.c` | The three `Cmd*TransformFeedbackEXT` entry points, copied by `mesa-backend-sync` into `$(MESA_DIR)/src/panfrost/vulkan/csf/` (registered in `meson.build` by the patch script above, same convention as `panvk_vX_kbase_queue.c`). |
 | `wsl-install-deps.sh` | Installs the Linux toolchain needed to build Mesa's panfrost targets. |
 | `wsl-build.sh` | Syncs the backend in, applies both patches, configures and builds `libpankmod_lib`. |
 | `android-aarch64.cross` | Meson cross-file for the eventual Android build. |
+
+## Restoring and re-patching the tree
+
+Needed whenever a patch script changes and its targets in `/opt/mesa-src`
+(or wherever `$MESA` points) need to go back to pristine before re-applying
+everything. **`git checkout -- <paths>` is necessary but not sufficient**,
+for two reasons that have each cost a confusing build failure:
+
+1. **Untracked files survive `git checkout` — including stale ones.**
+   `pan_kmod_kbase.c`/`.h`, `panvk_vX_cmd_xfb.c`, `panvk_kbase_sync.c`/`.h`
+   and `panvk_vX_kbase_queue.c` are all untracked in Mesa's git (see "Why
+   the source lives here and not in the Mesa tree" above) — that is
+   precisely why they need `mesa-backend-sync` / `wsl-build.sh` to copy
+   them in, and precisely why `git checkout` cannot touch them either way.
+   A copy left over from an earlier experiment (a reverted change, a
+   temporary diagnostic) will silently keep being compiled unless something
+   overwrites it.
+2. **`git checkout` reverts `meson.build`'s source-list patch, but leaves
+   the untracked `.c` file it used to list still sitting on disk.** The
+   `pan_kmod_kbase.c`/`.h` copy survives step 1's problem in the opposite
+   direction from step 2's: after `git checkout`, the file is present but
+   `meson.build` no longer mentions it, so `ninja` fails with `undefined
+   symbol: pan_kmod_fd_is_kbase` and a long list of other kbase symbols —
+   a link error that looks like a missing implementation, when the real
+   cause is a missing *build-file entry* for an implementation that is
+   right there on disk.
+
+The correct sequence re-syncs the untracked files and re-applies every
+patch, in this order:
+
+```bash
+cd "$MESA"   # e.g. /opt/mesa-src
+git checkout -- src/panfrost src/util src/vulkan
+
+# Re-copies the untracked backend files AND re-patches meson.build's
+# source list + the pan_kmod.c dispatch change. Skipping this step is
+# exactly gap 2 above: the panvk-focused patch scripts below never touch
+# meson.build's kmod source list, only PanVK itself.
+#
+# The tr -d '\r' is not optional. wsl-build.sh is a file in this repo's
+# Windows-side git checkout and can carry CRLF line endings; running it
+# unmodified from WSL does not error, it *silently no-ops one or more of
+# its own steps* (observed: the meson.build patch step reported nothing
+# changed, step 1's file copy still ran, and the resulting build linked
+# with pan_kmod_kbase.c.o simply missing - no error, just absent). Always
+# strip \r first when invoking any .sh script here from WSL against the
+# Windows checkout.
+tr -d '\r' < "$REPO/src/mesa/wsl-build.sh" > /tmp/wsl-build-clean.sh
+bash /tmp/wsl-build-clean.sh
+
+for p in kbase-enumeration kbase-sync kbase-queue kbase-subqueue-init \
+         kbase-external-memory android-gralloc-fd null-device-destroy \
+         xfb-phase1 image-modifier-null; do
+   python3 "$REPO/src/mesa/patch-panvk-$p.py" "$MESA"
+done
+python3 "$REPO/src/mesa/patch-panthor-csif-dispatch.py" "$MESA"
+python3 "$REPO/src/mesa/patch-pan-kmod-import-fd.py" "$MESA"
+
+# wsl-build.sh does not know about this one - copied separately, same
+# untracked-file gap as pan_kmod_kbase.c.
+cp "$REPO/src/mesa/panvk_vX_cmd_xfb.c" "$MESA/src/panfrost/vulkan/csf/"
+```
+
+**After running this, verify the kbase backend actually landed before
+trusting anything downstream** — the CRLF failure mode above produces no
+error message, only a link failure much later (`undefined symbol:
+pan_kmod_kbase_queue_create` and similar) that looks unrelated to its
+actual cause:
+
+```bash
+ar t "$MESA/build-android/src/panfrost/lib/kmod/libpankmod_lib.a" | grep kbase
+# must show pan_kmod_kbase.c.o - if it's missing, the sync/patch step above
+# silently failed (almost certainly the CRLF issue) and needs re-running
+```
+
+The patch-script list above is the order this repo's own sessions have run
+successfully; if a new `patch-panvk-*.py` is added, add it to this list too
+— an outdated list here is exactly the kind of staleness the "Not
+verified" section below warns about. **Both this list and the
+`tr -d '\r'` step were verified by actually running them end to end
+against a freshly `git checkout`-ed tree and confirming a clean Android
+build**, not written from memory of what should work.
+
+Before trusting a rebuild after any of this, check that no diagnostic
+`mesa_logi()` calls or other temporary instrumentation survived the
+restore — `grep` for anything added purely to verify a fix (this repo has
+more than once added a throwaway log line directly to `/opt/mesa-src` to
+confirm something on-device before writing the real patch-script version).
 
 ## The two structural problems this backend runs into
 
