@@ -2238,6 +2238,38 @@ Tools worth knowing about before touching any of this:
       data dependency, and everything a capture reads is CPU-written at
       record time. The known hazard is the shared TLS descriptor. If that
       holds, the split is unnecessary.
+      **Tried, 2026-08-07: no fault, but no fix either.** `backward_dependency`
+      stayed at 9/12 with a byte-identical `received:0 expected:64`
+      after threading a `wait_vt` flag through the capture flush and
+      dispatching inline from `CmdDrawIndirectByteCountEXT` when a
+      pending writeback targets this draw's counter buffer. The device
+      stayed healthy - the shared-TLS hazard did not bite - so this
+      rules out "the wait itself is unsafe" without ruling in a fix.
+      Not committed; the experiment is reconstructible from this note if
+      revisited. The split remains the only designed path.
+      **Prerequisite done, 2026-08-07: `dEQP-VK.renderpasses.*` baseline.**
+      The group is 80,878 cases (`renderpasses`, not `renderpass` -
+      `dynamic_rendering` is nested inside it as sub-cases, not a
+      separate top-level group). An 80-stride sample (1,011 cases) was
+      run in bounded chunks; **466 executed, 0 genuine correctness
+      failures.** The rest hit `VK_ERROR_OUT_OF_DEVICE_MEMORY` -
+      consistently from `sparserendertarget`- and `multiview_per_view`-
+      heavy cases, which deqp-vk treats as a fatal `ResourceError` and
+      aborts the remaining chunk over, not a driver crash: the device
+      stayed fully responsive throughout, unlike the Eden freeze
+      signature (no MMU-kworker spin, no wedged unrelated process). One
+      mid-session reboot cleared it enough to run a full 250-case chunk
+      clean (176/250 pass, 0 fail); it recurred afterward from a fresh
+      `deqp-vk` process, so it is a real resource constraint under this
+      group's own memory-heavy cases, not simply leftover pressure from
+      earlier in the session.
+      This is enough of a baseline for its purpose - catching a
+      regression from the render-pass split, not exhaustive certification
+      - but the OOM pattern itself is worth a cheap follow-up: sample
+      specifically within `sparserendertarget` and `multiview_per_view`
+      to see whether it is a real allocation ceiling (a Phase 10-style
+      "keep it alive" finding) or specific to running many
+      resource-heavy cases back-to-back in one `deqp-vk` process.
 - [ ] **Superseded: counter-buffer reads within one render pass.** All 9
       remaining failures are one class — eight `backward_dependency*` and
       `draw_indirect_counter_resubmit`. They write a counter buffer at
