@@ -164,3 +164,41 @@ Order matters — the render path is downstream of this, not just XFB:
 Run everything in bounded chunks. ~170 cases is a safe slice for
 execution-dense groups; the 668-case `fuzz` chunk froze the device and
 needed `adb reboot`.
+
+---
+
+# (unrelated) APK milestone 2: where presentation crashes
+
+Recorded here only because this file was open; belongs in kbase-notes.md.
+
+`vkCreateImage(VkNativeBufferANDROID)` SIGSEGVs on this device. Exact stack,
+from the crash buffer (`adb logcat -b crash`):
+
+    signal 11 (SIGSEGV), SEGV_MAPERR, fault addr 0x10   null pointer deref
+    #00 pan_image_layout_init +212
+    #01 panvk_image_init +2004
+    #02 panvk_android_create_gralloc_image +368
+    #03 present_frames                (src/android/swapchain_app)
+
+The path is `panvk_android_anb_init()` (panvk_android.c:115):
+`vk_android_get_anb_layout()` turns the gralloc handle into a
+`VkImageDrmFormatModifierExplicitCreateInfoEXT` via u_gralloc, then
+`panvk_image_init()` consumes it. Something in that layout is NULL or
+otherwise not what `pan_image_layout_init` expects.
+
+Prime suspect: u_gralloc's *fallback* backend is what runs on this device
+(MediaTek gralloc, no dedicated backend), and it is the same component that
+needed `patch-panvk-android-gralloc-fd.py` for the fd index. A fallback that
+cannot determine the modifier would plausibly hand back
+`DRM_FORMAT_MOD_INVALID` or a zeroed plane layout.
+
+**Next step:** log what `vk_android_get_anb_layout()` actually produces -
+`mod_info.drmFormatModifier`, `drmFormatModifierPlaneCount`, and
+`layouts[0].{offset,size,rowPitch}` - before `panvk_image_init()` sees them.
+That distinguishes "u_gralloc fallback cannot describe this buffer" from
+"pan_image_layout_init does not handle a case it should". Do not guess
+between those two; the fixes are in different projects.
+
+Note this path had never executed before 2026-08-07: it needs a swapchain,
+which needs a window, which needs an APK. The same blind spot hid the
+`anb->handle->data[0]` bug fixed in the same session.
