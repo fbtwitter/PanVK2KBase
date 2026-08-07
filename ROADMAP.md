@@ -1996,12 +1996,22 @@ Tools worth knowing about before touching any of this:
       contents are unknown. Tested by `--restart` with indices
       `{0,1,2,0xFFFF,1,2,3}`. All 37 probe modes pass; script still
       reproduces the tested tree byte-for-byte.
+      **`vkCmdDrawIndirectByteCountEXT` landed (2026-08-07)** — the last
+      entry point the extension defines. It draws as many vertices as a
+      previous capture actually wrote, so the count exists only in GPU
+      memory. A one-invocation libpan kernel does the divide (the command
+      stream cannot divide by a runtime value on this arch) and writes an
+      ordinary `VkDrawIndirectCommand`; everything downstream then reuses
+      the existing indirect path unchanged. It is also the first dispatch
+      where the tiler consumes what compute wrote rather than the reverse,
+      so it needs its own cache flush in that direction. All 40 probe
+      modes pass and the script still reproduces the tested tree
+      byte-for-byte, so `transformFeedbackDraw` is now `true`.
       `.EXT_transform_feedback` is nonetheless still left `false` by
-      default: still unsupported and asserted on are
-      `vkCmdDrawIndirectByteCountEXT`, restart combined with an indirect
-      draw, and adjacency/patch-list topologies — so advertising it would
-      turn "unsupported" into "assert/abort". Flipping it on stays a
-      deliberate follow-up.
+      default: still unsupported and asserted on are restart combined with
+      an indirect draw, and adjacency/patch-list topologies — so
+      advertising it would turn "unsupported" into "assert/abort".
+      Flipping it on stays a deliberate follow-up.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

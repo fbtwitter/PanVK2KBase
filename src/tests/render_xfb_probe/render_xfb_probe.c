@@ -250,6 +250,14 @@ static bool fan_mode;
  * runs of three, so two triangles with the strip parity restarting in the
  * second run.
  */
+/* --bytecount mode: vkCmdDrawIndirectByteCountEXT. The counter buffer holds a
+ * byte count (48) which, divided by the 16-byte vertexStride, is the 3 vertices
+ * of the usual triangle - a count that only ever exists in GPU memory.
+ */
+static bool bytecount_mode;
+#define BYTECOUNT_BYTES 48
+#define BYTECOUNT_STRIDE 16
+
 static bool restart_mode;
 #define RESTART_INDEX_COUNT 7
 static const uint16_t INDICES_RESTART[RESTART_INDEX_COUNT] = {
@@ -351,6 +359,8 @@ main(int argc, char **argv)
          indirect_mode = true;
       else if (strcmp(argv[i], "--strip") == 0)
          strip_mode = true;
+      else if (strcmp(argv[i], "--bytecount") == 0)
+         bytecount_mode = true;
       else if (strcmp(argv[i], "--restart") == 0) {
          strip_mode = true;   /* 4 vertices, TRIANGLE_STRIP */
          indexed_mode = true;
@@ -380,6 +390,11 @@ main(int argc, char **argv)
              STRIP_VERTS);
    if (restart_mode)
       printf("       + restart (indexed strip split by 0xFFFF)\n");
+   if (bytecount_mode)
+      printf("       + bytecount (vkCmdDrawIndirectByteCountEXT, %d/%d = %d "
+             "vertices)\n",
+             BYTECOUNT_BYTES, BYTECOUNT_STRIDE,
+             BYTECOUNT_BYTES / BYTECOUNT_STRIDE);
    if (indirect_mode)
       printf("       + indirect (vkCmdDrawIndirect%s)\n",
              multidraw_mode ? ", drawCount=2" : "");
@@ -535,6 +550,8 @@ main(int argc, char **argv)
    PFN_vkCmdDrawIndirect cmd_draw_indirect = GDPA(vkCmdDrawIndirect);
    PFN_vkCmdDrawIndexedIndirect cmd_draw_indexed_indirect =
       GDPA(vkCmdDrawIndexedIndirect);
+   PFN_vkCmdDrawIndirectByteCountEXT cmd_draw_byte_count =
+      GDPA(vkCmdDrawIndirectByteCountEXT);
    PFN_vkCmdCopyImageToBuffer cmd_copy_img_to_buf =
       GDPA(vkCmdCopyImageToBuffer);
    PFN_vkQueueSubmit queue_submit = GDPA(vkQueueSubmit);
@@ -614,13 +631,14 @@ main(int argc, char **argv)
    VkBuffer counter_buf = VK_NULL_HANDLE;
    VkDeviceMemory counter_memory = VK_NULL_HANDLE;
    uint32_t *counter_mapped = NULL;
-   if (resume_mode) {
+   if (resume_mode || bytecount_mode) {
       printf("\n=== counter buffer: 1 x uint32, host-visible ===\n");
 
       VkBufferCreateInfo cbci = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
          .size = sizeof(uint32_t),
-         .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,
+         .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       };
       r = create_buffer(device, &cbci, NULL, &counter_buf);
@@ -650,9 +668,9 @@ main(int argc, char **argv)
       if (r != VK_SUCCESS)
          return 1;
 
-      *counter_mapped = RESUME_START_BYTES;
-      printf("  seeded counter buffer with %d bytes (%d vertices)\n",
-             RESUME_START_BYTES, RESUME_START_BYTES / 16);
+      *counter_mapped = bytecount_mode ? BYTECOUNT_BYTES : RESUME_START_BYTES;
+      printf("  seeded counter buffer with %u bytes (%u vertices)\n",
+             *counter_mapped, *counter_mapped / 16);
    }
 
    /* ------------------------------------------------------- indirect buffer */
@@ -1168,7 +1186,12 @@ main(int argc, char **argv)
       printf("  vkCmdBeginTransformFeedbackEXT recorded (no counter buffer)\n");
    }
 
-   if (indirect_mode && indexed_mode) {
+   if (bytecount_mode) {
+      cmd_draw_byte_count(cmdbuf, instance_count(), 0, counter_buf, 0, 0,
+                          BYTECOUNT_STRIDE);
+      printf("  vkCmdDrawIndirectByteCountEXT recorded (stride %d)\n",
+             BYTECOUNT_STRIDE);
+   } else if (indirect_mode && indexed_mode) {
       cmd_bind_ibo(cmdbuf, ibo, 0, VK_INDEX_TYPE_UINT16);
       printf("  vkCmdBindIndexBuffer recorded (UINT16)\n");
       uint32_t ncmd = multidraw_mode ? MULTIDRAW_COUNT : 1;
@@ -1560,7 +1583,7 @@ main(int argc, char **argv)
       destroy_buffer(device, ibo, NULL);
       free_mem(device, ibo_memory, NULL);
    }
-   if (resume_mode) {
+   if (resume_mode || bytecount_mode) {
       destroy_buffer(device, counter_buf, NULL);
       free_mem(device, counter_memory, NULL);
    }
@@ -1570,7 +1593,11 @@ main(int argc, char **argv)
    }
 
    printf("\n=== %d failure(s) ===\n", failures);
-   if (failures == 0 && restart_mode)
+   if (failures == 0 && bytecount_mode)
+      printf("\n=> VK_EXT_transform_feedback draw-by-byte-count works:\n"
+             "   the vertex count came from a counter buffer and never\n"
+             "   existed on the host, and its own capture round-tripped.\n");
+   else if (failures == 0 && restart_mode)
       printf("\n=> VK_EXT_transform_feedback primitive restart works:\n"
              "   the index stream split into two runs, each assembled\n"
              "   independently with its own strip parity.\n");

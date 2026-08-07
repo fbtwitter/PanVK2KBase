@@ -5115,3 +5115,58 @@ PANVK_XFB_ADVERTISE=1 patch-panvk-xfb-phase1.py <mesa-src-dir>
 ```
 
 which is how the probe runs are reproduced.
+
+## vkCmdDrawIndirectByteCountEXT (2026-08-07)
+
+The last entry point the extension defines, and the reason `transformFeedbackDraw`
+could stay `false` until now. It answers "draw as many vertices as a previous
+capture actually wrote":
+
+```
+vertexCount = (counterBuffer[counterBufferOffset] - counterOffset) / vertexStride
+```
+
+The captured byte count lives in GPU memory, so the host cannot compute that
+count at record time — which is the whole point of the entry point. It is how
+an application replays a capture without a round trip to the CPU.
+
+### Why a kernel rather than command-stream arithmetic
+
+The command stream can add and subtract, but the divisor here is a *runtime*
+value (`vertexStride` is host-known, but the CS instructions that divide by a
+register are `#if PAN_ARCH >= 13` — see the arch-gating note earlier in this
+file; PAN_ARCH 10 has only immediate-operand adds). So a one-invocation libpan
+kernel does it instead:
+
+```c
+KERNEL(1)
+panlib_xfb_byte_count_draw(global uint32_t *cmd, constant uint32_t *counter,
+                           uint32_t counter_offset, uint32_t vertex_stride,
+                           uint32_t instance_count, uint32_t first_instance)
+```
+
+It writes an ordinary four-word `VkDrawIndirectCommand` into a scratch buffer.
+From that point on **nothing else is new**: the draw goes down the existing
+`vkCmdDrawIndirect` path, and so does its own XFB capture, which already knows
+how to read its counts from GPU memory. The subtraction is saturating —
+a counter below `counterOffset` yields zero vertices, not a huge unsigned
+wrap — and a zero stride yields zero rather than dividing by zero.
+
+### The new sync direction
+
+Every earlier XFB dispatch had the compute subqueue reading state the
+vertex/tiler subqueue had produced. This one runs the other way: the *tiler*
+consumes a buffer the *compute* kernel just wrote. That needs its own
+`cs_flush_caches(CLEAN)` + `cs_wait_slot()` on the compute side before the
+vertex/tiler subqueue is released, for the same reason recorded earlier — a
+barrier orders execution, it does not make one subqueue's writes visible to
+another's reads.
+
+**Test**: `render_xfb_probe --bytecount` captures a triangle, then replays it
+through `vkCmdDrawIndirectByteCountEXT` into a second XFB buffer and compares
+the two byte for byte. All 40 probe-mode combinations pass, device healthy, and
+the patch script reproduces the tested tree byte-for-byte (20/20).
+
+With this, `transformFeedbackDraw` becomes `true`. Still out of scope: primitive
+restart combined with an indirect draw, and adjacency/patch-list topologies
+(which need geometry or tessellation shaders anyway).
