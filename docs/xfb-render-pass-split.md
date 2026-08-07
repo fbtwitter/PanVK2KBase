@@ -289,3 +289,40 @@ made the crash go away and the frames appear, so it looked like a fix. The
 evidence supported "linear" only weakly - a stride consistent with linear
 is also consistent with AFBC. "The symptom went away" is not the same as
 "the assumption is true".
+
+### Root cause of the modifier problem: IMapper is compiled out
+
+The build has no `u_gralloc_imapper4/5` objects:
+
+    build-android/src/util/u_gralloc/*.p/
+      u_gralloc.c.o  u_gralloc_cros_api.c.o  u_gralloc_fallback.c.o
+      u_gralloc_internal.c.o  u_gralloc_libdrm.c.o  u_gralloc_qcom.c.o
+
+`src/util/u_gralloc/meson.build` only compiles the IMapper backends when
+`dep_android_ui` or `dep_android_mapper4` is found. This project builds with
+`-Dandroid-stub=true` (see `src/mesa/wsl-build-android.sh`), so neither is,
+and the runtime backend search falls all the way through CROS -> GRALLOC4 ->
+LIBDRM -> QCOM to FALLBACK.
+
+The IMapper backends are the only ones that can ask gralloc for a buffer's
+actual format modifier. Without them the driver *cannot* know whether a
+buffer is linear or AFBC - the fallback has no way to find out, which is
+exactly why it reports `DRM_FORMAT_MOD_INVALID`.
+
+So this is not a missing line of code, it is a build configuration that
+removes the capability. Options, roughly in order of honesty:
+
+1. Build against the real AOSP mapper libs so `u_gralloc_imapper*` compiles.
+   Needs `android.hardware.graphics.mapper@4.0` (or libui for IMapper5)
+   headers and libs, which an NDK-only cross build does not have. This is
+   the real fix and the largest piece of work.
+2. Read the modifier out of the gralloc handle's ints directly. Vendor
+   specific and fragile, but this repo already has precedent for handle
+   archaeology (`patch-panvk-android-gralloc-fd.py` probes the fds).
+3. Keep assuming, but stop assuming *silently*: if the modifier is unknown,
+   either refuse the buffer or force a linear allocation by asking for
+   CPU-access usage, rather than declaring a possibly-AFBC buffer linear.
+
+Note this also means the AFBC hypothesis for the Eden freeze is currently
+untestable from inside the driver - it cannot ask. Testing it needs (2) or
+an external check of what gralloc actually allocated for usage 0x200.
