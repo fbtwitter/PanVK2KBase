@@ -326,3 +326,36 @@ removes the capability. Options, roughly in order of honesty:
 Note this also means the AFBC hypothesis for the Eden freeze is currently
 untestable from inside the driver - it cannot ask. Testing it needs (2) or
 an external check of what gralloc actually allocated for usage 0x200.
+
+### Asking gralloc for no AFBC does not work on this device
+
+Tried and reverted, 2026-08-07. Arm gralloc spells "do not compress" as
+`MALI_GRALLOC_USAGE_NO_AFBC` = `GRALLOC_USAGE_PRIVATE_1` = `0x20000000`, so
+`vk_common_GetSwapchainGrallocUsageANDROID()` was patched to OR that into
+the usage it returns.
+
+The bit reached gralloc and was stored - the handle shows it:
+
+    usage    0x20000200          (was 0x00000200)
+    int[10]  0x20000b00          (was 0x00000b00)
+
+but the allocation size did not move:
+
+    int[08]  0x00dba400 = 14,394,880 bytes   unchanged, still the AFBC size
+
+Linear would be 14,172,160. So this MediaTek gralloc records the private
+usage bit and ignores it; Arm's convention does not apply here. Reverted
+rather than left in place, because code that looks like a fix and does
+nothing is worse than no code.
+
+**That leaves declaring the real modifier as the only route.** The needed
+value is a `DRM_FORMAT_MOD_ARM_AFBC(...)` with the block size and layout
+bits gralloc actually used. What is known from the handle: 16x16 blocks
+(the 221,440-byte header matches ceil(1280/16) * ceil(2768/16) * 16 exactly)
+and RGBA_8888. What is not known: the sparse/split/YTR bits, which change
+the modifier and which the header size cannot distinguish.
+
+Guessing those is the same mistake as guessing LINEAR. Getting them
+properly means the IMapper backend, i.e. building against real AOSP mapper
+libs instead of `-Dandroid-stub=true` - which is now the critical path for
+correct presentation, not an optimisation.
