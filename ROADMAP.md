@@ -2034,6 +2034,32 @@ Tools worth knowing about before touching any of this:
       (23/23). The only unsupported case left is adjacency/patch-list
       topologies, which is unreachable: they need `geometryShader` or
       `tessellationShader` and both are reported `false`.
+      **First CTS run (2026-08-07).**
+      `dEQP-VK.transform_feedback.*` is 133,719 cases; `simple` (7,899)
+      and `primitive_restart` (4) were run, the rest not yet.
+      `simple` now stands at **172 Pass / 72 Fail / 7,653 NotSupported /
+      2 crash** — most of the group needs `geometryShader`, so CTS skips
+      it, leaving ~246 cases that actually execute. It found three real
+      bugs in minutes, two of which `render_xfb_probe` structurally could
+      not: (1) **`gl_VertexIndex` aborted the compile** —
+      `load_raw_vertex_offset` is only lowered for `PAN_ARCH < 9`, but
+      `nir_lower_xfb_to_stores` emits it unconditionally, so every XFB
+      shader reading `gl_VertexIndex` failed; fixed. (2) **NULL
+      `pCounterBuffers`**, which the spec permits, was dereferenced by
+      Begin/End; two lines, six crashes became six passes. (3) **open —
+      deferred captures read live state.** Captures dispatch at
+      `CmdEndRendering`, so everything they read must be snapshotted per
+      queued draw; push constants, bound XFB buffers, `offsets_gpu` and
+      the VS shader itself are not, so a render pass with several
+      Begin/End pairs gives every capture the last draw's state. This is
+      the root cause of essentially all 72 failures — the signature is
+      `basic_1_*` passing while `basic_2/4/8_*` fail, where the number is
+      the count of Begin/End pairs. Fixing it is design work, not a
+      patch, and is **the next task**. Also open: four Bifrost backend
+      crashes in `bi_make_vec_to` at pipeline-creation time
+      (`holes_*`, `max_output_components_64/128`), in the shared compiler
+      rather than panvk's XFB glue. Bulk CTS runs froze the device twice
+      and needed `adb reboot`, so run them in bounded chunks.
       Full geometry-shader/
       tessellation-shader emulation remains explicitly out of scope — see
       `docs/kbase-notes.md` for why (Asahi's `hk` driver is the only prior

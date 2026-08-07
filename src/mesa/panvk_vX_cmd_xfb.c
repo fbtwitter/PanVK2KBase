@@ -86,7 +86,7 @@ panvk_per_arch(CmdBeginTransformFeedbackEXT)(
     * the write position uses, so seeding it is a plain copy. Buffers without
     * a counter buffer keep the zero written above.
     */
-   if (counterBufferCount) {
+   if (counterBufferCount && pCounterBuffers) {
       struct cs_builder *b =
          panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
       struct cs_index dst = cs_scratch_reg64(b, 0);
@@ -133,7 +133,7 @@ panvk_per_arch(CmdEndTransformFeedbackEXT)(
     * targets and let cmd_flush_pending_xfb_captures() emit the copies - the
     * same deferral the XFB query's availability uses.
     */
-   for (uint32_t i = 0; i < counterBufferCount; i++) {
+   for (uint32_t i = 0; pCounterBuffers && i < counterBufferCount; i++) {
       uint32_t buf_idx = firstCounterBuffer + i;
 
       if (buf_idx >= MAX_XFB_BUFFERS || !pCounterBuffers[i])
@@ -207,6 +207,13 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
 
    if (!state->xfb.offsets_gpu)
       return;
+
+   /* Per capture, not per command buffer: these dispatches all run at
+    * CmdEndRendering, so the value the queueing draw left behind is not
+    * necessarily this draw's. Patched from the kernel for an indirect draw,
+    * whose base only exists in the indirect command.
+    */
+   state->sysvals.vs.first_vertex = vertex_base;
 
    state->sysvals.xfb.num_vertices = vertex_count;
    state->sysvals.xfb.index_buffer = index_buffer;
@@ -415,6 +422,13 @@ dispatch_one_xfb_capture(struct panvk_cmd_buffer *cmdbuf,
          .index_size = index_size,
          .slot_table = slot_table.gpu,
          .restart_index = restart_index,
+         .first_vertex_pu =
+            indirect_buffer && push_uniforms.gpu &&
+                  shader_uses_sysval(xfb_variant, graphics, vs.first_vertex)
+               ? push_uniforms.gpu +
+                    shader_remapped_sysval_offset(
+                       xfb_variant, sysval_offset(graphics, vs.first_vertex))
+               : 0,
          .index_buffer_pu =
             indirect_buffer && index_size && push_uniforms.gpu &&
                   shader_uses_sysval(xfb_variant, graphics, xfb.index_buffer)

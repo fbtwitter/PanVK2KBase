@@ -5314,3 +5314,109 @@ afterwards, and the patch script reproduces the tested tree byte-for-byte
 The only remaining unsupported case is adjacency and patch-list topologies,
 which is unreachable: they require `geometryShader` or `tessellationShader`,
 and both are reported `false`.
+
+## The first CTS run against transform feedback (2026-08-07)
+
+`render_xfb_probe` had reached 48/48 across every mode it knows. That is the
+limit of a probe written by the same person who wrote the driver: it tests what
+the author thought of. The CTS run below found three real bugs in the first few
+minutes, two of which the probe could never have caught.
+
+### Scope of what was run
+
+`dEQP-VK.transform_feedback.*` is **133,719 cases**:
+
+| group | cases |
+| --- | --- |
+| `primitives_generated_query` | 107,866 |
+| `simple` | 7,899 |
+| `simple_optimized_gpl` | 7,891 |
+| `simple_fast_gpl` | 7,891 |
+| `fuzz` | 2,168 |
+| `primitive_restart` | 4 |
+
+Only `simple` and `primitive_restart` were run. Most of `simple` needs
+`geometryShader`, which this driver reports as `false`, so CTS skips those
+itself rather than failing them.
+
+**`simple`, after the two fixes below: 172 Pass, 72 Fail, 7,653 NotSupported,
+2 crashes.** Of the ~246 cases that actually execute, 172 pass. `primitive_restart`
+is 1/4.
+
+### Bug 1: gl_VertexIndex aborted the compile
+
+`Unhandled intrinsic load_raw_vertex_offset`, taking the test process down with
+it. `nir_lower_xfb_to_stores` rewrites `load_vertex_id` into
+`raw_vertex_id + raw_vertex_offset` unconditionally - its comment says "in
+transform feedback programs, vertex ID becomes zero-based, so apply that
+lowering even on Valhall". But panvk only lowers `load_raw_vertex_offset` under
+`#if PAN_ARCH < 9`: on 9+ the hardware delivers `vertex_id` directly and
+`pan_nir_lower_vertex_id` is not run, so nothing handled the intrinsic and it
+reached the Bifrost backend.
+
+So **every XFB shader reading `gl_VertexIndex` failed to compile**. The probe's
+shader does not read it, which is exactly why 48/48 said nothing about this.
+
+The fix, in `panvk_lower_xfb_dispatch_ids()`: `raw_vertex_id` is the capture
+slot in this variant, and `gl_VertexIndex` is the attribute-fetch index plus
+the draw's vertex base, so
+
+```
+raw_vertex_offset = (attrib - raw_vertex_id) + vertex_base
+```
+
+which composes back to exactly `gl_VertexIndex` for indexed and non-indexed
+draws alike, without pattern-matching the `iadd` the pass emitted. `vertex_base`
+is `vs.first_vertex`, now set per capture rather than per command buffer - and
+patched by `panlib_xfb_setup()` for an indirect draw, whose base lives in the
+indirect command (word 2 of `VkDrawIndirectCommand`, word 3 of the indexed
+form).
+
+### Bug 2: a NULL pointer the spec explicitly allows
+
+Six crashes, all `resume_*_null_counter_buffers` / `resume_*_null_ptrs_end_xfb`.
+`CmdBeginTransformFeedbackEXT` and `CmdEndTransformFeedbackEXT` checked
+`pCounterBuffers[i]` but never `pCounterBuffers` itself, which may be NULL with
+a nonzero `counterBufferCount`. Two lines. Six crashes became six passes.
+
+### Bug 3 (open): deferred captures read live state
+
+**This is the single root cause of essentially all 72 failures**, and of three
+of the four `primitive_restart` cases.
+
+Captures cannot dispatch from `CmdDraw` - the compute dispatch waits on the
+render pass's VERTEX_TILER syncobj, which nothing signals until `flush_tiling()`
+runs at `CmdEndRendering`. So everything a capture reads must be *snapshotted
+per queued draw*. Vertex counts, topology, index buffer, restart index, vertex
+base and query pointer are. These are **not**:
+
+- **push constants** - `basic_*` pushes a different `startValue` per draw
+- **bound XFB buffers** - each part binds a different range of the same buffer
+- **`offsets_gpu`** - re-allocated and re-seeded by every `Begin`
+- **the vertex shader itself** - `state->vs.shader` is whatever was bound last
+
+So a render pass with several Begin/End pairs, or per-draw push constants, gives
+every capture the *last* draw's state. The signature is unmistakable:
+`basic_1_*` passes, `basic_2_*`, `basic_4_*` and `basic_8_*` all fail - the
+number is the count of Begin/End pairs in one render pass.
+
+Fixing it means snapshotting the whole capture context per queued draw
+(uploading that draw's push uniforms at record time and holding the descriptor,
+rather than preparing them at flush time from live `state->sysvals`). That is a
+real piece of design work, not a patch.
+
+### Bug 4 (open): Bifrost backend crashes
+
+Four cases fault in `bi_make_vec_to` (via `bi_emit_alu`) during
+`vkCreateGraphicsPipelines` - `holes_vert`, `holes_extra_draw_vert`,
+`max_output_components_64`, `max_output_components_128`. These are in the shared
+compiler, not panvk's XFB glue, and are reached through shader shapes
+`nir_lower_xfb_to_stores` produces for outputs with component gaps.
+
+### Operational note
+
+Long `deqp-vk` runs froze the device twice, hard enough to need `adb reboot` -
+distinct from the process-level segfaults above, since `adb` itself stops
+responding. Run CTS in bounded chunks with a responsiveness check between them
+so a freeze is attributable, and confirm recovery with
+`driver_compute_probe --fill` before trusting later results.
