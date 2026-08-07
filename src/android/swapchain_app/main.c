@@ -562,6 +562,155 @@ load_driver_from_anywhere(const char *internal_path)
 
 /* ------------------------------------------------------------------ */
 
+/* Which AFBC modifier did gralloc actually use?
+ *
+ * The driver cannot ask - u_gralloc IMapper backends are compiled out of an
+ * -Dandroid-stub build - and guessing is what produced the LINEAR bug. So
+ * solve for it instead, using the driver as the oracle:
+ *
+ *   for each plausible Mali AFBC modifier, create an image of exactly the
+ *   swapchain geometry with that modifier and ask what it would allocate.
+ *   The modifier whose size reproduces the gralloc allocation is the one
+ *   gralloc used.
+ *
+ * This is not the LINEAR mistake repeated. That was an assumption with no
+ * way to check it; this has an exact numeric test, and a candidate that does
+ * not reproduce the measured size is rejected. If two candidates give the
+ * same size the answer is ambiguous and this says so rather than pick one -
+ * at which point IMapper is genuinely required.
+ *
+ * Nothing here modifies the driver. It only measures.
+ */
+#define FOURCC_MOD_ARM_AFBC(mode) (((uint64_t)0x08 << 56) | (uint64_t)(mode))
+#define AFBC_BLOCK_16x16 1ull
+#define AFBC_BLOCK_32x8  2ull
+#define AFBC_YTR    (1ull << 4)
+#define AFBC_SPLIT  (1ull << 5)
+#define AFBC_SPARSE (1ull << 6)
+#define AFBC_CBR    (1ull << 7)
+#define AFBC_TILED  (1ull << 8)
+#define AFBC_SC     (1ull << 9)
+
+static void
+probe_modifiers(VkPhysicalDevice pdev, PFN_vkGetInstanceProcAddr gipa,
+                VkInstance instance, VkDevice device,
+                PFN_vkGetDeviceProcAddr gdpa, uint32_t width, uint32_t height,
+                uint64_t target_size)
+{
+   LOGI("=== solve for the gralloc modifier ===");
+   LOGI("  target allocation: %llu bytes for %ux%u RGBA_8888",
+        (unsigned long long)target_size, width, height);
+
+   PFN_vkCreateImage create_image =
+      (PFN_vkCreateImage)gdpa(device, "vkCreateImage");
+   PFN_vkDestroyImage destroy_image =
+      (PFN_vkDestroyImage)gdpa(device, "vkDestroyImage");
+   PFN_vkGetImageMemoryRequirements get_reqs =
+      (PFN_vkGetImageMemoryRequirements)gdpa(device,
+                                             "vkGetImageMemoryRequirements");
+   if (!create_image || !destroy_image || !get_reqs) {
+      note(false, "resolved the image-size entrypoints");
+      return;
+   }
+
+   /* Ask the driver which modifiers it supports for this format, rather
+    * than trying candidates blind. Creating an image with a modifier the
+    * driver does not handle does not fail cleanly - it segfaults inside
+    * pan_image_layout_init(), the same null deref that
+    * DRM_FORMAT_MOD_INVALID produced. So the list must come from the driver.
+    */
+   PFN_vkGetPhysicalDeviceFormatProperties2 get_fmt_props2 =
+      (PFN_vkGetPhysicalDeviceFormatProperties2)gipa(
+         instance, "vkGetPhysicalDeviceFormatProperties2");
+   if (!get_fmt_props2) {
+      note(false, "resolved vkGetPhysicalDeviceFormatProperties2");
+      return;
+   }
+
+   VkDrmFormatModifierPropertiesListEXT mod_props = {
+      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+   };
+   VkFormatProperties2 fmt_props = {
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      .pNext = &mod_props,
+   };
+   get_fmt_props2(pdev, VK_FORMAT_R8G8B8A8_UNORM, &fmt_props);
+
+   const uint32_t mod_count = mod_props.drmFormatModifierCount;
+   LOGI("  driver supports %u modifiers for R8G8B8A8_UNORM", mod_count);
+   if (mod_count == 0)
+      return;
+
+   VkDrmFormatModifierPropertiesEXT *props =
+      calloc(mod_count, sizeof(*props));
+   if (!props)
+      return;
+
+   mod_props.pDrmFormatModifierProperties = props;
+   get_fmt_props2(pdev, VK_FORMAT_R8G8B8A8_UNORM, &fmt_props);
+
+   uint32_t matches = 0;
+   uint64_t match_mod = 0;
+
+   for (uint32_t i = 0; i < mod_count; i++) {
+      const uint64_t mod = props[i].drmFormatModifier;
+
+      const VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
+         .sType =
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+         .drmFormatModifierCount = 1,
+         .pDrmFormatModifiers = &mod,
+      };
+      const VkImageCreateInfo ici = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .pNext = &mod_list,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .extent = {width, height, 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      };
+
+      VkImage img = VK_NULL_HANDLE;
+      VkResult r = create_image(device, &ici, NULL, &img);
+      if (r != VK_SUCCESS) {
+         LOGI("  mod=0x%016llx  rejected (%d)",
+              (unsigned long long)mod, r);
+         continue;
+      }
+
+      VkMemoryRequirements reqs = {0};
+      get_reqs(device, img, &reqs);
+      const bool hit = (uint64_t)reqs.size == target_size;
+      LOGI("  mod=0x%016llx planes=%u  size=%llu%s",
+           (unsigned long long)mod, props[i].drmFormatModifierPlaneCount,
+           (unsigned long long)reqs.size, hit ? "   <== MATCH" : "");
+      if (hit) {
+         matches++;
+         match_mod = mod;
+      }
+      destroy_image(device, img, NULL);
+   }
+
+   free(props);
+
+   if (matches == 1)
+      LOGI("  RESULT: unique match - modifier 0x%016llx",
+           (unsigned long long)match_mod);
+   else if (matches == 0)
+      LOGI("  RESULT: no candidate reproduces the allocation - list is "
+           "incomplete or the size includes metadata this does not model");
+   else
+      LOGI("  RESULT: %u candidates match - AMBIGUOUS, do not pick one",
+           matches);
+}
+
 /* Milestone 2: be the swapchain.
  *
  * Presents `frames` frames of a solid colour straight to the ANativeWindow,
@@ -1082,6 +1231,7 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
       "VK_KHR_external_semaphore_fd",
       "VK_KHR_external_fence_fd",
       "VK_KHR_external_memory_fd",
+      "VK_EXT_image_drm_format_modifier",
    };
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -1118,6 +1268,12 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          check(true, "resolved the ANativeWindow producer API");
          VkQueue queue = VK_NULL_HANDLE;
          get_queue(device, gfx_family, 0, &queue);
+
+         /* Geometry and allocation size measured from the gralloc handle on
+          * this device; see the handle dump in present_frames().
+          */
+         probe_modifiers(pdev, gipa, instance, device, gdpa, 1280, 2768,
+                         14394880ull);
          /* Long enough to outlast the window's buffer count many times
           * over, which is what makes the release fence load-bearing. */
          present_frames(device, queue, gfx_family, window, gdpa, 4);
