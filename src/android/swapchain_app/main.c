@@ -50,6 +50,8 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
 #define TAG "PanVKApp"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -976,12 +978,24 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
    /* VK_ANDROID_native_buffer is what makes presentation possible at all -
     * without it there is no way to turn a window buffer into a VkImage.
     */
-   const char *dev_exts[] = {"VK_ANDROID_native_buffer"};
+   /* Bypassing the platform loader means enabling what it would have enabled.
+    * vkQueueSignalReleaseImageANDROID exports a sync fd internally, via
+    * vkGetSemaphoreFdKHR, so the external-fd extensions are not optional here
+    * even though the app never calls them directly - without them that
+    * entrypoint resolves to NULL and the release fails VK_ERROR_UNKNOWN.
+    */
+   const char *dev_exts[] = {
+      "VK_ANDROID_native_buffer",
+      "VK_KHR_external_semaphore_fd",
+      "VK_KHR_external_fence_fd",
+      "VK_KHR_external_memory_fd",
+   };
    const VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = has_native_buffer ? 1 : 0,
+      .enabledExtensionCount =
+         has_native_buffer ? (uint32_t)ARRAY_LEN(dev_exts) : 0,
       .ppEnabledExtensionNames = dev_exts,
    };
 
