@@ -237,3 +237,55 @@ on the kbase sync type, that is a small, local fix; if the submit path
 genuinely requires a real exportable fence, this runs into the documented
 `KBASE_IOCTL_STREAM_CREATE` limitation and presentation needs a different
 design on this kernel driver.
+
+## The Eden freeze: the LINEAR assumption is the prime suspect
+
+2026-08-07, after presentation started working.
+
+Ruled out first, so this is not guesswork by elimination alone:
+
+- **Not a per-present leak.** 600/600 frames with objects recycled through
+  a 4-slot ring, device healthy. The earlier stop at frame 127 was the
+  harness holding 127 images and 254 semaphores at once.
+- **Not an unsignalled fence of ours.** `panvk_kbase_sync_export_sync_file()`
+  blocks until the GPU is actually done and only then returns -1
+  ("already signalled"), which is spec-legal *because* the wait happened.
+  It costs a CPU block per present; it does not hand out live fences.
+
+The fences the system hung on were `mali-0-1282_2-74-kcpu...` - pid 1282 is
+**SurfaceFlinger**, i.e. the vendor blob driver's own context, not ours.
+SurfaceFlinger's GPU work hung while compositing, with
+`kworker/mali_mmu2` at ~98% kernel.
+
+**Suspect: the modifier.** `panvk_android_anb_init()` now maps
+`DRM_FORMAT_MOD_INVALID` to `DRM_FORMAT_MOD_LINEAR`, because u_gralloc's
+fallback cannot determine the real modifier and the measured layout looked
+linear (one plane, rowPitch exactly width * 4). That fixed the null-deref
+and made presentation work - but it is an *assumption*, and Mali gralloc
+commonly allocates **AFBC** for `GRALLOC_USAGE_HW_RENDER` buffers, which is
+the usage the driver asks for (0x200).
+
+If the buffer really is AFBC and we render to it as linear, the content is
+wrong in exactly the way that makes the compositor's AFBC decoder fault -
+which fits a spinning MMU kworker far better than anything on our side.
+A clear-only test app would not notice: the image still shows *something*,
+and Eden "ran, a bit laggy, then froze" fits a compositor progressively
+choking on malformed buffers.
+
+**Next, in order:**
+
+1. Determine the real modifier rather than assuming. Options: query gralloc
+   for it properly (a u_gralloc backend for this MediaTek/Arm gralloc rather
+   than the fallback), or read it from the handle's metadata fds.
+2. Failing that, force the assumption true: request a linear buffer by
+   adding CPU-access usage bits, and see whether Eden stops freezing. That
+   is a diagnostic, not a fix - it would cost AFBC's bandwidth savings.
+3. If AFBC is confirmed, the LINEAR mapping must become a real modifier
+   rather than a guess, or the ANB path should refuse buffers whose
+   modifier it cannot determine instead of silently mis-describing them.
+
+Note the shape of this mistake for next time: mapping INVALID to LINEAR
+made the crash go away and the frames appear, so it looked like a fix. The
+evidence supported "linear" only weakly - a stride consistent with linear
+is also consistent with AFBC. "The symptom went away" is not the same as
+"the assumption is true".
