@@ -945,11 +945,30 @@ acquire/release handshake exist. The driver loads rootlessly through a
 custom linker namespace. A present-shaped frame costs ~15ms (64 fps) at
 720p with trivial GPU work.
 
-**What has never run: an actual swapchain.** Every piece of the presentation
-handshake is proven individually, but only from a shell binary. Driving
-`vkAcquireImageANDROID`/`vkQueueSignalReleaseImageANDROID` against a real
-`ANativeWindow` needs an APK, which is a different kind of work from
-anything in `src/tests/` and is the single largest remaining unknown.
+~~**What has never run: an actual swapchain.**~~ **It runs now
+(2026-08-07).** `src/android/swapchain_app` presents 4/4 frames to a real
+`ANativeWindow` from inside a NativeActivity: dequeue a gralloc buffer,
+import it as a `VkImage` via `VK_ANDROID_native_buffer`, clear it,
+`vkQueueSignalReleaseImageANDROID`, queue it back. 22 checks, 0 failed.
+That closes what this file called "the single largest remaining unknown".
+
+Two driver bugs had to be fixed to get there, and both had gone unnoticed
+for the same reason - nothing had ever driven the presentation path:
+
+- `vk_android_import_anb_memory()` still assumed the dma-buf is
+  `handle->data[0]`. `patch-panvk-android-gralloc-fd.py` had fixed that
+  assumption in three places months earlier and missed this one.
+- `panvk_vX_device.c` set `copy_sync_payloads` unconditionally to
+  `vk_drm_syncobj_copy_payloads` - the DRM syncobj implementation, on the
+  one backend that has no DRM syncobj. Presentation is the only caller
+  that prefers it, so every image release returned `VK_ERROR_UNKNOWN`.
+  Now gated on `is_kbase`.
+
+Plus one gralloc gap: u_gralloc's fallback backend cannot determine this
+device's format modifier and reports `DRM_FORMAT_MOD_INVALID` while
+returning success, which null-dereferenced in `pan_image_layout_init`.
+Mapped to `LINEAR`, which the measured `rowPitch` (exactly width * 4,
+one plane) supports.
 
 **Verification.** `make regress` runs 30 probes across three tiers
 (`tools/run-probes.sh`); all pass. CTS: `api.smoke` 6/6, `api.command_buffers`
@@ -1322,9 +1341,10 @@ Tools worth knowing about before touching any of this:
       driver rather than shipping it, and it is a yes. The last row is why
       the first attempt failed: `adb push` puts the driver somewhere an app
       may read but never execute.
-- [ ] Only after Phase 5 is solid. Android gralloc/ANativeWindow if
-      targeting phones, or DRM/kmsro if targeting an embedded board still
-      on kbase.
+- [x] **Android gralloc/ANativeWindow — done** (2026-08-07). Presentation
+      works end to end from inside an app; see "Where this actually is"
+      above and `src/android/swapchain_app`. DRM/kmsro for embedded boards
+      remains untouched and out of scope for a phone target.
 - [x] **Cross-compile for Android — done, and has been for a while.**
       `src/mesa/wsl-build-android.sh` + `android-aarch64-wsl.cross` produce
       `libvulkan_panfrost.so` (~19MB, arm64-v8a) against the NDK, and every

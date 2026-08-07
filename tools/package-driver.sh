@@ -59,7 +59,7 @@ cat > "$OUT/meta.json" <<EOF
 {
   "schemaVersion": 1,
   "name": "PanVK (kbase) $VERSION",
-  "description": "Mesa PanVK for Arm Mali, running on the proprietary kbase kernel driver instead of panthor. Experimental: compute and rendering work; presentation does not yet. Built from PanVK2KBase $GIT_SHA.",
+  "description": "Mesa PanVK for Arm Mali, running on the proprietary kbase kernel driver instead of panthor. Experimental: compute, rendering and presentation all work; not conformant, and untested in real games. Built from PanVK2KBase $GIT_SHA.",
   "author": "PanVK2KBase",
   "packageVersion": "1",
   "vendor": "Mesa",
@@ -83,4 +83,12 @@ echo
 echo "NOTE: a picker that loads this with a plain dlopen() will fail on"
 echo "libdrm.so / libhardware.so - neither is an Android public library."
 echo "It needs the namespace recipe in docs/kbase-notes.md; see"
-echo "tests/driver_namespace_probe for a working implementation."
+echo "tests/driver_namespace_probe for a working implementation, and"
+echo "src/android/swapchain_app for the same recipe driven from inside a"
+echo "real app, which is the case that actually matters."
+echo
+echo "The driver must also end up somewhere the app may execute from."
+echo "Measured on device (src/android/swapchain_app):"
+echo "  the APK's native library dir   yes"
+echo "  the app's private files dir    yes   <- for a downloaded driver"
+echo "  /data/local/tmp                NO    - readable, never executable"
