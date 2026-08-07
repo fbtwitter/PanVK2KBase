@@ -1295,6 +1295,15 @@ run_everything(ANativeWindow *window, const char *internal_path)
    g_checks_run = 0;
    g_checks_failed = 0;
 
+   /* AFBC modifiers are gated behind PANVK_DEBUG=wsi_afbc in
+    * panvk_physical_device.c - without it the driver advertises LINEAR only,
+    * which is why importing an AFBC gralloc buffer had nothing to describe
+    * it with. Set before the driver loads, since it is read during device
+    * setup. PANVK_APP_NO_WSI_AFBC=1 turns this back off for comparison.
+    */
+   if (!getenv("PANVK_APP_NO_WSI_AFBC") && !getenv("PANVK_DEBUG"))
+      setenv("PANVK_DEBUG", "wsi_afbc", 1);
+
    PFN_vkGetInstanceProcAddr gipa = load_driver_from_anywhere(internal_path);
    if (gipa)
       run_vulkan(window, gipa);
