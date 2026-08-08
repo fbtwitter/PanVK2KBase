@@ -1528,8 +1528,18 @@ run_vulkan(ANativeWindow *window, PFN_vkGetInstanceProcAddr gipa)
          probe_modifiers(pdev, gipa, instance, device, gdpa, 1280, 2768,
                          0x00dba400ull);
          /* Long enough to outlast the window's buffer count many times
-          * over, which is what makes the release fence load-bearing. */
-         present_frames(device, queue, gfx_family, window, gdpa, 4);
+          * over, which is what makes the release fence load-bearing.
+          * Default bumped way up (was 4) to reproduce the fdsan crash seen
+          * under Azahar's continuous present loop - that took 20-30+ seconds
+          * of real presentation to surface, so a handful of frames here
+          * never had a chance to hit it. Override with PANVK_APP_FRAMES for
+          * a quick smoke run.
+          */
+         int frames = 3000;
+         const char *frames_env = getenv("PANVK_APP_FRAMES");
+         if (frames_env)
+            frames = atoi(frames_env);
+         present_frames(device, queue, gfx_family, window, gdpa, frames);
       } else {
          check(false, "resolved the ANativeWindow producer API");
       }

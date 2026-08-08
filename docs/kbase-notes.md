@@ -5643,3 +5643,91 @@ reverse-engineer — real module, real device tree, real companion drivers,
 all consistent. Raw firmware images were not kept (multi-GB, easily
 re-extracted from the downloaded ROM if ever needed again); this section is
 the durable record.
+
+## fdsan crash under real presentation load: a missing lock in panvk_kbase_sync
+
+2026-08-08. First real emulator run (Azahar/AzaharPlus, built from this
+repo's `mali-custom-driver-support` + `mesa-driver-namespace` patches - see
+the "Follow-up: what an emulator actually has to change" section above for
+those). The driver loaded, enumerated `Mali-G720 MC8`, and ran a real 3DS
+title for 20-30+ seconds before every attempt ended the same way:
+
+```
+F libc    : fdsan: attempted to close file descriptor 296, expected to be
+            unowned, actually owned by FILE* 0x7ce1867ea0
+F libc    : Fatal signal 6 (SIGABRT) ... in tid ... (VulkanPresent), pid ...
+```
+
+Reproduced twice with different fd numbers (296, then separately 245), same
+signature both times, same thread name (`VulkanPresent`), same crash
+address. Symbolized against the local unstripped build (`llvm-addr2line
+-f -C -e build/libvulkan_panfrost.so <addr>`):
+
+```
+panvk_kbase_sync_finish  (panvk_kbase_sync.c)
+vk_sync_destroy          (vk_sync.c)
+vk_queue_submit_cleanup  (vk_queue.c)
+vk_queue_submit_thread_func (vk_queue.c)
+```
+
+**Root cause.** `panvk_kbase_sync_finish()` → `drop_imported()` does a plain
+`close(s->sync_fd)`, and every field it touches (`sync_fd`, `imported`) was
+unsynchronized — `finish`, `signal`, `reset`, `move`, `import_sync_file`,
+`export_sync_file` and `wait_satisfied` all read or wrote them with no
+lock. `vk_queue_submit_thread_func` is Mesa's *own* internal queue-submit
+thread, spun up automatically regardless of what thread called
+`vkQueueSubmit` — so even an application that never spawns a thread of its
+own still has this driver's cleanup path racing its presentation path
+(`vkQueueSignalReleaseImageANDROID` → `export_sync_file`) on two genuinely
+different threads. What fdsan caught is the observable result: one thread's
+stale, already-closed `sync_fd` value got handed to `close()` after the OS
+had reused that fd number for something else entirely (a `FILE*` elsewhere
+in the process) - a classic use-after-close, just surfaced through fd
+reuse instead of a more obviously-wrong symptom.
+
+**Fix.** Added `simple_mtx_t lock` to `struct panvk_kbase_sync`
+(`panvk_kbase_sync.h`), guarding `sync_fd`/`imported`. Every touch point
+now locks: `finish`/`signal`/`reset`/`import_sync_file` wrap their
+`drop_imported()` call; `move()` locks both the src and dst objects in
+pointer-address order (never src-then-dst unconditionally) so a second
+concurrent `move()` with src/dst swapped can't deadlock against it;
+`export_sync_file()`'s `dup()` of an imported fd happens *inside* the lock
+rather than after a separate read, closing the TOCTOU gap where a
+concurrent `drop_imported()` could close the fd between the check and the
+`dup()`; `wait_satisfied()` snapshots `sync_fd`/`imported` under the lock
+before calling `poll()`, rather than holding the lock across a syscall or
+reading the fields live.
+
+**First verification attempt was a false negative, worth recording as a
+process note.** Rebuilt, repackaged, pushed a new driver zip to the device,
+reproduced via Azahar again - same crash, byte-identical addresses via
+`addr2line` against the *new* build. That should be essentially impossible
+if the new binary were actually loaded (the fix adds real code: a new
+struct field, lock/unlock calls). Cause: both driver packages had the same
+generic `meta.json` `name`, and Azahar's picker evidently keys off that to
+decide whether to skip re-extracting an "already installed" driver, so it
+kept running the stale cached `.so` despite the file on disk being new.
+Fixed by giving the package a distinct name/version
+(`"PanVK (kbase) syncfix-v2"`). Lesson: when a driver-picker-based test
+doesn't reproduce a fix's effect at all - not even a changed crash address
+- suspect the picker's own caching before the fix itself.
+
+**Real verification**, once loading was confirmed fresh: rather than fight
+Azahar's picker UI/caching further, verified directly against this repo's
+own harness. `src/android/swapchain_app/main.c`'s `present_frames()` call
+was bumped from 4 frames (enough to prove presentation works at all, not
+enough to hit a bug that took Azahar 20-30s of continuous load to surface)
+to 3000, overridable via `PANVK_APP_FRAMES`. Built and driven entirely via
+adb (`build.sh --install`, then `adb shell am start` - no UI interaction,
+so no picker-caching risk): **3000/3000 frames presented, 22/22 checks
+passed, zero fdsan violations**, over roughly 100 seconds - longer than
+Azahar's crash window. This app has no application-level threading, but
+still exercises the race: Mesa's `vk_queue_submit_thread_func` runs
+regardless, so the same submit-thread-vs-app-thread pattern is present
+either way.
+
+Not yet re-verified against Azahar itself with a correctly-named package -
+worth doing before calling this fully closed, since the swapchain_app
+result is strong evidence but Azahar's actual usage pattern (real game
+workload, real frame pacing) is the thing this bug was originally found
+against.

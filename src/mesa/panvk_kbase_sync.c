@@ -163,6 +163,7 @@ panvk_kbase_sync_init(struct vk_device *device, struct vk_sync *sync,
    }
 
    s->slot = slot;
+   simple_mtx_init(&s->lock, mtx_plain);
    s->sync_fd = -1;
    s->imported = false;
 
@@ -179,6 +180,12 @@ panvk_kbase_sync_init(struct vk_device *device, struct vk_sync *sync,
  * Called from every operation that replaces the payload - signal, reset and
  * move - because after any of those the slot is the truth again and a stale
  * imported fd would keep answering waits with someone else's completion.
+ *
+ * Caller must hold s->lock. Without it, two threads racing to drop the same
+ * payload (e.g. the submit thread finishing a temporary semaphore while the
+ * app thread signals it) can both read a valid sync_fd before either clears
+ * it, and the second close() lands on a fd number the OS has since reused
+ * for something else entirely - see the lock's doc comment in the header.
  */
 static void
 drop_imported(struct panvk_kbase_sync *s)
@@ -195,7 +202,10 @@ panvk_kbase_sync_finish(struct vk_device *device, struct vk_sync *sync)
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
 
+   simple_mtx_lock(&s->lock);
    drop_imported(s);
+   simple_mtx_unlock(&s->lock);
+   simple_mtx_destroy(&s->lock);
    free_slot(type, s->slot);
 }
 
@@ -209,7 +219,9 @@ panvk_kbase_sync_signal(struct vk_device *device, struct vk_sync *sync,
    /* A CPU signal replaces whatever the payload was, including an imported
     * fence.
     */
+   simple_mtx_lock(&s->lock);
    drop_imported(s);
+   simple_mtx_unlock(&s->lock);
 
    /* vk_sync passes value == 0 for binary syncs, meaning "signalled". */
    if (!(sync->flags & VK_SYNC_IS_TIMELINE))
@@ -254,6 +266,17 @@ panvk_kbase_sync_move(struct vk_device *device, struct vk_sync *dst,
    struct panvk_kbase_sync *d = to_kbase_sync(dst);
    struct panvk_kbase_sync *s = to_kbase_sync(src);
 
+   /* Two objects, two locks. Fixed address order (rather than always
+    * src-then-dst) so this can never deadlock against a second move() -
+    * concurrent or otherwise - that happens to be called with src/dst
+    * swapped relative to this one.
+    */
+   struct panvk_kbase_sync *first = s < d ? s : d;
+   struct panvk_kbase_sync *second = s < d ? d : s;
+   simple_mtx_lock(&first->lock);
+   if (second != first)
+      simple_mtx_lock(&second->lock);
+
    uint32_t moved = s->slot;
    s->slot = d->slot;
    d->slot = moved;
@@ -270,6 +293,10 @@ panvk_kbase_sync_move(struct vk_device *device, struct vk_sync *dst,
    d->imported = moved_imported;
 
    drop_imported(s);
+
+   if (second != first)
+      simple_mtx_unlock(&second->lock);
+   simple_mtx_unlock(&first->lock);
 
    /* src must read as unsignalled afterwards. The slot it now holds is dst's
     * old one, which is usually a freshly created temporary and already zero,
@@ -302,7 +329,9 @@ panvk_kbase_sync_reset(struct vk_device *device, struct vk_sync *sync)
    struct panvk_kbase_sync_type *type = to_kbase_sync_type(sync->type);
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
 
+   simple_mtx_lock(&s->lock);
    drop_imported(s);
+   simple_mtx_unlock(&s->lock);
 
    volatile uint64_t *v = slot_value(type, s->slot);
    v[0] = 0;
@@ -324,12 +353,24 @@ wait_satisfied(struct panvk_kbase_sync_type *type,
     *
     * sync_fd < 0 here is the "imported -1" case - the compositor had
     * nothing outstanding - and is satisfied immediately.
+    *
+    * Snapshot under the lock rather than reading s->sync_fd live: this loop
+    * can run many iterations against a sync another thread is concurrently
+    * signalling/resetting, and calling poll() on a local copy means a
+    * concurrent drop_imported() closing the real fd underneath us is at
+    * worst a poll() on a stale-but-still-valid-at-the-time fd number, never
+    * a read of a field mid-mutation.
     */
-   if (s->imported) {
-      if (s->sync_fd < 0)
+   simple_mtx_lock(&s->lock);
+   bool imported = s->imported;
+   int sync_fd = s->sync_fd;
+   simple_mtx_unlock(&s->lock);
+
+   if (imported) {
+      if (sync_fd < 0)
          return true;
 
-      struct pollfd pfd = {.fd = s->sync_fd, .events = POLLIN};
+      struct pollfd pfd = {.fd = sync_fd, .events = POLLIN};
       return poll(&pfd, 1, 0) == 1;
    }
 
@@ -445,10 +486,12 @@ panvk_kbase_sync_import_sync_file(struct vk_device *device,
    /* Only now that the import cannot fail: the Vulkan spec requires the fd
     * to be left alone on failure, so nothing above may have consumed it.
     */
+   simple_mtx_lock(&s->lock);
    drop_imported(s);
 
    s->sync_fd = sync_file;
    s->imported = true;
+   simple_mtx_unlock(&s->lock);
 
    return VK_SUCCESS;
 }
@@ -476,12 +519,21 @@ panvk_kbase_sync_export_sync_file(struct vk_device *device,
     * rather than blocking - it is already exactly the fence being asked
     * for, and passing it along is both cheaper and more useful than
     * collapsing it to -1.
+    *
+    * dup() happens under the lock, not after reading sync_fd and releasing
+    * it: otherwise a concurrent drop_imported() could close the real fd
+    * between the check and the dup(), racing this thread into either
+    * duplicating a fd that is about to go invalid or, worse, one the OS has
+    * already reused for something else.
     */
    struct panvk_kbase_sync *s = to_kbase_sync(sync);
+   simple_mtx_lock(&s->lock);
    if (s->imported) {
       *sync_file = s->sync_fd >= 0 ? dup(s->sync_fd) : -1;
+      simple_mtx_unlock(&s->lock);
       return VK_SUCCESS;
    }
+   simple_mtx_unlock(&s->lock);
 
    const struct vk_sync_wait wait = {
       .sync = sync,

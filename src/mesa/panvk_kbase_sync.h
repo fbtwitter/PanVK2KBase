@@ -39,6 +39,21 @@ struct panvk_kbase_sync {
    struct vk_sync base;
    uint32_t slot;
 
+   /* Guards @sync_fd and @imported below. Mesa's threaded submit can run
+    * this driver's queue-submit thread and an application presentation
+    * thread against the same panvk_kbase_sync concurrently - e.g.
+    * vk_queue_submit_cleanup() destroying a temporary binary semaphore's
+    * payload on the submit thread while the app thread is mid
+    * export_sync_file() on it via vkQueueSignalReleaseImageANDROID. Without
+    * this, drop_imported()'s close(sync_fd) can run against a stale fd
+    * number after another thread already closed and cleared it, and by then
+    * the OS may have handed that fd to something unrelated - which is
+    * exactly what fdsan caught on a real device (Azahar/AzaharPlus,
+    * VulkanPresent thread): "attempted to close file descriptor ...,
+    * actually owned by FILE* ...".
+    */
+   simple_mtx_t lock;
+
    /* An imported sync_file payload, for Android acquire/release.
     *
     * When @imported is set the payload is NOT the slot: it is whatever the
