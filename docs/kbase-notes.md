@@ -5576,3 +5576,70 @@ mechanism and assuming it's the same class of problem. Next step: dump
 was dumped (`PANVK_KBASE_DUMP=1`, `kbase dump summary`) to see what
 `INDEX_COUNT`/vertex-count register actually holds at the point the loop
 runs, rather than continuing to reason about it from source.
+
+## Retail firmware cross-check: r49p1 confirmed from the real kernel module, not just the blob
+
+2026-08-08. Downloaded the official Indonesia HyperOS fastboot ROM for
+`klee` (Poco X8 Pro, region build `3.0.303.0.WPJIDXM`) from miuirom.org, to
+check the vendored `third_party/kbase-uapi-r49p1/` headers against something
+more direct than the blob's embedded version string. Extracted (host-side,
+not on-device, no root involved — `lpunpack` + `fsck.erofs --extract` +
+`dtc` in WSL) rather than the device itself:
+
+- **`super.img` -> `vendor_dlkm_a` (EROFS) -> `lib/modules/`**: the real
+  module is `mali_kbase_mt6899_r49.ko`. `modinfo` output:
+
+  ```
+  version:  r49p1-03bet0 (UK version 1.30)
+  vermagic: 6.6.89-android15-8-gb471cb188e0a-4k SMP preempt mod_unload modversions aarch64
+  alias:    of:N*T*Carm,mali-valhall
+  softdep:  pre: memory_group_manager
+  ```
+
+  Exact match to `third_party/kbase-uapi-r49p1/` — same driver release, same
+  device, confirmed a third, independent way (blob string, header directory
+  name, now the compiled kernel module itself).
+  Two companion modules load alongside it: `mali_mgm_mt6899_r49.ko`
+  (Memory Group Manager) and `mali_prot_alloc_mt6899_r49.ko` (protected
+  memory allocator) — both referenced by phandle from the GPU's own DT node,
+  not incidental.
+- **`vendor_boot.img`'s embedded DTB** (`dtc -I dtb -O dts`, exact offset
+  found by scanning for the FDT magic `d00dfeed`, size from the FDT header's
+  own `totalsize` field — grabbing an arbitrary byte range guesses wrong):
+  the real `mali@13000000` node —
+
+  ```
+  mali@13000000 {
+      compatible = "mediatek,mali\0arm,mali-valhall";
+      reg = <0x13000000 0x480000>;
+      physical-memory-group-manager = <&mgm_phandle>;
+      protected-memory-allocator = <&pma_phandle>;
+      interrupts = <JOB MMU GPU EVENT PWR GPUEB_MBOX1>;
+      operating-points-v2 = <&opp-table0>;   /* 21 OPPs, top ~1.3GHz @ ~0.92V */
+      l2-hash-values = <0x0b 0x0e 0x00>;
+      sleep-mode-enable = <1>;
+      autosuspend-delay-ms = <0x19>;
+      adaptive-power-policy = <2>;
+      system-coherency = <0>;
+  };
+  ```
+
+  `l2-hash-values` matches the module's own `l2_hash_values` parameter
+  default — one internal-consistency check that came back clean. No
+  `firmware-name` override in the DT, so the driver uses its compiled-in
+  default `fw_name`.
+- **`dtbo.img`** (Android DTBO container, header parsed by hand — magic
+  `0xd7b7ab1e`, one DT entry) decompiles to a large overlay tree
+  (display/touch/peripheral fragments); nothing GPU-specific beyond what the
+  base DT already has.
+- **`gpueb.img`** is a red herring for this purpose: MediaTek's separate
+  GPU DVFS/power-management coprocessor firmware (`tinysys-gpueb-RV33_A`,
+  its own RISC-V core), unrelated to the kbase ioctl/CSF protocol.
+
+Net: no surprises, nothing contradicting what was already vendored and
+already verified working end-to-end. This closes the "is r49p1 really
+right" question as far as it can be closed without a from-scratch protocol
+reverse-engineer — real module, real device tree, real companion drivers,
+all consistent. Raw firmware images were not kept (multi-GB, easily
+re-extracted from the downloaded ROM if ever needed again); this section is
+the durable record.
